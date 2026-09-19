@@ -43,21 +43,21 @@ namespace pluginxx {
 namespace detail {
 
 /// C ABI 字符串视图是否为空 (指针与 (指针,长度) 两种形态)
-inline bool abiViewEmpty(const AgentxxPluginStringView* sv) noexcept {
+inline bool abiViewEmpty(const PluginxxStringView* sv) noexcept {
     return !sv || !sv->data || sv->size == 0;
 }
 
-inline bool abiViewEmpty(const AgentxxPluginStringView& sv) noexcept {
+inline bool abiViewEmpty(const PluginxxStringView& sv) noexcept {
     return !sv.data || sv.size == 0;
 }
 
 /// std::string_view → C ABI 视图 (**借用**; 调用方保证被引用内存长命)
-inline AgentxxPluginStringView abiView(std::string_view sv) noexcept {
-    return AgentxxPluginStringView{sv.data(), static_cast<uint64_t>(sv.size())};
+inline PluginxxStringView abiView(std::string_view sv) noexcept {
+    return PluginxxStringView{sv.data(), static_cast<uint64_t>(sv.size())};
 }
 
 /// 写 C ABI 出参错误串 (宿主堆内存; 插件经 host->free 释放)
-inline void setErrorString(AgentxxPluginString* out, std::string_view msg) noexcept {
+inline void setErrorString(PluginxxString* out, std::string_view msg) noexcept {
     if (!out) {
         return;
     }
@@ -140,8 +140,8 @@ public:
     int registerCapabilityEx(
         InstanceT*                           inst,
         std::string_view                     capability,
-        AgentxxPluginCapabilityStartFunction start,
-        AgentxxPluginOperatorCancelFunction  cancel,
+        PluginxxCapabilityStartFunction start,
+        PluginxxOperatorCancelFunction  cancel,
         void*                                ctx
     ) {
         if (!inst || capability.empty() || !start) {
@@ -219,14 +219,14 @@ public:
     /// - `caller` 为发起调用的插件实例 (持有其执行 lease, 卸载等待必然覆盖本次调用);
     /// - 完成通知经 [OpCore] 恒在 IO 线程发布 (即使插件同步 done);
     /// - 真正拒绝 (能力不存在/提供者不可用) 返回 NULL 并写 `error_out`, 此时不调用 `cb`。
-    AgentxxPluginOperatorHandle* invokeCapabilityAsync(
+    PluginxxOperatorHandle* invokeCapabilityAsync(
         InstanceT*                     caller,
         std::string_view               capability,
         std::string_view               method,
         std::string_view               argsJson,
-        AgentxxPluginOperatorCallback  cb,
+        PluginxxOperatorCallback  cb,
         void*                          ud,
-        AgentxxPluginString*           error_out
+        PluginxxString*           error_out
     ) {
         std::shared_ptr<OpCore> core;
         try {
@@ -282,10 +282,10 @@ public:
     /// - 事件回调在宿主事件线程执行, 每次回调都在实例执行 lease 保护下调用插件
     ///   (因此卸载的 idle 等待覆盖它);
     /// - 实例正在关闭/已禁用, 或宿主无事件后端时返回 nullptr。
-    AgentxxPluginSubscription* subscribe(
+    PluginxxSubscription* subscribe(
         InstanceT*               inst,
         std::string_view         topic,
-        void(AGENTXX_PLUGIN_CALL* handler)(const AgentxxPluginStringView* event_json, void* ud),
+        void(PLUGINXX_CALL* handler)(const PluginxxStringView* event_json, void* ud),
         void* ud
     ) {
         if (!inst || topic.empty() || !handler) {
@@ -301,7 +301,7 @@ public:
             return nullptr;
         }
 
-        auto sub     = std::make_shared<AgentxxPluginSubscription>();
+        auto sub     = std::make_shared<PluginxxSubscription>();
         sub->source  = source;
         sub->topic   = hooks_ ? hooks_->qualifyEventTopic(topic) : std::string{topic};
         sub->inst    = inst->ownerSelf;
@@ -345,7 +345,7 @@ public:
     }
 
     /// 撤销事件订阅 (**幂等**; 可在任意线程调用, 簿记自动回到 IO 线程)
-    void unsubscribe(AgentxxPluginSubscription* sub) {
+    void unsubscribe(PluginxxSubscription* sub) {
         unsubscribePluginSubscription(sub);
     }
 
@@ -389,8 +389,8 @@ public:
 
     /// 投递一次回调到 IO 线程 (**IO 线程**)
     /// - 恒异步: 回调经 OpCore 完成协议在 IO 线程发布, 因此不会在调用栈内重入
-    AgentxxPluginOperatorHandle*
-        postCallback(InstanceT* inst, void(AGENTXX_PLUGIN_CALL* fn)(void*), void* ud) {
+    PluginxxOperatorHandle*
+        postCallback(InstanceT* inst, void(PLUGINXX_CALL* fn)(void*), void* ud) {
         if (!inst || !fn || !this->isIoThread()) {
             return nullptr;
         }
@@ -406,7 +406,7 @@ public:
             });
             core->accept();
             auto notify = core->notify();
-            notify.done(notify.host_ud, AGENTXX_PLUGIN_OPERATOR_OK, nullptr);
+            notify.done(notify.host_ud, PLUGINXX_OPERATOR_OK, nullptr);
             return core->handle();
         } catch (...) {
             core->reject();
@@ -415,12 +415,12 @@ public:
     }
 
     /// 定时器睡眠 (**IO 线程**); 完成/取消/失败都经完成回调恰好一次上报
-    AgentxxPluginOperatorHandle* sleep(
+    PluginxxOperatorHandle* sleep(
         InstanceT*                    inst,
         int64_t                       ms,
-        AgentxxPluginOperatorCallback cb,
+        PluginxxOperatorCallback cb,
         void*                         ud,
-        AgentxxPluginString*          error_out
+        PluginxxString*          error_out
     ) {
         if (!inst || !cb || !this->isIoThread()) {
             detail::setErrorString(error_out, "scheduler sleep: invalid instance, callback, or thread");
@@ -455,7 +455,7 @@ public:
                 auto notify = core->notify();
                 notify.done(
                     notify.host_ud,
-                    ec ? AGENTXX_PLUGIN_OPERATOR_CANCELLED : AGENTXX_PLUGIN_OPERATOR_OK,
+                    ec ? PLUGINXX_OPERATOR_CANCELLED : PLUGINXX_OPERATOR_OK,
                     nullptr
                 );
             });
@@ -481,21 +481,21 @@ public:
     /// - 工作体本身在工作线程执行 (显式例外), 完成通知经 OpCore 回到 IO 线程;
     /// - `work` 收到的取消令牌只在本次工作调用期间有效 (插件不得保存);
     /// - 宿主无工作线程时立即以失败终结 (不静默丢工作)。
-    AgentxxPluginOperatorHandle* offload(
+    PluginxxOperatorHandle* offload(
         InstanceT* inst,
-        void*(AGENTXX_PLUGIN_CALL* work)(
+        void*(PLUGINXX_CALL* work)(
             void*                           ud,
-            const AgentxxPluginCancelToken* token,
-            AgentxxPluginString*            error_out
+            const PluginxxCancelToken* token,
+            PluginxxString*            error_out
         ),
-        void(AGENTXX_PLUGIN_CALL* done)(
+        void(PLUGINXX_CALL* done)(
             void*                          ud,
             int32_t                        status,
             void*                          result,
-            const AgentxxPluginStringView* error
+            const PluginxxStringView* error
         ),
         void*                ud,
-        AgentxxPluginString* error_out
+        PluginxxString* error_out
     ) {
         if (!inst || !work || !this->isIoThread()) {
             detail::setErrorString(
@@ -525,7 +525,7 @@ public:
                     return;
                 }
                 auto view = detail::abiView(error);
-                if (status == AGENTXX_PLUGIN_OPERATOR_FAILED && error.empty()) {
+                if (status == PLUGINXX_OPERATOR_FAILED && error.empty()) {
                     view = detail::abiView("plugin offload failed");
                 }
                 done(ud, status, result->value, &view);
@@ -536,27 +536,27 @@ public:
 
             const bool queued = [&]() {
                 if (!hooks_ || !hooks_->postToWorkerThread([core, result, cancelState, work, ud]() {
-                        AgentxxPluginCancelToken token{&isOffloadCancelled, cancelState.get()};
-                        AgentxxPluginString    workError{};
-                        int32_t                status = AGENTXX_PLUGIN_OPERATOR_OK;
+                        PluginxxCancelToken token{&isOffloadCancelled, cancelState.get()};
+                        PluginxxString    workError{};
+                        int32_t                status = PLUGINXX_OPERATOR_OK;
                         std::string            error;
                         try {
                             result->value = work(ud, &token, &workError);
                             if (workError.data) {
                                 error.assign(workError.data, static_cast<size_t>(workError.size));
-                                status = AGENTXX_PLUGIN_OPERATOR_FAILED;
+                                status = PLUGINXX_OPERATOR_FAILED;
                             }
                             if (cancelState->requested.load(std::memory_order_acquire)) {
-                                status = AGENTXX_PLUGIN_OPERATOR_CANCELLED;
+                                status = PLUGINXX_OPERATOR_CANCELLED;
                             }
                         } catch (const std::exception& e) {
-                            status = AGENTXX_PLUGIN_OPERATOR_FAILED;
+                            status = PLUGINXX_OPERATOR_FAILED;
                             try {
                                 error = e.what();
                             } catch (...) {
                             }
                         } catch (...) {
-                            status = AGENTXX_PLUGIN_OPERATOR_FAILED;
+                            status = PLUGINXX_OPERATOR_FAILED;
                             error  = "plugin offload worker threw unknown exception";
                         }
                         hostMemoryFree(workError.data);
@@ -572,7 +572,7 @@ public:
             if (!queued) {
                 auto notify = core->notify();
                 auto view   = detail::abiView("plugin offload: no thread pool");
-                notify.done(notify.host_ud, AGENTXX_PLUGIN_OPERATOR_FAILED, &view);
+                notify.done(notify.host_ud, PLUGINXX_OPERATOR_FAILED, &view);
             }
             return core->handle();
         } catch (const std::exception& e) {
@@ -599,12 +599,12 @@ public:
     /// - `notify`: 【出参】插件协程结束 (帧销毁后) 经 `notify.done` 恰好一次上报;
     /// - 返回宿主托管句柄 (失败 NULL + error_out); 句柄仅用于 `cancel_task`,
     ///   宿主在任务 done 后自动回收。
-    AgentxxPluginOperatorHandle* registerTask(
+    PluginxxOperatorHandle* registerTask(
         InstanceT*                          inst,
-        AgentxxPluginOperatorCancelFunction cancel_fn,
+        PluginxxOperatorCancelFunction cancel_fn,
         void*                               cancel_ud,
-        AgentxxPluginOperatorNotify*        notify,
-        AgentxxPluginString*                error_out
+        PluginxxOperatorNotify*        notify,
+        PluginxxString*                error_out
     ) {
         if (notify) {
             *notify = {};
@@ -645,7 +645,7 @@ protected:
         std::atomic<bool> requested{false};
     };
 
-    static int32_t AGENTXX_PLUGIN_CALL isOffloadCancelled(const AgentxxPluginCancelToken* token) {
+    static int32_t PLUGINXX_CALL isOffloadCancelled(const PluginxxCancelToken* token) {
         auto* state = token ? static_cast<const OffloadCancelState*>(token->host_ud) : nullptr;
         return state && state->requested.load(std::memory_order_acquire) ? 1 : 0;
     }

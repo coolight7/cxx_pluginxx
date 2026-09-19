@@ -26,6 +26,7 @@
 /// stop/start 事务按需投递到 IO 线程执行 (调用方不必在 IO 线程)。
 #pragma once
 
+#include "pluginxx/api/entry.h"
 #include "pluginxx/host/abi_util.h"
 #include "pluginxx/host/domain_hooks.h"
 #include "pluginxx/host/host_core.h"
@@ -116,33 +117,50 @@ public:
             co_return nullptr;
         }
 
-        auto getInfoFn = reinterpret_cast<AgentxxPluginGetInfoFn>(
-            NativeLoader::sym(dl, AGENTXX_PLUGIN_AGENT_SYMBOL_GET_INFO, err)
-        );
+        // 入口符号名由宿主提供 (内核不硬编码任何宿主专名, 见 pluginxx/api/entry.h):
+        // 未提供 create 时无法装载, 直接失败并说明原因 (不去猜宿主专名)。
+        const PluginEntrySymbols entries = entrySymbols();
+        if (!entries.valid() || !entries.lifecyclePaired()) {
+            NativeLoader::close(dl);
+            XX_LOGE(
+                "{}Plugin `{}` load failed: host did not provide plugin entry symbols "
+                "(create={}, start={}, stop={})",
+                logTag(),
+                path,
+                entries.create.empty() ? "missing" : "ok",
+                entries.start.empty() ? "missing" : "ok",
+                entries.stop.empty() ? "missing" : "ok"
+            );
+            co_return nullptr;
+        }
+
+        auto lookupSymbol = [&dl](std::string_view name, std::string& e) -> void* {
+            if (name.empty()) {
+                return nullptr;
+            }
+            const std::string owned{name};
+            return NativeLoader::sym(dl, owned.c_str(), e);
+        };
+
+        auto getInfoFn = reinterpret_cast<PluginxxGetInfoFn>(lookupSymbol(entries.getInfo, err));
         std::string createErr;
-        auto        createFn = reinterpret_cast<AgentxxPluginCreateFn>(
-            NativeLoader::sym(dl, AGENTXX_PLUGIN_AGENT_SYMBOL_CREATE, createErr)
-        );
+        auto        createFn = reinterpret_cast<PluginxxCreateFn>(lookupSymbol(entries.create, createErr));
         std::string startErr;
-        auto        startFn = reinterpret_cast<AgentxxPluginStartFn>(
-            NativeLoader::sym(dl, AGENTXX_PLUGIN_AGENT_SYMBOL_START, startErr)
-        );
+        auto        startFn = reinterpret_cast<PluginxxStartFn>(lookupSymbol(entries.start, startErr));
         std::string stopErr;
-        auto        stopFn = reinterpret_cast<AgentxxPluginStopFn>(
-            NativeLoader::sym(dl, AGENTXX_PLUGIN_AGENT_SYMBOL_STOP, stopErr)
-        );
+        auto        stopFn = reinterpret_cast<PluginxxStopFn>(lookupSymbol(entries.stop, stopErr));
 
         if (!createFn) {
             NativeLoader::close(dl);
             if (allowMissingEntry) {
-                XX_LOGW("{}Plugin `{}` skipped: no agent entry (client only)", logTag(), path);
+                XX_LOGW("{}Plugin `{}` skipped: no host entry (other side only)", logTag(), path);
                 co_return nullptr;
             }
             XX_LOGE(
                 "{}Plugin `{}` missing {}: {}",
                 logTag(),
                 path,
-                AGENTXX_PLUGIN_AGENT_SYMBOL_CREATE,
+                std::string{entries.create},
                 createErr
             );
             co_return nullptr;
@@ -156,15 +174,15 @@ public:
                 "start/stop",
                 logTag(),
                 path,
-                AGENTXX_PLUGIN_AGENT_SYMBOL_START,
+                std::string{entries.start},
                 startFn ? "ok" : startErr,
-                AGENTXX_PLUGIN_AGENT_SYMBOL_STOP,
+                std::string{entries.stop},
                 stopFn ? "ok" : stopErr
             );
             co_return nullptr;
         }
 
-        const AgentxxPluginInfo* info = nullptr;
+        const PluginxxInfo* info = nullptr;
         try {
             info = getInfoFn ? getInfoFn() : nullptr;
         } catch (const std::exception& e) {
@@ -172,14 +190,14 @@ public:
         } catch (...) {
             XX_LOGW("{}Plugin `{}` get_info threw unknown exception", logTag(), path);
         }
-        if (info && info->api_version != AGENTXX_PLUGIN_API_VERSION) {
+        if (info && info->api_version != PLUGINXX_API_VERSION) {
             NativeLoader::close(dl);
             XX_LOGE(
                 "{}Plugin `{}` API version mismatch (got {}, host requires {})",
                 logTag(),
                 path,
                 info->api_version,
-                AGENTXX_PLUGIN_API_VERSION
+                PLUGINXX_API_VERSION
             );
             co_return nullptr;
         }
@@ -279,14 +297,14 @@ public:
             co_return nullptr;
         }
 
-        const AgentxxPluginInfo* info = entry->get_info ? entry->get_info() : nullptr;
-        if (info && info->api_version != AGENTXX_PLUGIN_API_VERSION) {
+        const PluginxxInfo* info = entry->get_info ? entry->get_info() : nullptr;
+        if (info && info->api_version != PLUGINXX_API_VERSION) {
             XX_LOGE(
                 "{}Builtin plugin `{}` API version mismatch (got {}, host requires {})",
                 logTag(),
                 name,
                 info->api_version,
-                AGENTXX_PLUGIN_API_VERSION
+                PLUGINXX_API_VERSION
             );
             co_return nullptr;
         }
@@ -811,8 +829,18 @@ protected:
     /// 生命周期控制块 ([InstanceLifetime]) 与交给自己插件的 host 控制块。
     virtual InstancePtr createInstance(std::string name) = 0;
 
-    /// 交给插件的宿主 vtable (进程内稳定静态表; 见 `AgentxxHostVtable`)
-    virtual const AgentxxHostVtable* hostVtable() = 0;
+    /// 交给插件的宿主 vtable (进程内稳定静态表; 见 `PluginxxHostVtable`)
+    virtual const PluginxxHostVtable* hostVtable() = 0;
+
+    /// 本宿主使用的插件入口符号名 (dlsym/LoadLibrary 查找用)
+    ///
+    /// - 符号名属于宿主命名空间, 内核不提供默认值: 未覆写时装载直接失败
+    ///   (错误信息说明宿主未提供入口符号名), 不会静默尝试宿主专名;
+    /// - 必须与插件侧导出宏使用的前缀一致 (`PLUGINXX_EXPORT_PLUGIN(SymbolPrefix, ...)`);
+    /// - `destroy` 不在此列: 它由实例类的 [InstanceT::pluginDestroySymbol] 给出。
+    virtual PluginEntrySymbols entrySymbols() const {
+        return {};
+    }
 
     // =====================================================================
     // 宿主接缝 (可选覆写)
@@ -897,8 +925,8 @@ protected:
     ///   旧指针时各 vtable 入口只会安全失败 (tombstone 语义, 见 instance_base.h)。
     void attachInstance(
         const InstancePtr&         inst,
-        const AgentxxPluginStartFn startFn,
-        const AgentxxPluginStopFn  stopFn
+        const PluginxxStartFn startFn,
+        const PluginxxStopFn  stopFn
     ) {
         if (!inst) {
             return;
@@ -942,10 +970,10 @@ protected:
     /// 插件实例的公共装配 (两种加载路径共用): 元信息/生命周期入口/宿主控制块
     InstancePtr makeInstance(
         std::string                name,
-        const AgentxxPluginInfo*   info,
+        const PluginxxInfo*   info,
         std::string                path,
-        const AgentxxPluginStartFn startFn,
-        const AgentxxPluginStopFn  stopFn
+        const PluginxxStartFn startFn,
+        const PluginxxStopFn  stopFn
     ) {
         auto inst = createInstance(std::move(name));
         if (!inst) {

@@ -15,10 +15,10 @@
 
 - 符号名: `agentxx_plugin_agent_get_info/create/start/stop/destroy`、
   `agentxx_plugin_client_*` (改动即破坏已编译插件)
-- 结构体名 / 宏名 / IID 字符串: `AgentxxPluginHost`、`AgentxxPluginString`、
-  `AGENTXX_PLUGIN_CALL`、`AGENTXX_PLUGIN_EXPORT`、`"agentxx.agent.tools"` 等
-- 调用约定与对齐: `AGENTXX_PLUGIN_CALL` (Windows `__stdcall`)、8 字节对齐、定长基础类型
-- 版本: `AGENTXX_PLUGIN_API_VERSION` (接口表 `version` / `struct_size` 自校验)
+- 结构体名 / 宏名 / IID 字符串: `PluginxxHost`、`PluginxxString`、
+  `PLUGINXX_CALL`、`PLUGINXX_EXPORT`、`"agentxx.agent.tools"` 等
+- 调用约定与对齐: `PLUGINXX_CALL` (Windows `__stdcall`)、8 字节对齐、定长基础类型
+- 版本: `PLUGINXX_API_VERSION` (接口表 `version` / `struct_size` 自校验)
 
 ## 目录结构
 
@@ -39,7 +39,7 @@ include/pluginxx/
   host/   loader.h (dlopen/LoadLibrary)、manifest.h (plugin.yaml/名称推导/拓扑排序)、
           abi_util.h (C 串转换/异常兜底/io 线程同步投递)、
           capability_registry.h (能力注册表: 能力名 → 提供者插件 + 启动/取消回调)、
-          event_bus.h (事件后端抽象 EventSource + 订阅句柄 AgentxxPluginSubscription)、
+          event_bus.h (事件后端抽象 EventSource + 订阅句柄 PluginxxSubscription)、
           domain_hooks.h (领域钩子 DomainHooks: 通用表需要宿主数据的入口)、
           host_core.h (宿主核心 PluginHostCore<InstanceT>: 通用表状态与方法实现)、
           tables_impl.h (十张通用表的 vtable 入口 + queryGenericPluginIface<I,M>)、
@@ -66,7 +66,7 @@ protected:
     // 生命周期接缝 (纯虚): 管理器自引用 / 生成领域实例 / 交给自己插件的 vtable
     std::shared_ptr<pluginxx::PluginHostLifecycle<MyInstance>> selfRef() override;
     std::shared_ptr<MyInstance> createInstance(std::string name) override;
-    const AgentxxHostVtable*    hostVtable() override;
+    const PluginxxHostVtable*    hostVtable() override;
     // 生命周期接缝 (可选): 领域注册摘除与清空 / 清单资源应用与释放 / 启停状态通知 /
     // 装载卸载收尾 / 卸载级联口径 / 日志前缀
     void detachDomainRegistrations(MyInstance* inst) override;

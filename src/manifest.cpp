@@ -12,7 +12,7 @@
 
 namespace pluginxx {
 
-std::string_view pluginStringView2std(AgentxxPluginStringView str) {
+std::string_view pluginStringView2std(PluginxxStringView str) {
     return std::string_view{str.data, static_cast<size_t>(str.size)};
 }
 
@@ -32,7 +32,7 @@ BuiltinPluginProvider builtinPluginProvider() noexcept {
     return providerSlot();
 }
 
-const AgentxxPluginBuiltinInfo* findBuiltinPlugin(std::string_view name) {
+const PluginxxBuiltinInfo* findBuiltinPlugin(std::string_view name) {
     auto fn = providerSlot().plugins;
     if (!fn) {
         return nullptr;
@@ -50,7 +50,7 @@ const AgentxxPluginBuiltinInfo* findBuiltinPlugin(std::string_view name) {
     return nullptr;
 }
 
-const AgentxxPluginBuiltinManifest* findBuiltinManifest(std::string_view name) {
+const PluginxxBuiltinManifest* findBuiltinManifest(std::string_view name) {
     auto fn = providerSlot().manifests;
     if (!fn) {
         return nullptr;

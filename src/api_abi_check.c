@@ -10,27 +10,24 @@
 
 /* 8 字节对齐约定: 跨边界结构体不得出现更大的对齐要求 (避免平台差异) */
 _Static_assert(
-    _Alignof(AgentxxPluginStringView) <= 8,
-    "AgentxxPluginStringView 对齐超过 8 字节"
+    _Alignof(PluginxxStringView) <= 8,
+    "PluginxxStringView 对齐超过 8 字节"
 );
-_Static_assert(_Alignof(AgentxxPluginHost) <= 8, "AgentxxPluginHost 对齐超过 8 字节");
-_Static_assert(_Alignof(AgentxxPluginOperatorNotify) <= 8, "AgentxxPluginOperatorNotify 对齐超过 8 字节");
+_Static_assert(_Alignof(PluginxxHost) <= 8, "PluginxxHost 对齐超过 8 字节");
+_Static_assert(_Alignof(PluginxxOperatorNotify) <= 8, "PluginxxOperatorNotify 对齐超过 8 字节");
 
 /* 定长基础类型约定: 字符串视图的长度字段必须是 uint64_t */
 _Static_assert(
-    sizeof(((AgentxxPluginStringView*)0)->size) == 8,
-    "AgentxxPluginStringView::size 必须是 8 字节定长类型"
+    sizeof(((PluginxxStringView*)0)->size) == 8,
+    "PluginxxStringView::size 必须是 8 字节定长类型"
 );
 
-/* 入口符号名常量 (宿主按名 dlsym/GetProcAddress 查找) */
-_Static_assert(
-    sizeof(AGENTXX_PLUGIN_AGENT_SYMBOL_CREATE) == sizeof("agentxx_plugin_agent_create"),
-    "入口符号名长度校验"
-);
+/* 入口符号名由宿主提供 (内核不定义宿主专名, 见 pluginxx/api/entry.h):
+   这里不再校验具体符号名, 改为在 C++ 侧校验宿主接缝 (entrySymbols) 的语义 */
 
 const char* pluginxx_api_abi_probe(void);
 
 /// 返回宿主日志表的 IID (证明通用表声明在本 TU 可见且可用于 C)
 const char* pluginxx_api_abi_probe(void) {
-    return AGENTXX_PLUGIN_IFACE_AGENT_LOG;
+    return PLUGINXX_IFACE_LOG;
 }

@@ -1,9 +1,9 @@
-/// pluginxx 宿主侧协程驱动请求 (agentxx.agent.coroutine_runtime 接口表的实现载体)
+/// pluginxx 宿主侧协程驱动请求 (pluginxx.coroutine_runtime 接口表的实现载体)
 ///
 /// 背景: 插件协程要与宿主协程在同一宿主 IO 执行序列中交错推进, 但插件可以用任意
 /// 协程库/事件循环, 宿主也绝不能把插件私有 reactor 接进自己的执行序列。因此两端
 /// 只经两类动作协作 (见 docs/zh-cn/design/plugins.md):
-/// - **driver/pump**: 插件申请宿主异步执行一次有界回调 (`AgentxxPluginDriveOnceFn`);
+/// - **driver/pump**: 插件申请宿主异步执行一次有界回调 (`PluginxxDriveOnceFn`);
 /// - **wake 合并**: 插件侧适配器自行合并重复唤醒, 再申请下一次 ticket。
 ///
 /// 本文件是"driver"这一侧的宿主实现:
@@ -21,7 +21,7 @@
 /// 有限步骤) 必须能继续跑完, 否则关闭必然超时。禁止新工作由 `acceptsOperations`
 /// 与各注册入口把关 (不在这里), 本文件只保证 ticket 的排队/执行/取消语义。
 ///
-/// 命名空间: 请求类型本身位于**全局命名空间** (与 `AgentxxPluginOperatorHandle`
+/// 命名空间: 请求类型本身位于**全局命名空间** (与 `PluginxxOperatorHandle`
 /// 一致), 因为它是 C ABI 的不透明句柄; 它在内部使用 `pluginxx` 的运行时类型。
 #pragma once
 
@@ -36,7 +36,7 @@
 #include <string>
 #include <utility>
 
-/// 驱动请求: 一次票 = 一次有界回调 (`AgentxxPluginDriveOnceFn`)。
+/// 驱动请求: 一次票 = 一次有界回调 (`PluginxxDriveOnceFn`)。
 ///
 /// 句柄与生命周期:
 /// - 裸指针句柄在"已排队 / 正在执行"期间有效 (由实例的请求表与投递闭包持有), 插件
@@ -44,7 +44,7 @@
 ///   吸收"刚收束就取消"的迟到调用;
 /// - 句柄校验由进程级地址注册表兜底 ([cancelByHandle]): 过期/伪造指针只被忽略;
 /// - 出队执行 (`runOnIo`) 或取消 (`cancel`) 后释放实例 lease 并摘除登记。
-struct AgentxxPluginDriver : std::enable_shared_from_this<AgentxxPluginDriver> {
+struct PluginxxDriver : std::enable_shared_from_this<PluginxxDriver> {
     /// 状态机的唯一所有权令牌: Idle 由"执行"与"取消"两方 CAS 竞争, 胜者负责
     /// 收束 (释放 lease)。
     enum class State : uint32_t {
@@ -59,10 +59,10 @@ struct AgentxxPluginDriver : std::enable_shared_from_this<AgentxxPluginDriver> {
     /// - `lifetime`: 实例生命周期控制块; 空指针或实例已 Closed 时创建失败
     /// - `drive`: 插件回调 (C ABI 函数指针), `ud` 为其 user_data
     /// - `return`: 失败返回 nullptr (实例已关闭 / 参数缺失)
-    static std::shared_ptr<AgentxxPluginDriver> create(
+    static std::shared_ptr<PluginxxDriver> create(
         std::shared_ptr<pluginxx::PluginRuntime>    runtime,
         std::shared_ptr<pluginxx::InstanceLifetime> lifetime,
-        AgentxxPluginDriveOnceFn                    drive,
+        PluginxxDriveOnceFn                    drive,
         void*                                       ud,
         const std::string&                          label
     ) {
@@ -74,7 +74,7 @@ struct AgentxxPluginDriver : std::enable_shared_from_this<AgentxxPluginDriver> {
         if (!lease) {
             return nullptr;
         }
-        auto driver       = std::shared_ptr<AgentxxPluginDriver>(new AgentxxPluginDriver());
+        auto driver       = std::shared_ptr<PluginxxDriver>(new PluginxxDriver());
         driver->runtime_  = std::move(runtime);
         driver->drive_    = drive;
         driver->userData_ = ud;
@@ -91,11 +91,11 @@ struct AgentxxPluginDriver : std::enable_shared_from_this<AgentxxPluginDriver> {
     /// 命中才经 weak_ptr 升级为强引用并调用 cancel; 未命中 (伪造/过期指针) 只记录
     /// 日志, 绝不解引用。表内只存 weak_ptr 且请求收束时按地址摘除, 因此内存有界,
     /// 也不存在"表项持有最后一个强引用导致自毁"的风险。
-    static bool cancelByHandle(AgentxxPluginDriver* driver) noexcept {
+    static bool cancelByHandle(PluginxxDriver* driver) noexcept {
         if (!driver) {
             return false;
         }
-        std::shared_ptr<AgentxxPluginDriver> ticket;
+        std::shared_ptr<PluginxxDriver> ticket;
         {
             auto&           registry = handleRegistry();
             std::lock_guard lock(registry.mutex);
@@ -113,8 +113,8 @@ struct AgentxxPluginDriver : std::enable_shared_from_this<AgentxxPluginDriver> {
         return true;
     }
 
-    AgentxxPluginDriver(const AgentxxPluginDriver&)            = delete;
-    AgentxxPluginDriver& operator=(const AgentxxPluginDriver&) = delete;
+    PluginxxDriver(const PluginxxDriver&)            = delete;
+    PluginxxDriver& operator=(const PluginxxDriver&) = delete;
 
     State state() const noexcept {
         return static_cast<State>(state_.load(std::memory_order_acquire));
@@ -184,13 +184,13 @@ struct AgentxxPluginDriver : std::enable_shared_from_this<AgentxxPluginDriver> {
 
 private:
 
-    AgentxxPluginDriver() = default;
+    PluginxxDriver() = default;
 
     /// 请求地址注册表 (仅宿主内部; 与 PluginHostControl 的进程级注册表同思路)。
     /// 只做"地址校验 + 生命周期升级", 不携带任何跨实例业务状态, 因此不违反多实例约定。
     struct HandleRegistry {
         std::mutex                                                               mutex;
-        std::map<const AgentxxPluginDriver*, std::weak_ptr<AgentxxPluginDriver>> tickets;
+        std::map<const PluginxxDriver*, std::weak_ptr<PluginxxDriver>> tickets;
     };
 
     static HandleRegistry& handleRegistry() noexcept {
@@ -198,7 +198,7 @@ private:
         return registry;
     }
 
-    static void registerHandle(const std::shared_ptr<AgentxxPluginDriver>& driver) noexcept {
+    static void registerHandle(const std::shared_ptr<PluginxxDriver>& driver) noexcept {
         if (!driver) {
             return;
         }
@@ -211,7 +211,7 @@ private:
         }
     }
 
-    static void unregisterHandle(const AgentxxPluginDriver* driver) noexcept {
+    static void unregisterHandle(const PluginxxDriver* driver) noexcept {
         if (!driver) {
             return;
         }
@@ -261,7 +261,7 @@ private:
     }
 
     std::shared_ptr<pluginxx::PluginRuntime> runtime_;
-    AgentxxPluginDriveOnceFn                 drive_    = nullptr;
+    PluginxxDriveOnceFn                 drive_    = nullptr;
     void*                                    userData_ = nullptr;
     std::string                              label_;
     std::atomic<uint32_t>                    state_{kIdle};

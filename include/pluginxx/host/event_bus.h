@@ -3,8 +3,8 @@
 /// 内容:
 /// - [EventSource]: 宿主事件总线的最小抽象 (订阅 / 撤销 / 发布) —— 宿主用自己已有的
 ///   事件系统实现它 (agentxx 侧见 `agentxx/plugin/plugin_event_source.h`);
-/// - [AgentxxPluginSubscription]: 事件订阅句柄的**实现体** (C ABI 中作为不透明指针
-///   `AgentxxPluginSubscription*` 传递, 因此名字保持 ABI 冻结时的形态);
+/// - [PluginxxSubscription]: 事件订阅句柄的**实现体** (C ABI 中作为不透明指针
+///   `PluginxxSubscription*` 传递, 因此名字保持 ABI 冻结时的形态);
 /// - [unsubscribePluginSubscription]: 幂等撤销 (任意线程; 宿主侧簿记在 IO 线程执行)。
 ///
 /// 线程约定:
@@ -58,10 +58,10 @@ public:
 
 } // namespace pluginxx
 
-/// 事件订阅句柄的实现体 (C ABI 不透明句柄 `AgentxxPluginSubscription*` 的实际类型)。
+/// 事件订阅句柄的实现体 (C ABI 不透明句柄 `PluginxxSubscription*` 的实际类型)。
 ///
 /// 归属 cxx_pluginxx: 事件表是通用表, 句柄字段因此只依赖内核类型。
-struct AgentxxPluginSubscription {
+struct PluginxxSubscription {
     /// 事件后端 (被本句柄持有, 保证撤销动作执行时后端仍然有效)
     std::shared_ptr<pluginxx::EventSource> source;
     /// 已补齐命名空间的最终主题
@@ -73,7 +73,7 @@ struct AgentxxPluginSubscription {
     /// 宿主运行时 (撤销时把簿记投递到 IO 线程; 弱引用不延长其生命周期)
     std::weak_ptr<pluginxx::PluginRuntime> runtime;
     /// 插件事件回调 (C ABI 函数指针)
-    void(AGENTXX_PLUGIN_CALL* handler)(const AgentxxPluginStringView* event_json, void* ud)
+    void(PLUGINXX_CALL* handler)(const PluginxxStringView* event_json, void* ud)
         = nullptr;
     void* ud = nullptr;
     /// 是否仍然有效: 撤销时先置 false, 事件线程据此立即短路
@@ -89,7 +89,7 @@ namespace detail {
 ///
 /// 定义放在 `pluginxx/runtime/instance_base.h` (那里 [PluginInstanceBase] 已完整):
 /// 本头只前置声明实例类型, 不能在这里访问其成员。
-void revokeSubscription(AgentxxPluginSubscription* sub) noexcept;
+void revokeSubscription(PluginxxSubscription* sub) noexcept;
 
 } // namespace detail
 
@@ -104,7 +104,7 @@ void revokeSubscription(AgentxxPluginSubscription* sub) noexcept;
 ///
 /// 句柄本体的保活由实例的 `subscriptionHandles` 负责 (随实例析构释放), 因此插件在
 /// 撤销之后再传同一裸指针进来也只会命中 [detail::revokeSubscription] 的空操作分支。
-inline void unsubscribePluginSubscription(AgentxxPluginSubscription* sub) {
+inline void unsubscribePluginSubscription(PluginxxSubscription* sub) {
     if (!sub) {
         return;
     }

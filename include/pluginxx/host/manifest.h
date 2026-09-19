@@ -49,9 +49,9 @@ inline std::string parseBuiltinName(std::string_view p) {
 /// (返回 0 项), 纯动态库宿主无需注册。
 struct BuiltinPluginProvider {
     /// 返回内置插件描述静态数组, 并写出元素个数 (可为空)
-    const AgentxxPluginBuiltinInfo* (*plugins)(uint64_t* count) = nullptr;
+    const PluginxxBuiltinInfo* (*plugins)(uint64_t* count) = nullptr;
     /// 返回内置内嵌清单静态数组, 并写出元素个数 (可为空)
-    const AgentxxPluginBuiltinManifest* (*manifests)(uint64_t* count) = nullptr;
+    const PluginxxBuiltinManifest* (*manifests)(uint64_t* count) = nullptr;
 };
 
 /// 注册内置插件清单提供者 (宿主静态初始化期调用一次即可; 幂等覆盖)
@@ -61,10 +61,10 @@ PLUGINXX_API void setBuiltinPluginProvider(BuiltinPluginProvider provider) noexc
 PLUGINXX_API BuiltinPluginProvider builtinPluginProvider() noexcept;
 
 /// 按名查找内置插件描述 (未注册提供者/未命中返回 nullptr)
-PLUGINXX_API const AgentxxPluginBuiltinInfo* findBuiltinPlugin(std::string_view name);
+PLUGINXX_API const PluginxxBuiltinInfo* findBuiltinPlugin(std::string_view name);
 
 /// 按名查找内置内嵌清单 (未注册提供者/未命中返回 nullptr)
-PLUGINXX_API const AgentxxPluginBuiltinManifest* findBuiltinManifest(std::string_view name);
+PLUGINXX_API const PluginxxBuiltinManifest* findBuiltinManifest(std::string_view name);
 
 /// 从库文件名推断插件名 (libfoo.so → foo; foo.dll → foo; libfoo.so.1.2 → foo;
 /// my.plugin.so → my.plugin)

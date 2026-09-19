@@ -27,11 +27,11 @@ namespace pluginxx {
 /// 栈缓冲日志 (noexcept): "[插件名] exception: msg" 经宿主 log 接口表输出;
 /// host/logIf 缺失时静默丢弃 (catch 路径不得再失败)
 inline void logTo(
-    const AgentxxPluginHost*     host,
-    const AgentxxPluginLogIface* logIf,
+    const PluginxxHost*     host,
+    const PluginxxLogIface* logIf,
     int32_t                      level,
-    AgentxxPluginStringView      pluginName,
-    AgentxxPluginStringView      msg
+    PluginxxStringView      pluginName,
+    PluginxxStringView      msg
 ) noexcept {
     if (!host || !logIf || !logIf->log || !msg.data) {
         return;
@@ -46,13 +46,13 @@ inline void logTo(
         static_cast<int>(msg.size > 460 ? 460 : msg.size),
         msg.data
     );
-    AgentxxPluginStringView sv = PluginStringView::fromCstr(buf);
+    PluginxxStringView sv = PluginStringView::fromCstr(buf);
     logIf->log(host, level, &sv);
 }
 
 inline void logTo(
-    const AgentxxPluginHost*     host,
-    const AgentxxPluginLogIface* logIf,
+    const PluginxxHost*     host,
+    const PluginxxLogIface* logIf,
     int32_t                      level,
     std::string_view             pluginName,
     std::string_view             msg
@@ -61,8 +61,8 @@ inline void logTo(
 }
 
 inline void logTo(
-    const AgentxxPluginHost*     host,
-    const AgentxxPluginLogIface* logIf,
+    const PluginxxHost*     host,
+    const PluginxxLogIface* logIf,
     int32_t                      level,
     const char*                  pluginName,
     const char*                  msg
@@ -94,7 +94,7 @@ inline void reportCurrentException(LogFn&& logFn) noexcept {
 ///
 /// 用法 (fallback 类型须可转换为 fn 的返回类型; lambda 返回类型建议显式标注):
 ///   return pluginxx::guardCall(pluginCatchLog, nullptr,
-///       [&]() -> const AgentxxPluginInfo* { ... });
+///       [&]() -> const PluginxxInfo* { ... });
 template<typename LogFn, typename Fn>
 [[nodiscard]] inline auto
     guardCall(LogFn&& logFn, std::invoke_result_t<Fn&> fallback, Fn&& fn) noexcept

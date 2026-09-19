@@ -3,7 +3,7 @@
 /// 内容:
 /// - [PluginInstanceBase]: 实例公共基类 (元信息/依赖/启用标志/宿主句柄/驱动登记表/
 ///   执行 lease/destroy 执行), agent 侧与 client 侧实例各自继承;
-/// - [PluginHostControl]: 交给插件的 `AgentxxPluginHost*` 视图所在的控制块 —— 地址
+/// - [PluginHostControl]: 交给插件的 `PluginxxHost*` 视图所在的控制块 —— 地址
 ///   永不失效, 实例关闭后只清空实例引用 (tombstone), 因此插件跨卸载持有旧 host 指针
 ///   时各 vtable 入口只会安全失败, 既不访问已释放对象也不误指新实例;
 /// - [resolvePluginHostControl]: 反查插件传入的 host 视图对应控制块;
@@ -52,8 +52,8 @@
 #include <dlfcn.h>
 #endif
 
-struct AgentxxPluginOperatorHandle;
-struct AgentxxPluginOperationCompletionEndpoint;
+struct PluginxxOperatorHandle;
+struct PluginxxOperationCompletionEndpoint;
 
 namespace pluginxx {
 
@@ -81,7 +81,7 @@ struct PluginInstanceBase {
     void*                    pluginCtx = nullptr; ///< entry 输出的插件私有上下文
     /// 内置插件 (合并编译进宿主二进制) 的 destroy 入口; 动态库插件为 nullptr
     /// (此时 destroy 由 [destroyPlugin] 经 [pluginDestroySymbol] 向动态库查找)
-    AgentxxPluginDestroyFn builtinUnload = nullptr;
+    PluginxxDestroyFn builtinUnload = nullptr;
     bool                     enabled   = true; ///< 是否启用 (禁用: 注册摘除/命令停用)
     bool userDisabled          = false; ///< 是否被用户显式禁用 (区别于级联禁用)
     bool blockedByDependencies = false; ///< 是否因必选依赖不可用而级联禁用
@@ -95,8 +95,8 @@ struct PluginInstanceBase {
     /// 实例生命周期入口 (加载成功的插件必有这两个符号, 见 plugin_api.h):
     /// - start: 注册事务 (工具/钩子/能力/订阅/自管线程), 在宿主 IO 线程执行;
     /// - stop: 撤销自管资源, destroy 之前必须先完成。
-    AgentxxPluginStartFn lifecycleStart = nullptr;
-    AgentxxPluginStopFn  lifecycleStop  = nullptr;
+    PluginxxStartFn lifecycleStart = nullptr;
+    PluginxxStopFn  lifecycleStop  = nullptr;
     /// start 事务是否已成功完成 (加载成功即置位)。
     bool lifecycleStarted = false;
     /// stop 事务是否已执行完成 (destroy 的前提)。
@@ -132,9 +132,9 @@ struct PluginInstanceBase {
         return lifecycleStop != nullptr && lifecycleStarted && !lifecycleStopped;
     }
 
-    std::vector<std::shared_ptr<::AgentxxPluginOperatorHandle>>              operatorHandles;
-    std::vector<std::shared_ptr<::AgentxxPluginOperationCompletionEndpoint>> completionEndpoints;
-    std::vector<std::shared_ptr<::AgentxxPluginOperatorHandle>>              outstandingOps;
+    std::vector<std::shared_ptr<::PluginxxOperatorHandle>>              operatorHandles;
+    std::vector<std::shared_ptr<::PluginxxOperationCompletionEndpoint>> completionEndpoints;
+    std::vector<std::shared_ptr<::PluginxxOperatorHandle>>              outstandingOps;
 
     /// ==================== 通用表相关登记 (仅宿主 IO 线程读写) ====================
     ///
@@ -143,15 +143,15 @@ struct PluginInstanceBase {
     /// 撤销与清理, 新增宿主无需重复实现同一套登记。
 
     /// 活跃事件订阅 (句柄本体由 [subscriptionHandles] 保活; 撤销时从此表移除)
-    std::vector<std::shared_ptr<::AgentxxPluginSubscription>> subscriptions;
+    std::vector<std::shared_ptr<::PluginxxSubscription>> subscriptions;
     /// 事件订阅句柄保活表: 插件持有的裸指针在实例析构前始终有效
-    std::vector<std::shared_ptr<::AgentxxPluginSubscription>> subscriptionHandles;
+    std::vector<std::shared_ptr<::PluginxxSubscription>> subscriptionHandles;
     /// 活跃 sleep 使用 Operation 句柄索引；完成回调开始前移除，取消查询 O(1)。
-    std::unordered_map<void*, std::shared_ptr<::AgentxxPluginOperatorHandle>> sleepTimers;
+    std::unordered_map<void*, std::shared_ptr<::PluginxxOperatorHandle>> sleepTimers;
     /// 已声明能力 (随工具注销/实例禁用卸载一并撤销)
     std::vector<PluginCapabilityRegistration> capabilityRegistrations;
 
-    /// 驱动请求登记表 (`agentxx.agent.coroutine_runtime` 的 ticket 句柄)。
+    /// 驱动请求登记表 (`pluginxx.coroutine_runtime` 的 ticket 句柄)。
     ///
     /// 为什么需要这张表:
     /// - 插件桥接持有宿主发放的**裸指针**句柄, 它的有效性必须由宿主兜底: 宿主
@@ -170,10 +170,10 @@ struct PluginInstanceBase {
     static constexpr size_t kFinishedDriverRetention = 16;
 
     mutable std::mutex                                 driversMutex;
-    std::deque<std::shared_ptr<::AgentxxPluginDriver>> drivers;
+    std::deque<std::shared_ptr<::PluginxxDriver>> drivers;
 
     /// 登记请求句柄 (任意线程; 由 request_driver 在排队前调用)。
-    void retainDriverHandle(const std::shared_ptr<::AgentxxPluginDriver>& driver) {
+    void retainDriverHandle(const std::shared_ptr<::PluginxxDriver>& driver) {
         if (!driver) {
             return;
         }
@@ -186,11 +186,11 @@ struct PluginInstanceBase {
     /// - `return`: true = 命中了登记表 (无论请求是否已收束, 都会调一次 cancel())
     /// - 未命中表示该句柄不属于本实例的有效窗口 (已收束且墓碑已过期, 或无效句柄):
     ///   安全忽略并记日志, 绝不解引用。
-    bool cancelDriver(const ::AgentxxPluginDriver* driver) noexcept {
+    bool cancelDriver(const ::PluginxxDriver* driver) noexcept {
         if (!driver) {
             return false;
         }
-        std::shared_ptr<::AgentxxPluginDriver> target;
+        std::shared_ptr<::PluginxxDriver> target;
         {
             std::lock_guard lock(driversMutex);
             for (const auto& entry : drivers) {
@@ -217,7 +217,7 @@ struct PluginInstanceBase {
     ///
     /// - `return`: 本次实际取消的请求数量 (0 表示没有排队中的请求)
     size_t cancelPendingDrivers() noexcept {
-        std::vector<std::shared_ptr<::AgentxxPluginDriver>> pending;
+        std::vector<std::shared_ptr<::PluginxxDriver>> pending;
         {
             std::lock_guard lock(driversMutex);
             pending.reserve(drivers.size());
@@ -296,7 +296,7 @@ public:
     /// 具体类型 (框架内核因此不依赖宿主的管理器类型)。
     std::weak_ptr<PluginRuntime> runtime;
 
-    /// 宿主控制块：交给插件的 `AgentxxPluginHost` 视图保存在控制块内（进程级
+    /// 宿主控制块：交给插件的 `PluginxxHost` 视图保存在控制块内（进程级
     /// 稳定地址），插件在实例卸载后继续使用旧 host 指针时只会安全失败。
     /// 见 [PluginHostControl]。
     std::shared_ptr<PluginHostControl> hostControl;
@@ -339,7 +339,7 @@ public:
 
     /// 交给插件的宿主视图（控制块内地址，永不失效）；未装配控制块返回 nullptr。
     /// 插件保存该指针跨卸载继续调用时，各 vtable 入口会安全失败。
-    const AgentxxPluginHost* hostView() const noexcept;
+    const PluginxxHost* hostView() const noexcept;
 
     /// 插件上下文销毁后调用：旧 host 指针之后按“实例不存在”安全失败。
     void retireHostControl() noexcept;
@@ -349,7 +349,7 @@ public:
 // 宿主控制块 (交给插件的 host 视图)
 // =====================================================================
 
-/// 宿主控制块：插件持有的 `const AgentxxPluginHost*` 必须指向进程级稳定地址。
+/// 宿主控制块：插件持有的 `const PluginxxHost*` 必须指向进程级稳定地址。
 ///
 /// 背景：插件在 create 时收到 host 指针，可能把它保存在实例字段、工作线程或
 /// 延迟任务里；实例卸载（destroy + dlclose）之后插件仍可能调用宿主 vtable。
@@ -386,7 +386,7 @@ public:
     /// 创建并注册控制块。`vtable` 为本端宿主静态函数表（agent/client 各自一份）。
     static std::shared_ptr<PluginHostControl> create(
         const std::shared_ptr<PluginInstanceBase>& instance,
-        const AgentxxHostVtable*                   vtable
+        const PluginxxHostVtable*                   vtable
     ) {
         std::shared_ptr<PluginHostControl> control(new PluginHostControl(instance, vtable));
         registerControl(control);
@@ -394,7 +394,7 @@ public:
     }
 
     /// 交给插件的 host 视图地址（控制块内，永不失效）。
-    const AgentxxPluginHost* host() const noexcept {
+    const PluginxxHost* host() const noexcept {
         return &host_;
     }
 
@@ -426,7 +426,7 @@ private:
 
     PluginHostControl(
         const std::shared_ptr<PluginInstanceBase>& instance,
-        const AgentxxHostVtable*                   vtable
+        const PluginxxHostVtable*                   vtable
     ) :
         instance_(instance),
         generation_(instance ? instance->lifetime ? instance->lifetime->generation() : 0 : 0) {
@@ -449,13 +449,13 @@ private:
         registry.controls.emplace(control->token(), control);
     }
 
-    AgentxxPluginHost                 host_{};
+    PluginxxHost                 host_{};
     std::weak_ptr<PluginInstanceBase> instance_;
     uint64_t                          generation_ = 0;
     std::atomic<bool>                 retired_{false};
 };
 
-inline const AgentxxPluginHost* PluginInstanceBase::hostView() const noexcept {
+inline const PluginxxHost* PluginInstanceBase::hostView() const noexcept {
     return hostControl ? hostControl->host() : nullptr;
 }
 
@@ -486,10 +486,10 @@ inline bool PluginInstanceBase::destroyPlugin() noexcept {
         return true;
     }
 
-    AgentxxPluginDestroyFn destroy = builtinUnload;
+    PluginxxDestroyFn destroy = builtinUnload;
     if (dlHandle) {
         std::string err;
-        destroy = reinterpret_cast<AgentxxPluginDestroyFn>(
+        destroy = reinterpret_cast<PluginxxDestroyFn>(
             NativeLoader::sym(dlHandle, pluginDestroySymbol(), err)
         );
         if (!destroy && !err.empty()) {
@@ -518,7 +518,7 @@ namespace detail {
 /// 事件订阅撤销的簿记动作 (见 pluginxx/host/event_bus.h 的声明)
 /// - 调用方已把句柄的 `alive` 置 false, 这里只做后端退订与实例订阅表清理;
 /// - 幂等: `subscriptionId` 置 0 后重复调用是空操作。
-inline void revokeSubscription(AgentxxPluginSubscription* sub) noexcept {
+inline void revokeSubscription(PluginxxSubscription* sub) noexcept {
     if (!sub) {
         return;
     }
@@ -539,7 +539,7 @@ inline void revokeSubscription(AgentxxPluginSubscription* sub) noexcept {
                 std::remove_if(
                     subs.begin(),
                     subs.end(),
-                    [sub](const std::shared_ptr<AgentxxPluginSubscription>& entry) {
+                    [sub](const std::shared_ptr<PluginxxSubscription>& entry) {
                         return entry.get() == sub;
                     }
                 ),
@@ -557,7 +557,7 @@ inline void revokeSubscription(AgentxxPluginSubscription* sub) noexcept {
 /// 解析插件传入的 host 视图对应的控制块。
 /// - 未注册的令牌（含插件复制的 host 结构被篡改、旧内存被复用后的垃圾值）返回空；
 /// - 已关闭实例返回控制块本身，调用方据此区分“实例不存在”与“参数非法”。
-inline std::shared_ptr<PluginHostControl> resolvePluginHostControl(const AgentxxPluginHost* host
+inline std::shared_ptr<PluginHostControl> resolvePluginHostControl(const PluginxxHost* host
 ) noexcept {
     if (!host || !host->opaque) {
         return nullptr;
@@ -584,8 +584,8 @@ inline void hostMemoryFree(void* ptr) {
     ::free(ptr);
 }
 
-inline AgentxxPluginString hostMemoryCreateString(AgentxxPluginStringView s) {
-    AgentxxPluginString res{nullptr, 0};
+inline PluginxxString hostMemoryCreateString(PluginxxStringView s) {
+    PluginxxString res{nullptr, 0};
     if (!s.data && s.size == 0) {
         return res;
     }
@@ -601,23 +601,23 @@ inline AgentxxPluginString hostMemoryCreateString(AgentxxPluginStringView s) {
     return res;
 }
 
-inline AgentxxPluginString hostMemoryCreateString(std::string_view sv) {
-    return hostMemoryCreateString(AgentxxPluginStringView{sv.data(), static_cast<uint64_t>(sv.size())});
+inline PluginxxString hostMemoryCreateString(std::string_view sv) {
+    return hostMemoryCreateString(PluginxxStringView{sv.data(), static_cast<uint64_t>(sv.size())});
 }
 
-inline void hostMemorySetString(AgentxxPluginString* out, std::string_view sv) {
+inline void hostMemorySetString(PluginxxString* out, std::string_view sv) {
     if (!out) {
         return;
     }
     *out = hostMemoryCreateString(sv);
 }
 
-inline AgentxxPluginString hostMemoryCreateString(const char* s) {
+inline PluginxxString hostMemoryCreateString(const char* s) {
     if (!s) {
-        return AgentxxPluginString{nullptr, 0};
+        return PluginxxString{nullptr, 0};
     }
     return hostMemoryCreateString(
-        AgentxxPluginStringView{s, static_cast<uint64_t>(std::strlen(s))}
+        PluginxxStringView{s, static_cast<uint64_t>(std::strlen(s))}
     );
 }
 

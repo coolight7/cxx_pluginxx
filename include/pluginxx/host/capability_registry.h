@@ -26,8 +26,8 @@ namespace pluginxx {
 /// 实例侧的能力声明记录 (提供者插件自己的登记表, 卸载/禁用时据此逐条撤销)
 struct PluginCapabilityRegistration {
     std::string                          name;   ///< 能力名
-    AgentxxPluginCapabilityStartFunction start  = nullptr;
-    AgentxxPluginOperatorCancelFunction  cancel = nullptr;
+    PluginxxCapabilityStartFunction start  = nullptr;
+    PluginxxOperatorCancelFunction  cancel = nullptr;
     void*                                ctx    = nullptr;
 };
 
@@ -37,8 +37,8 @@ public:
 
     struct Entry {
         std::string                          provider;
-        AgentxxPluginCapabilityStartFunction start  = nullptr;
-        AgentxxPluginOperatorCancelFunction  cancel = nullptr;
+        PluginxxCapabilityStartFunction start  = nullptr;
+        PluginxxOperatorCancelFunction  cancel = nullptr;
         void*                                ctx    = nullptr;
     };
 
@@ -46,8 +46,8 @@ public:
     bool registerCapability(
         std::string_view                     name,
         std::string_view                     provider,
-        AgentxxPluginCapabilityStartFunction start  = nullptr,
-        AgentxxPluginOperatorCancelFunction  cancel = nullptr,
+        PluginxxCapabilityStartFunction start  = nullptr,
+        PluginxxOperatorCancelFunction  cancel = nullptr,
         void*                                ctx    = nullptr
     );
 

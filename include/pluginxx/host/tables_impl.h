@@ -2,8 +2,8 @@
 ///
 /// 用法 (宿主侧 `query_interface` 实现):
 /// ```cpp
-/// const void* AGENTXX_PLUGIN_CALL xx_query_interface(
-///     const AgentxxPluginHost*, const AgentxxPluginStringView* iid) {
+/// const void* PLUGINXX_CALL xx_query_interface(
+///     const PluginxxHost*, const PluginxxStringView* iid) {
 ///     ...
 ///     if (n == "__vtable") return &hostVtable();
 ///     if (const void* t = pluginxx::queryGenericPluginIface<MyInstance, MyManager>(n)) return t;
@@ -46,7 +46,7 @@ namespace detail {
 /// - `fn` 的入参是实例与管理器 (投递期间由 `keep` 保活, 含 admission lease);
 ///   业务参数校验由 `fn` 自己完成, 失败返回非 0 状态码。
 template<typename InstanceT, typename ManagerT, typename Fn>
-int32_t onInstanceIo(const AgentxxPluginHost* host, Fn&& fn) {
+int32_t onInstanceIo(const PluginxxHost* host, Fn&& fn) {
     return guardVtableCall(-1, [&]() -> int32_t {
         auto call = enterPluginHost<InstanceT, ManagerT>(host);
         if (!call.ok()) {
@@ -66,7 +66,7 @@ int32_t onInstanceIo(const AgentxxPluginHost* host, Fn&& fn) {
 /// 只读查询类入口的公共骨架 (允许关闭中查询):
 /// 在 IO 线程取字符串结果 → 经 host->alloc 写入 `out`; 结果为空按失败返回 -1。
 template<typename InstanceT, typename ManagerT, typename Fn>
-int32_t queryStringIo(const AgentxxPluginHost* host, AgentxxPluginString* out, Fn&& fn) {
+int32_t queryStringIo(const PluginxxHost* host, PluginxxString* out, Fn&& fn) {
     if (!out) {
         return -1;
     }
@@ -101,7 +101,7 @@ template<typename InstanceT, typename ManagerT>
 struct GenericTableEntries {
     using HostCall = PluginHostCall<InstanceT, ManagerT>;
 
-    static HostCall enterHost(const AgentxxPluginHost* host, bool allowClosing = false) {
+    static HostCall enterHost(const PluginxxHost* host, bool allowClosing = false) {
         return enterPluginHost<InstanceT, ManagerT>(host, allowClosing);
     }
 
@@ -109,8 +109,8 @@ struct GenericTableEntries {
     // log 表
     // =====================================================================
 
-    static void AGENTXX_PLUGIN_CALL
-        logEntry(const AgentxxPluginHost* host, int32_t level, const AgentxxPluginStringView* msg) {
+    static void PLUGINXX_CALL
+        logEntry(const PluginxxHost* host, int32_t level, const PluginxxStringView* msg) {
         (void)host;
         using utilxx_base::LogLevel;
         LogLevel lv = LogLevel::Info;
@@ -140,11 +140,11 @@ struct GenericTableEntries {
     // json 表
     // =====================================================================
 
-    static int32_t AGENTXX_PLUGIN_CALL jsonGetStringEntry(
-        const AgentxxPluginHost*       host,
-        const AgentxxPluginStringView* json,
-        const AgentxxPluginStringView* key,
-        AgentxxPluginString*           out
+    static int32_t PLUGINXX_CALL jsonGetStringEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* json,
+        const PluginxxStringView* key,
+        PluginxxString*           out
     ) {
         if (!out) {
             return -1;
@@ -166,10 +166,10 @@ struct GenericTableEntries {
         return -1;
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL jsonEscapeEntry(
-        const AgentxxPluginHost*       host,
-        const AgentxxPluginStringView* s,
-        AgentxxPluginString*           out
+    static int32_t PLUGINXX_CALL jsonEscapeEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* s,
+        PluginxxString*           out
     ) {
         if (!out) {
             return -1;
@@ -225,8 +225,8 @@ struct GenericTableEntries {
     // config 表
     // =====================================================================
 
-    static int32_t AGENTXX_PLUGIN_CALL
-        configGetEntry(const AgentxxPluginHost* host, AgentxxPluginString* out) {
+    static int32_t PLUGINXX_CALL
+        configGetEntry(const PluginxxHost* host, PluginxxString* out) {
         return detail::queryStringIo<InstanceT, ManagerT>(
             host,
             out,
@@ -238,8 +238,8 @@ struct GenericTableEntries {
         );
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL
-        pluginArgsEntry(const AgentxxPluginHost* host, AgentxxPluginString* out) {
+    static int32_t PLUGINXX_CALL
+        pluginArgsEntry(const PluginxxHost* host, PluginxxString* out) {
         return guardVtableCall(-1, [&]() -> int32_t {
             if (!out) {
                 return -1;
@@ -260,10 +260,10 @@ struct GenericTableEntries {
         });
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL toolPromptEntry(
-        const AgentxxPluginHost*       host,
-        const AgentxxPluginStringView* tool_name,
-        AgentxxPluginString*           out
+    static int32_t PLUGINXX_CALL toolPromptEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* tool_name,
+        PluginxxString*           out
     ) {
         return guardVtableCall(-1, [&]() -> int32_t {
             if (!out) {
@@ -288,10 +288,10 @@ struct GenericTableEntries {
         });
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL sessionWorkDirEntry(
-        const AgentxxPluginHost*       host,
-        const AgentxxPluginStringView* thread_id,
-        AgentxxPluginString*           out
+    static int32_t PLUGINXX_CALL sessionWorkDirEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* thread_id,
+        PluginxxString*           out
     ) {
         return guardVtableCall(-1, [&]() -> int32_t {
             if (!out) {
@@ -317,8 +317,8 @@ struct GenericTableEntries {
         });
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL
-        pluginConfigPathEntry(const AgentxxPluginHost* host, AgentxxPluginString* out) {
+    static int32_t PLUGINXX_CALL
+        pluginConfigPathEntry(const PluginxxHost* host, PluginxxString* out) {
         return detail::queryStringIo<InstanceT, ManagerT>(
             host,
             out,
@@ -329,8 +329,8 @@ struct GenericTableEntries {
         );
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL
-        languageGetEntry(const AgentxxPluginHost* host, AgentxxPluginString* out) {
+    static int32_t PLUGINXX_CALL
+        languageGetEntry(const PluginxxHost* host, PluginxxString* out) {
         return guardVtableCall(-1, [&]() -> int32_t {
             if (!out) {
                 return -1;
@@ -353,9 +353,9 @@ struct GenericTableEntries {
         });
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL languageSetEntry(
-        const AgentxxPluginHost*       host,
-        const AgentxxPluginStringView* language
+    static int32_t PLUGINXX_CALL languageSetEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* language
     ) {
         return guardVtableCall(-1, [&]() -> int32_t {
             auto call = enterHost(host);
@@ -378,8 +378,8 @@ struct GenericTableEntries {
     // plugins 表
     // =====================================================================
 
-    static int32_t AGENTXX_PLUGIN_CALL
-        listPluginsEntry(const AgentxxPluginHost* host, AgentxxPluginString* out) {
+    static int32_t PLUGINXX_CALL
+        listPluginsEntry(const PluginxxHost* host, PluginxxString* out) {
         return detail::queryStringIo<InstanceT, ManagerT>(
             host,
             out,
@@ -391,10 +391,10 @@ struct GenericTableEntries {
         );
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL getPluginEntry(
-        const AgentxxPluginHost*       host,
-        const AgentxxPluginStringView* name,
-        AgentxxPluginString*           out
+    static int32_t PLUGINXX_CALL getPluginEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* name,
+        PluginxxString*           out
     ) {
         return guardVtableCall(-1, [&]() -> int32_t {
             if (!out) {
@@ -419,8 +419,8 @@ struct GenericTableEntries {
         });
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL
-        ownInfoEntry(const AgentxxPluginHost* host, AgentxxPluginString* out) {
+    static int32_t PLUGINXX_CALL
+        ownInfoEntry(const PluginxxHost* host, PluginxxString* out) {
         return guardVtableCall(-1, [&]() -> int32_t {
             if (!out) {
                 return -1;
@@ -449,22 +449,22 @@ struct GenericTableEntries {
     // events 表
     // =====================================================================
 
-    static AgentxxPluginSubscription* AGENTXX_PLUGIN_CALL subscribeEntry(
-        const AgentxxPluginHost*       host,
-        const AgentxxPluginStringView* topic,
-        void(AGENTXX_PLUGIN_CALL* handler)(const AgentxxPluginStringView* event_json, void* ud),
+    static PluginxxSubscription* PLUGINXX_CALL subscribeEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* topic,
+        void(PLUGINXX_CALL* handler)(const PluginxxStringView* event_json, void* ud),
         void* ud
     ) {
-        return guardVtableCall(nullptr, [&]() -> AgentxxPluginSubscription* {
+        return guardVtableCall(nullptr, [&]() -> PluginxxSubscription* {
             auto call = enterHost(host);
             auto mgr  = call.manager();
             auto inst = call.instance();
             if (!mgr || !inst || detail::abiViewEmpty(topic) || !handler) {
-                return static_cast<AgentxxPluginSubscription*>(nullptr);
+                return static_cast<PluginxxSubscription*>(nullptr);
             }
             auto              keep      = call;
             const std::string topicCopy = svToStr(*topic);
-            return ioCallSyncKeep<AgentxxPluginSubscription*>(
+            return ioCallSyncKeep<PluginxxSubscription*>(
                 keep,
                 mgr,
                 [keep, topicCopy, handler, ud]() {
@@ -474,16 +474,16 @@ struct GenericTableEntries {
         });
     }
 
-    static void AGENTXX_PLUGIN_CALL unsubscribeEntry(AgentxxPluginSubscription* sub) {
+    static void PLUGINXX_CALL unsubscribeEntry(PluginxxSubscription* sub) {
         guardVtableCallVoid([&] {
             unsubscribePluginSubscription(sub);
         });
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL publishEntry(
-        const AgentxxPluginHost*       host,
-        const AgentxxPluginStringView* topic,
-        const AgentxxPluginStringView* event_json
+    static int32_t PLUGINXX_CALL publishEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* topic,
+        const PluginxxStringView* event_json
     ) {
         return guardVtableCall(-1, [&]() -> int32_t {
             auto call = enterHost(host);
@@ -509,9 +509,9 @@ struct GenericTableEntries {
     // capabilities 表
     // =====================================================================
 
-    static int32_t AGENTXX_PLUGIN_CALL capabilityRegisterEntry(
-        const AgentxxPluginHost*       host,
-        const AgentxxPluginStringView* capability
+    static int32_t PLUGINXX_CALL capabilityRegisterEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* capability
     ) {
         if (detail::abiViewEmpty(capability)) {
             return -1;
@@ -525,9 +525,9 @@ struct GenericTableEntries {
         );
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL capabilityUnregisterEntry(
-        const AgentxxPluginHost*       host,
-        const AgentxxPluginStringView* capability
+    static int32_t PLUGINXX_CALL capabilityUnregisterEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* capability
     ) {
         if (detail::abiViewEmpty(capability)) {
             return -1;
@@ -541,8 +541,8 @@ struct GenericTableEntries {
         );
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL
-        capabilityHasEntry(const AgentxxPluginHost* host, const AgentxxPluginStringView* capability) {
+    static int32_t PLUGINXX_CALL
+        capabilityHasEntry(const PluginxxHost* host, const PluginxxStringView* capability) {
         return guardVtableCall(0, [&]() -> int32_t {
             auto call = enterHost(host, /*allowClosing=*/true);
             auto mgr  = call.manager();
@@ -559,11 +559,11 @@ struct GenericTableEntries {
         });
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL capabilityRegisterExEntry(
-        const AgentxxPluginHost*             host,
-        const AgentxxPluginStringView*       capability,
-        AgentxxPluginCapabilityStartFunction start,
-        AgentxxPluginOperatorCancelFunction  cancel,
+    static int32_t PLUGINXX_CALL capabilityRegisterExEntry(
+        const PluginxxHost*             host,
+        const PluginxxStringView*       capability,
+        PluginxxCapabilityStartFunction start,
+        PluginxxOperatorCancelFunction  cancel,
         void*                                ctx
     ) {
         return guardVtableCall(-1, [&]() -> int32_t {
@@ -587,28 +587,28 @@ struct GenericTableEntries {
         });
     }
 
-    static AgentxxPluginOperatorHandle* AGENTXX_PLUGIN_CALL invokeCapabilityAsyncEntry(
-        const AgentxxPluginHost*       host,
-        const AgentxxPluginStringView* capability,
-        const AgentxxPluginStringView* method,
-        const AgentxxPluginStringView* args_json,
-        AgentxxPluginOperatorCallback  cb,
+    static PluginxxOperatorHandle* PLUGINXX_CALL invokeCapabilityAsyncEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* capability,
+        const PluginxxStringView* method,
+        const PluginxxStringView* args_json,
+        PluginxxOperatorCallback  cb,
         void*                          ud,
-        AgentxxPluginString*           error_out
+        PluginxxString*           error_out
     ) {
-        return guardVtableCall<AgentxxPluginOperatorHandle*>(nullptr, [&]() {
+        return guardVtableCall<PluginxxOperatorHandle*>(nullptr, [&]() {
             auto call = enterHost(host);
             auto mgr  = call.manager();
             auto inst = call.instance();
             if (!mgr || !inst || detail::abiViewEmpty(capability) || detail::abiViewEmpty(method)) {
-                return static_cast<AgentxxPluginOperatorHandle*>(nullptr);
+                return static_cast<PluginxxOperatorHandle*>(nullptr);
             }
             // 跨边界视图只在本次调用内有效: 投递前复制为自有字符串
             auto              keep = call;
             const std::string cap  = svToStr(*capability);
             const std::string meth = svToStr(*method);
             const std::string args = args_json ? svToStr(*args_json) : std::string{"{}"};
-            return ioCallSyncKeep<AgentxxPluginOperatorHandle*>(
+            return ioCallSyncKeep<PluginxxOperatorHandle*>(
                 keep,
                 mgr,
                 [keep, cap, meth, args, cb, ud, error_out]() {
@@ -630,15 +630,15 @@ struct GenericTableEntries {
     // scheduler 表
     // =====================================================================
 
-    static int32_t AGENTXX_PLUGIN_CALL isIoThreadEntry(const AgentxxPluginHost* host) {
+    static int32_t PLUGINXX_CALL isIoThreadEntry(const PluginxxHost* host) {
         // 只读查询：关闭过程中仍允许回答（返回 0 表示"不是 IO 线程"）
         auto call = enterHost(host, /*allowClosing=*/true);
         auto mgr  = call.manager();
         return (mgr && mgr->isIoThread()) ? 1 : 0;
     }
 
-    static int32_t AGENTXX_PLUGIN_CALL
-        postToIoEntry(const AgentxxPluginHost* host, void(AGENTXX_PLUGIN_CALL* fn)(void*), void* ud) {
+    static int32_t PLUGINXX_CALL
+        postToIoEntry(const PluginxxHost* host, void(PLUGINXX_CALL* fn)(void*), void* ud) {
         return guardVtableCall(-1, [&]() -> int32_t {
             auto call = enterHost(host);
             auto mgr  = call.manager();
@@ -653,24 +653,24 @@ struct GenericTableEntries {
         });
     }
 
-    static AgentxxPluginOperatorHandle* AGENTXX_PLUGIN_CALL sleepEntry(
-        const AgentxxPluginHost*      host,
+    static PluginxxOperatorHandle* PLUGINXX_CALL sleepEntry(
+        const PluginxxHost*      host,
         int64_t                       ms,
-        AgentxxPluginOperatorCallback cb,
+        PluginxxOperatorCallback cb,
         void*                         ud,
-        AgentxxPluginString*          error_out
+        PluginxxString*          error_out
     ) {
-        return guardVtableCall<AgentxxPluginOperatorHandle*>(nullptr, [&]() {
+        return guardVtableCall<PluginxxOperatorHandle*>(nullptr, [&]() {
             auto call = enterHost(host);
             auto mgr  = call.manager();
             auto inst = call.instance();
             if (!mgr || !inst || !cb) {
                 detail::setErrorString(error_out, "scheduler sleep: plugin runtime unavailable");
-                return static_cast<AgentxxPluginOperatorHandle*>(nullptr);
+                return static_cast<PluginxxOperatorHandle*>(nullptr);
             }
             // sleep 自身会经 OpCore 获取实例执行 lease, 这里只需投递到 IO 线程
             auto keep = call;
-            return ioCallSyncKeep<AgentxxPluginOperatorHandle*>(
+            return ioCallSyncKeep<PluginxxOperatorHandle*>(
                 keep,
                 mgr,
                 [keep, ms, cb, ud, error_out]() {
@@ -680,32 +680,32 @@ struct GenericTableEntries {
         });
     }
 
-    static AgentxxPluginOperatorHandle* AGENTXX_PLUGIN_CALL offloadEntry(
-        const AgentxxPluginHost* host,
-        void*(AGENTXX_PLUGIN_CALL* work)(
+    static PluginxxOperatorHandle* PLUGINXX_CALL offloadEntry(
+        const PluginxxHost* host,
+        void*(PLUGINXX_CALL* work)(
             void*                           ud,
-            const AgentxxPluginCancelToken* token,
-            AgentxxPluginString*            error_out
+            const PluginxxCancelToken* token,
+            PluginxxString*            error_out
         ),
-        void(AGENTXX_PLUGIN_CALL* done)(
+        void(PLUGINXX_CALL* done)(
             void*                          ud,
             int32_t                        status,
             void*                          result,
-            const AgentxxPluginStringView* error
+            const PluginxxStringView* error
         ),
         void*                ud,
-        AgentxxPluginString* error_out
+        PluginxxString* error_out
     ) {
-        return guardVtableCall<AgentxxPluginOperatorHandle*>(nullptr, [&]() {
+        return guardVtableCall<PluginxxOperatorHandle*>(nullptr, [&]() {
             auto call = enterHost(host);
             auto mgr  = call.manager();
             auto inst = call.instance();
             if (!mgr || !inst || !work) {
                 detail::setErrorString(error_out, "scheduler offload: plugin runtime unavailable");
-                return static_cast<AgentxxPluginOperatorHandle*>(nullptr);
+                return static_cast<PluginxxOperatorHandle*>(nullptr);
             }
             auto keep = call;
-            return ioCallSyncKeep<AgentxxPluginOperatorHandle*>(
+            return ioCallSyncKeep<PluginxxOperatorHandle*>(
                 keep,
                 mgr,
                 [keep, work, done, ud, error_out]() {
@@ -716,7 +716,7 @@ struct GenericTableEntries {
     }
 
     /// Operation 取消 (scheduler / capabilities / tasks 三张表共用)
-    static void AGENTXX_PLUGIN_CALL opCancelEntry(AgentxxPluginOperatorHandle* op) {
+    static void PLUGINXX_CALL opCancelEntry(PluginxxOperatorHandle* op) {
         cancelPluginOperation(op);
     }
 
@@ -733,16 +733,16 @@ struct GenericTableEntries {
     /// - Disabled/Closed 拒绝 (lease 获取失败);
     /// - 入队失败 (IO executor 不可用/已停止) 返回 NULL, 调用方必须把受影响的操作
     ///   以失败终结, 并且请求此时已经收束 (不会泄漏 lease)。
-    static AgentxxPluginDriver* AGENTXX_PLUGIN_CALL requestDriverEntry(
-        const AgentxxPluginHost*   host,
-        AgentxxPluginDriveOnceFn   drive_once,
+    static PluginxxDriver* PLUGINXX_CALL requestDriverEntry(
+        const PluginxxHost*   host,
+        PluginxxDriveOnceFn   drive_once,
         void*                      user_data,
-        AgentxxPluginString*       error_out
+        PluginxxString*       error_out
     ) {
-        return guardVtableCall<AgentxxPluginDriver*>(nullptr, [&]() {
+        return guardVtableCall<PluginxxDriver*>(nullptr, [&]() {
             if (!drive_once) {
                 detail::setErrorString(error_out, "coroutine runtime: null drive callback");
-                return static_cast<AgentxxPluginDriver*>(nullptr);
+                return static_cast<PluginxxDriver*>(nullptr);
             }
             auto call = enterHost(host, /*allowClosing=*/true);
             auto inst = call.instance();
@@ -752,9 +752,9 @@ struct GenericTableEntries {
                     error_out,
                     "coroutine runtime: plugin instance is closed or unavailable"
                 );
-                return static_cast<AgentxxPluginDriver*>(nullptr);
+                return static_cast<PluginxxDriver*>(nullptr);
             }
-            auto driver = AgentxxPluginDriver::create(
+            auto driver = PluginxxDriver::create(
                 mgr->runtime(),
                 inst->lifetime,
                 drive_once,
@@ -766,13 +766,13 @@ struct GenericTableEntries {
                     error_out,
                     "coroutine runtime: plugin instance is closing or closed"
                 );
-                return static_cast<AgentxxPluginDriver*>(nullptr);
+                return static_cast<PluginxxDriver*>(nullptr);
             }
             // 句柄墓碑先登记再排队: 迟到 cancel_driver 只会观察终态, 不会解引用已释放对象。
             inst->retainDriverHandle(driver);
             if (!driver->schedule()) {
                 detail::setErrorString(error_out, "coroutine runtime: host IO executor is unavailable");
-                return static_cast<AgentxxPluginDriver*>(nullptr);
+                return static_cast<PluginxxDriver*>(nullptr);
             }
             return driver.get();
         });
@@ -782,12 +782,12 @@ struct GenericTableEntries {
     ///
     /// `cancel_driver` 的 ABI 形态不含 host 参数, 因此句柄校验走请求自身的进程级
     /// 地址注册表: 命中才解引用 (weak_ptr 升级为强引用), 伪造/过期指针安全忽略。
-    static void AGENTXX_PLUGIN_CALL cancelDriverEntry(AgentxxPluginDriver* driver) {
+    static void PLUGINXX_CALL cancelDriverEntry(PluginxxDriver* driver) {
         if (!driver) {
             return;
         }
         guardVtableCallVoid([&] {
-            if (!AgentxxPluginDriver::cancelByHandle(driver)) {
+            if (!PluginxxDriver::cancelByHandle(driver)) {
                 XX_LOGW("Plugin driver cancellation ignored: handle is not an active ticket");
             }
         });
@@ -797,22 +797,22 @@ struct GenericTableEntries {
     // tasks 表
     // =====================================================================
 
-    static AgentxxPluginOperatorHandle* AGENTXX_PLUGIN_CALL registerTaskEntry(
-        const AgentxxPluginHost*            host,
-        AgentxxPluginOperatorCancelFunction cancel_fn,
+    static PluginxxOperatorHandle* PLUGINXX_CALL registerTaskEntry(
+        const PluginxxHost*            host,
+        PluginxxOperatorCancelFunction cancel_fn,
         void*                               cancel_ud,
-        AgentxxPluginOperatorNotify*        notify,
-        AgentxxPluginString*                error_out
+        PluginxxOperatorNotify*        notify,
+        PluginxxString*                error_out
     ) {
-        return guardVtableCall<AgentxxPluginOperatorHandle*>(nullptr, [&]() {
+        return guardVtableCall<PluginxxOperatorHandle*>(nullptr, [&]() {
             auto call = enterHost(host);
             auto mgr  = call.manager();
             auto inst = call.instance();
             if (!mgr || !inst || !notify) {
-                return static_cast<AgentxxPluginOperatorHandle*>(nullptr);
+                return static_cast<PluginxxOperatorHandle*>(nullptr);
             }
             auto keep = call;
-            return ioCallSyncKeep<AgentxxPluginOperatorHandle*>(
+            return ioCallSyncKeep<PluginxxOperatorHandle*>(
                 keep,
                 mgr,
                 [keep, cancel_fn, cancel_ud, notify, error_out]() {
@@ -827,9 +827,9 @@ struct GenericTableEntries {
     // cancel 表
     // =====================================================================
 
-    static int32_t AGENTXX_PLUGIN_CALL cancelIsCancelledEntry(
-        const AgentxxPluginHost*       host,
-        const AgentxxPluginStringView* thread_id
+    static int32_t PLUGINXX_CALL cancelIsCancelledEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* thread_id
     ) {
         return guardVtableCall(0, [&]() -> int32_t {
             auto call = enterHost(host, /*allowClosing=*/true);
@@ -852,29 +852,29 @@ struct GenericTableEntries {
     // 表结构体 (首次查询时构造; 线程安全的静态初始化)
     // =====================================================================
 
-    static const AgentxxPluginLogIface& logIface() {
-        static const AgentxxPluginLogIface iface{
-            AGENTXX_PLUGIN_IFACE_AGENT_LOG_VERSION,
-            sizeof(AgentxxPluginLogIface),
+    static const PluginxxLogIface& logIface() {
+        static const PluginxxLogIface iface{
+            PLUGINXX_IFACE_LOG_VERSION,
+            sizeof(PluginxxLogIface),
             &logEntry,
         };
         return iface;
     }
 
-    static const AgentxxPluginJsonIface& jsonIface() {
-        static const AgentxxPluginJsonIface iface{
-            AGENTXX_PLUGIN_IFACE_AGENT_JSON_VERSION,
-            sizeof(AgentxxPluginJsonIface),
+    static const PluginxxJsonIface& jsonIface() {
+        static const PluginxxJsonIface iface{
+            PLUGINXX_IFACE_JSON_VERSION,
+            sizeof(PluginxxJsonIface),
             &jsonGetStringEntry,
             &jsonEscapeEntry,
         };
         return iface;
     }
 
-    static const AgentxxPluginConfigIface& configIface() {
-        static const AgentxxPluginConfigIface iface{
-            AGENTXX_PLUGIN_IFACE_AGENT_CONFIG_VERSION,
-            sizeof(AgentxxPluginConfigIface),
+    static const PluginxxConfigIface& configIface() {
+        static const PluginxxConfigIface iface{
+            PLUGINXX_IFACE_CONFIG_VERSION,
+            sizeof(PluginxxConfigIface),
             &configGetEntry,
             &pluginArgsEntry,
             &toolPromptEntry,
@@ -886,10 +886,10 @@ struct GenericTableEntries {
         return iface;
     }
 
-    static const AgentxxPluginsIface& pluginsIface() {
-        static const AgentxxPluginsIface iface{
-            AGENTXX_PLUGIN_IFACE_AGENT_PLUGINS_VERSION,
-            sizeof(AgentxxPluginsIface),
+    static const PluginxxPluginsIface& pluginsIface() {
+        static const PluginxxPluginsIface iface{
+            PLUGINXX_IFACE_PLUGINS_VERSION,
+            sizeof(PluginxxPluginsIface),
             &listPluginsEntry,
             &getPluginEntry,
             &ownInfoEntry,
@@ -897,10 +897,10 @@ struct GenericTableEntries {
         return iface;
     }
 
-    static const AgentxxPluginEventsIface& eventsIface() {
-        static const AgentxxPluginEventsIface iface{
-            AGENTXX_PLUGIN_IFACE_AGENT_EVENTS_VERSION,
-            sizeof(AgentxxPluginEventsIface),
+    static const PluginxxEventsIface& eventsIface() {
+        static const PluginxxEventsIface iface{
+            PLUGINXX_IFACE_EVENTS_VERSION,
+            sizeof(PluginxxEventsIface),
             &subscribeEntry,
             &unsubscribeEntry,
             &publishEntry,
@@ -908,10 +908,10 @@ struct GenericTableEntries {
         return iface;
     }
 
-    static const AgentxxPluginCapabilitiesIface& capabilitiesIface() {
-        static const AgentxxPluginCapabilitiesIface iface{
-            AGENTXX_PLUGIN_IFACE_AGENT_CAPABILITIES_VERSION,
-            sizeof(AgentxxPluginCapabilitiesIface),
+    static const PluginxxCapabilitiesIface& capabilitiesIface() {
+        static const PluginxxCapabilitiesIface iface{
+            PLUGINXX_IFACE_CAPABILITIES_VERSION,
+            sizeof(PluginxxCapabilitiesIface),
             &capabilityRegisterEntry,
             &capabilityRegisterExEntry,
             &capabilityUnregisterEntry,
@@ -922,10 +922,10 @@ struct GenericTableEntries {
         return iface;
     }
 
-    static const AgentxxPluginSchedulerIface& schedulerIface() {
-        static const AgentxxPluginSchedulerIface iface{
-            AGENTXX_PLUGIN_IFACE_AGENT_SCHEDULER_VERSION,
-            sizeof(AgentxxPluginSchedulerIface),
+    static const PluginxxSchedulerIface& schedulerIface() {
+        static const PluginxxSchedulerIface iface{
+            PLUGINXX_IFACE_SCHEDULER_VERSION,
+            sizeof(PluginxxSchedulerIface),
             &isIoThreadEntry,
             &postToIoEntry,
             &sleepEntry,
@@ -935,10 +935,10 @@ struct GenericTableEntries {
         return iface;
     }
 
-    static const AgentxxPluginCoroutineRuntimeIface& coroutineRuntimeIface() {
-        static const AgentxxPluginCoroutineRuntimeIface iface{
-            AGENTXX_PLUGIN_IFACE_COROUTINE_RUNTIME_VERSION,
-            sizeof(AgentxxPluginCoroutineRuntimeIface),
+    static const PluginxxCoroutineRuntimeIface& coroutineRuntimeIface() {
+        static const PluginxxCoroutineRuntimeIface iface{
+            PLUGINXX_IFACE_COROUTINE_RUNTIME_VERSION,
+            sizeof(PluginxxCoroutineRuntimeIface),
             &requestDriverEntry,
             &cancelDriverEntry,
             &isIoThreadEntry,
@@ -946,20 +946,20 @@ struct GenericTableEntries {
         return iface;
     }
 
-    static const AgentxxPluginTasksIface& tasksIface() {
-        static const AgentxxPluginTasksIface iface{
-            AGENTXX_PLUGIN_IFACE_AGENT_TASKS_VERSION,
-            sizeof(AgentxxPluginTasksIface),
+    static const PluginxxTasksIface& tasksIface() {
+        static const PluginxxTasksIface iface{
+            PLUGINXX_IFACE_TASKS_VERSION,
+            sizeof(PluginxxTasksIface),
             &registerTaskEntry,
             &opCancelEntry,
         };
         return iface;
     }
 
-    static const AgentxxPluginCancelIface& cancelIface() {
-        static const AgentxxPluginCancelIface iface{
-            AGENTXX_PLUGIN_IFACE_AGENT_CANCEL_VERSION,
-            sizeof(AgentxxPluginCancelIface),
+    static const PluginxxCancelIface& cancelIface() {
+        static const PluginxxCancelIface iface{
+            PLUGINXX_IFACE_CANCEL_VERSION,
+            sizeof(PluginxxCancelIface),
             &cancelIsCancelledEntry,
         };
         return iface;
@@ -971,34 +971,34 @@ struct GenericTableEntries {
 template<typename InstanceT, typename ManagerT>
 const void* queryGenericPluginIface(std::string_view iid) {
     using Entries = GenericTableEntries<InstanceT, ManagerT>;
-    if (iid == AGENTXX_PLUGIN_IFACE_AGENT_LOG) {
+    if (iid == PLUGINXX_IFACE_LOG) {
         return &Entries::logIface();
     }
-    if (iid == AGENTXX_PLUGIN_IFACE_AGENT_JSON) {
+    if (iid == PLUGINXX_IFACE_JSON) {
         return &Entries::jsonIface();
     }
-    if (iid == AGENTXX_PLUGIN_IFACE_AGENT_CONFIG) {
+    if (iid == PLUGINXX_IFACE_CONFIG) {
         return &Entries::configIface();
     }
-    if (iid == AGENTXX_PLUGIN_IFACE_AGENT_PLUGINS) {
+    if (iid == PLUGINXX_IFACE_PLUGINS) {
         return &Entries::pluginsIface();
     }
-    if (iid == AGENTXX_PLUGIN_IFACE_AGENT_EVENTS) {
+    if (iid == PLUGINXX_IFACE_EVENTS) {
         return &Entries::eventsIface();
     }
-    if (iid == AGENTXX_PLUGIN_IFACE_AGENT_CAPABILITIES) {
+    if (iid == PLUGINXX_IFACE_CAPABILITIES) {
         return &Entries::capabilitiesIface();
     }
-    if (iid == AGENTXX_PLUGIN_IFACE_AGENT_SCHEDULER) {
+    if (iid == PLUGINXX_IFACE_SCHEDULER) {
         return &Entries::schedulerIface();
     }
-    if (iid == AGENTXX_PLUGIN_IFACE_COROUTINE_RUNTIME) {
+    if (iid == PLUGINXX_IFACE_COROUTINE_RUNTIME) {
         return &Entries::coroutineRuntimeIface();
     }
-    if (iid == AGENTXX_PLUGIN_IFACE_AGENT_TASKS) {
+    if (iid == PLUGINXX_IFACE_TASKS) {
         return &Entries::tasksIface();
     }
-    if (iid == AGENTXX_PLUGIN_IFACE_AGENT_CANCEL) {
+    if (iid == PLUGINXX_IFACE_CANCEL) {
         return &Entries::cancelIface();
     }
     return nullptr;

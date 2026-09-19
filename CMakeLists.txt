@@ -34,6 +34,11 @@ include(CMakePackageConfigHelpers)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED OFF)
 
+# C ABI 头以 C 语言编译校验 (src/api_abi_check.c 使用 _Static_assert/_Alignof):
+# 独立构建本库时必须显式指定 C 标准, 否则 MSVC 按旧 C 方言编译导致校验失败。
+set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
 if (XX_IS_MSVC_D)
   list(PREPEND CMAKE_FIND_LIBRARY_SUFFIXES .lib .a)
 else ()

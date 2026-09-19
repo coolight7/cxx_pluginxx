@@ -5,8 +5,8 @@ namespace pluginxx {
 bool CapabilityRegistry::registerCapability(
     std::string_view                     name,
     std::string_view                     provider,
-    AgentxxPluginCapabilityStartFunction start,
-    AgentxxPluginOperatorCancelFunction  cancel,
+    PluginxxCapabilityStartFunction start,
+    PluginxxOperatorCancelFunction  cancel,
     void*                                ctx
 ) {
     if (name.empty()) {

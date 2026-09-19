@@ -78,7 +78,7 @@ struct PluginHostCall {
 ///   执行（由 lease 保证 unload 等待其返回），但不产生新注册。
 template<typename InstanceT, typename ManagerT>
 inline PluginHostCall<InstanceT, ManagerT>
-    enterPluginHost(const AgentxxPluginHost* host, bool allowClosing = false) {
+    enterPluginHost(const PluginxxHost* host, bool allowClosing = false) {
     PluginHostCall<InstanceT, ManagerT> call;
     auto                                control = resolvePluginHostControl(host);
     if (!control) {

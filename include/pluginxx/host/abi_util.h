@@ -32,35 +32,35 @@ namespace pluginxx {
 
 /// C ABI 字符串视图 → std::string_view (**零拷贝**)
 /// - 视图指针为空时返回空视图 (**非**空指针解引用)
-inline std::string_view svToSv(AgentxxPluginStringView sv) noexcept {
+inline std::string_view svToSv(PluginxxStringView sv) noexcept {
     return sv.data ? std::string_view{sv.data, static_cast<size_t>(sv.size)} : std::string_view{};
 }
 
 /// C ABI 字符串视图指针 → std::string_view (**零拷贝**)
 /// - 指针或视图为空时返回空视图
-inline std::string_view svToSv(const AgentxxPluginStringView* sv) noexcept {
+inline std::string_view svToSv(const PluginxxStringView* sv) noexcept {
     return (sv && sv->data) ? std::string_view{sv->data, static_cast<size_t>(sv->size)}
                             : std::string_view{};
 }
 
 /// C ABI 字符串视图 → std::string (**拷贝**)
-inline std::string svToStr(AgentxxPluginStringView sv) {
+inline std::string svToStr(PluginxxStringView sv) {
     return sv.data ? std::string{sv.data, static_cast<size_t>(sv.size)} : std::string{};
 }
 
 /// C ABI 字符串视图指针 → std::string (**拷贝**)
-inline std::string svToStr(const AgentxxPluginStringView* sv) {
+inline std::string svToStr(const PluginxxStringView* sv) {
     return (sv && sv->data) ? std::string{sv->data, static_cast<size_t>(sv->size)} : std::string{};
 }
 
 /// std::string_view → C ABI 字符串视图 (**借用, 不复制**)
 /// - 调用方须保证被引用内存比视图长命 (跨边界只读入参场景)
-inline AgentxxPluginStringView strToSv(std::string_view sv) noexcept {
-    return AgentxxPluginStringView{sv.data(), static_cast<uint64_t>(sv.size())};
+inline PluginxxStringView strToSv(std::string_view sv) noexcept {
+    return PluginxxStringView{sv.data(), static_cast<uint64_t>(sv.size())};
 }
 
 /// C ABI 字符串视图 → std::string_view (实现见 src/manifest.cpp)
-PLUGINXX_API std::string_view pluginStringView2std(AgentxxPluginStringView str);
+PLUGINXX_API std::string_view pluginStringView2std(PluginxxStringView str);
 
 /// ==================== C ABI 边界异常兜底 ====================
 namespace detail {
