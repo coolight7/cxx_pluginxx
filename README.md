@@ -123,6 +123,14 @@ target_link_libraries(your_target PRIVATE cxx_pluginxx_static)  # 或 cxx_plugin
 
 ## 导出面
 
-动态变体仅导出本库命名空间符号 (`*pluginxx*` / `*utilxx*`), ELF 上经 version script
-白名单控制, MSVC 上仅导出本目标自有符号 —— 静态链入的第三方符号不外泄。
+动态变体**默认不导出任何符号**, 只有公开头文件中标注 `PLUGINXX_API` 的 API 才进入
+导出表/导入库 (静态链入的第三方符号、std 模板实例都不会外泄):
+
+- MSVC: 标注展开为 `dllexport` (构建动态库时) / `dllimport` (使用方);
+  静态使用方由目标接口定义 `CXX_PLUGINXX_STATIC`, 宏展开为空
+- GCC/Clang: 编译期 `-fvisibility=hidden` (+ `-fvisibility-inlines-hidden`),
+  标注展开为 `visibility("default")`; version script 仅保留 `local: *` 作为兜底
+- 不使用 CMake 的 `WINDOWS_EXPORT_ALL_SYMBOLS`: 该机制要解析每个 `.obj` 的符号表
+  生成 `.def`, 而 `/GL` (LTO) 产物只有编译器中间表示、没有符号表, 二者互斥
+
 插件动态库的导出面由宿主构建侧另行约束 (仅 `agentxx_plugin_*` 入口)。

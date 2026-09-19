@@ -17,6 +17,7 @@
 #define PLUGINXX_HOST_MANIFEST_H
 
 #include "pluginxx/api/abi.h"
+#include "pluginxx/export.h"
 #include "utilxx_base/log.h"
 
 #include <filesystem>
@@ -54,23 +55,23 @@ struct BuiltinPluginProvider {
 };
 
 /// 注册内置插件清单提供者 (宿主静态初始化期调用一次即可; 幂等覆盖)
-void setBuiltinPluginProvider(BuiltinPluginProvider provider) noexcept;
+PLUGINXX_API void setBuiltinPluginProvider(BuiltinPluginProvider provider) noexcept;
 
 /// 读取当前注册的内置插件清单提供者
-BuiltinPluginProvider builtinPluginProvider() noexcept;
+PLUGINXX_API BuiltinPluginProvider builtinPluginProvider() noexcept;
 
 /// 按名查找内置插件描述 (未注册提供者/未命中返回 nullptr)
-const AgentxxPluginBuiltinInfo* findBuiltinPlugin(std::string_view name);
+PLUGINXX_API const AgentxxPluginBuiltinInfo* findBuiltinPlugin(std::string_view name);
 
 /// 按名查找内置内嵌清单 (未注册提供者/未命中返回 nullptr)
-const AgentxxPluginBuiltinManifest* findBuiltinManifest(std::string_view name);
+PLUGINXX_API const AgentxxPluginBuiltinManifest* findBuiltinManifest(std::string_view name);
 
 /// 从库文件名推断插件名 (libfoo.so → foo; foo.dll → foo; libfoo.so.1.2 → foo;
 /// my.plugin.so → my.plugin)
 /// - 扩展名剥离用 rfind (兼容文件名内含扩展名片段, 如 my.plugin.so → my.plugin)
 /// - 仅当剥离过扩展名后才去 lib 前缀: 无扩展名的库/目录 (如插件目录
 ///   `libanalysis`) 保持原名, 避免误剥
-std::string pluginNameFromPath(const std::string& path);
+PLUGINXX_API std::string pluginNameFromPath(const std::string& path);
 
 /// 插件清单资源声明 (plugin.yaml 可选段; 相对插件目录的路径已解析为绝对路径)
 /// - 键名与主配置 yaml 的 skill/memory/mcp 段一致 (降低理解成本):
@@ -114,7 +115,7 @@ struct PluginManifestInterfaces {
 /// - interfaces 非空时额外输出接口声明段 (require/optional, 见
 ///   PluginManifestInterfaces); 段缺失时保持为空 —— 接口声明不参与
 ///   manifest 合法性判定
-bool parsePluginManifest(
+PLUGINXX_API bool parsePluginManifest(
     const std::filesystem::path& dir,
     std::string&                 name,
     std::string&                 entry,
@@ -128,7 +129,7 @@ bool parsePluginManifest(
 /// - 语义与 parsePluginManifest 完全一致, 仅输入为内存 YAML 字符串而非目录文件
 /// - baseDir 为资源相对路径的解析基准 (为空则按当前工作目录/保持原样, 内置清单
 ///   通常为空 —— 内置插件的 skill/memory 声明较少, 且多为绝对路径)
-bool parsePluginManifestFromString(
+PLUGINXX_API bool parsePluginManifestFromString(
     const std::string&           yamlStr,
     const std::filesystem::path& baseDir,
     std::string&                 name,
@@ -142,7 +143,7 @@ bool parsePluginManifestFromString(
 /// 尝试从内置内嵌清单解析 (优先于文件系统)
 /// - 内置编译时 plugin.yaml 已随二进制内嵌, 无需外部文件即可取 depends/resources/interfaces
 /// - 返回 true 表示命中内置清单并解析成功; false 表示无内置清单 (回退文件系统)
-bool parseBuiltinManifest(
+PLUGINXX_API bool parseBuiltinManifest(
     std::string_view          pluginName,
     std::string&              name,
     std::string&              entry,
@@ -157,7 +158,7 @@ bool parseBuiltinManifest(
 /// - 多配置生成器 (MSVC Debug/Release) 产物位于配置子目录: {dir}/{entry}
 ///   找不到时回退 {dir}/{Debug|Release|RelWithDebInfo|MinSizeRel}/{entry}
 /// - 返回绝对路径 (可能不存在, 由调用方处理)
-std::string resolvePluginEntryPath(const std::filesystem::path& dir, const std::string& entry);
+PLUGINXX_API std::string resolvePluginEntryPath(const std::filesystem::path& dir, const std::string& entry);
 
 /// 拓扑排序项 (调用方 Item 须含 path/name/depends 三个成员, 可附带其他字段)
 struct PluginSortItem {

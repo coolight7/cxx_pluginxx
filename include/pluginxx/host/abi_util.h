@@ -15,6 +15,7 @@
 #define PLUGINXX_HOST_ABI_UTIL_H
 
 #include "pluginxx/api/abi.h"
+#include "pluginxx/export.h"
 #include "utilxx_base/log.h"
 
 #include <exception>
@@ -59,7 +60,7 @@ inline AgentxxPluginStringView strToSv(std::string_view sv) noexcept {
 }
 
 /// C ABI 字符串视图 → std::string_view (实现见 src/manifest.cpp)
-std::string_view pluginStringView2std(AgentxxPluginStringView str);
+PLUGINXX_API std::string_view pluginStringView2std(AgentxxPluginStringView str);
 
 /// ==================== C ABI 边界异常兜底 ====================
 namespace detail {

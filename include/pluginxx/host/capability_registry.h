@@ -12,6 +12,7 @@
 #pragma once
 
 #include "pluginxx/api/tables.h"
+#include "pluginxx/export.h"
 #include "utilxx_base/container_util.h"
 #include "utilxx_base/log.h"
 
@@ -31,7 +32,7 @@ struct PluginCapabilityRegistration {
 };
 
 /// 能力注册表: 名称 → (提供者, 启动回调, 取消回调, 上下文)
-class CapabilityRegistry {
+class PLUGINXX_API CapabilityRegistry {
 public:
 
     struct Entry {

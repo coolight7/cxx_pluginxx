@@ -14,10 +14,12 @@
 
 #include <string>
 
+#include "pluginxx/export.h"
+
 namespace pluginxx {
 
 /// 动态库装载/符号查找/卸载 (跨平台: dlopen / LoadLibraryW)
-struct NativeLoader {
+struct PLUGINXX_API NativeLoader {
     /// 打开动态库; 失败返回 nullptr 并在 err 输出原因
     static void* open(const std::string& path, std::string& err);
 

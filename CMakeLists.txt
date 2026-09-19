@@ -98,21 +98,32 @@ set_target_properties(${_CXX_PLUGINXX_TARGETS} PROPERTIES
 )
 
 if (XX_IS_MSVC_D)
-  set_target_properties(cxx_pluginxx_shared PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+  # 导出面控制 (MSVC): 动态库默认不导出任何符号, 仅导出标注 PLUGINXX_API 的公开 API。
+  # 不能使用 WINDOWS_EXPORT_ALL_SYMBOLS (CMake 自动导出): 该机制要解析每个 .obj 的
+  # 符号表生成 .def, 而 /GL (LTO) 产物不含符号表 (dumpbin: "ANONYMOUS OBJECT"),
+  # 解析必失败 ("unrecognized file format in 'xxx.obj, 0'"), 即自动导出与 LTO 互斥。
+  target_compile_definitions(cxx_pluginxx_shared PRIVATE CXX_PLUGINXX_EXPORTS)
 else ()
-  # ELF 导出面控制: 只导出本库命名空间符号, 隐藏静态链入的第三方符号
+  # GCC/Clang: 默认隐藏全部符号, 仅导出头文件中标注 PLUGINXX_API 的公开 API
+  # (该宏在 GCC/Clang 下展开为 visibility("default"));
+  # version script 只保留 local: * 作为兜底: 即便某个静态链入的第三方代码显式声明了
+  # visibility("default"), 也不会被本动态库重导出。
+  set_target_properties(${_CXX_PLUGINXX_TARGETS} PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+  )
   set(_CXX_PLUGINXX_MAP "${CMAKE_CURRENT_BINARY_DIR}/pluginxx_symbols.map")
-  file(WRITE "${_CXX_PLUGINXX_MAP}" "# cxx_pluginxx 动态库导出白名单 (仅本库命名空间符号)
+  file(WRITE "${_CXX_PLUGINXX_MAP}" "# cxx_pluginxx 动态库导出兜底 (仅隐藏, 白名单由 PLUGINXX_API 决定)
 {
-global:
-  *pluginxx*;
-  *utilxx*;
 local: *;
 };
 ")
   target_link_options(cxx_pluginxx_shared PRIVATE "-Wl,--version-script=${_CXX_PLUGINXX_MAP}")
   unset(_CXX_PLUGINXX_MAP)
 endif ()
+
+# 静态链接本库的使用方走此定义: 头文件中的 PLUGINXX_API 展开为空 (避免 dllimport)
+target_compile_definitions(cxx_pluginxx_static PUBLIC CXX_PLUGINXX_STATIC=1)
 
 foreach (_t ${_CXX_PLUGINXX_TARGETS})
   target_compile_definitions(${_t} PUBLIC

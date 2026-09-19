@@ -9,9 +9,11 @@
 
 #include <string_view>
 
+#include "pluginxx/export.h"
+
 namespace pluginxx {
 
 /// 返回本库的版本字符串视图
-[[nodiscard]] std::string_view version() noexcept;
+[[nodiscard]] PLUGINXX_API std::string_view version() noexcept;
 
 } // namespace pluginxx
