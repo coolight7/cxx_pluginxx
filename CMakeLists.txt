@@ -117,14 +117,18 @@ else ()
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
   )
-  set(_CXX_PLUGINXX_MAP "${CMAKE_CURRENT_BINARY_DIR}/pluginxx_symbols.map")
-  file(WRITE "${_CXX_PLUGINXX_MAP}" "# cxx_pluginxx 动态库导出兜底 (仅隐藏, 白名单由 PLUGINXX_API 决定)
+  # version script 仅 ELF (Linux/Android) 可用; Mach-O (macOS/iOS) 无此机制,
+  # 上面的 visibility=hidden 已实现"默认隐藏"语义, 无需额外兜底
+  if (XX_IS_LINUX_D OR XX_IS_ANDROID_D)
+    set(_CXX_PLUGINXX_MAP "${CMAKE_CURRENT_BINARY_DIR}/pluginxx_symbols.map")
+    file(WRITE "${_CXX_PLUGINXX_MAP}" "# cxx_pluginxx 动态库导出兜底 (仅隐藏, 白名单由 PLUGINXX_API 决定)
 {
 local: *;
 };
 ")
-  target_link_options(cxx_pluginxx_shared PRIVATE "-Wl,--version-script=${_CXX_PLUGINXX_MAP}")
-  unset(_CXX_PLUGINXX_MAP)
+    target_link_options(cxx_pluginxx_shared PRIVATE "-Wl,--version-script=${_CXX_PLUGINXX_MAP}")
+    unset(_CXX_PLUGINXX_MAP)
+  endif ()
 endif ()
 
 # 静态链接本库的使用方走此定义: 头文件中的 PLUGINXX_API 展开为空 (避免 dllimport)

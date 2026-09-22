@@ -37,12 +37,12 @@ const PluginxxBuiltinInfo* findBuiltinPlugin(std::string_view name) {
     if (!fn) {
         return nullptr;
     }
-    size_t      count = 0;
+    uint64_t    count = 0;
     const auto* list  = fn(&count);
     if (!list) {
         return nullptr;
     }
-    for (size_t i = 0; i < count; ++i) {
+    for (uint64_t i = 0; i < count; ++i) {
         if (pluginStringView2std(list[i].name) == name) {
             return &list[i];
         }
@@ -55,12 +55,12 @@ const PluginxxBuiltinManifest* findBuiltinManifest(std::string_view name) {
     if (!fn) {
         return nullptr;
     }
-    size_t      count = 0;
+    uint64_t    count = 0;
     const auto* list  = fn(&count);
     if (!list) {
         return nullptr;
     }
-    for (size_t i = 0; i < count; ++i) {
+    for (uint64_t i = 0; i < count; ++i) {
         if (pluginStringView2std(list[i].name) == name) {
             return &list[i];
         }
