@@ -18,11 +18,6 @@
 /// [plugin_kit.h](/agent/lib/include/agentxx/plugin/api/plugin_kit.h), 该头包含本头并把
 /// 通用名引入 `agentxx::plugin` —— 插件源码只包含它即可, 无需关心本节分层。
 #pragma once
-#include "pluginxx/api/abi.h"
-#include "pluginxx/api/tables.h"
-#include "utilxx_base/container_util.h"
-#include "utilxx_base/json.h"
-#include "utilxx_base/json_view.h"
 #include "asio/awaitable.hpp"
 #include "asio/co_spawn.hpp"
 #include "asio/detached.hpp"
@@ -31,6 +26,11 @@
 #include "asio/post.hpp"
 #include "fmt/format.h"
 #include "fmt/ranges.h"
+#include "pluginxx/api/abi.h"
+#include "pluginxx/api/tables.h"
+#include "utilxx_base/container_util.h"
+#include "utilxx_base/json.h"
+#include "utilxx_base/json_view.h"
 #include <type_traits>
 
 #include <algorithm>
@@ -64,6 +64,7 @@ namespace pluginxx {
 /// 插件作用域 JSON 别名 (自主 Json 体系, 不依赖图引擎)
 using Json     = utilxx_base::Json;
 using JsonView = utilxx_base::JsonView;
+
 /* ==================== C++ 字符串/接口便捷工具 (非 ABI) ====================
  *
  * [pluginxx/api/abi.h](/agent/third_party/cxx_pluginxx/include/pluginxx/api/abi.h) 为纯 C ABI
@@ -228,8 +229,7 @@ public:
     }
 
     /// 覆盖写入 ABI 字符串出参: 先释放已有宿主分配, 再经宿主 alloc 写入新内容
-    static void
-        set(const PluginxxHost* h, PluginxxString* out, std::string_view sv) noexcept {
+    static void set(const PluginxxHost* h, PluginxxString* out, std::string_view sv) noexcept {
         if (!out) {
             return;
         }
@@ -346,8 +346,8 @@ public:
 
     PluginxxString release() noexcept {
         PluginxxString tmp = str_;
-        str_                    = {nullptr, 0};
-        host_                   = nullptr;
+        str_               = {nullptr, 0};
+        host_              = nullptr;
         return tmp;
     }
 
@@ -381,8 +381,7 @@ const Iface* queryInterface(const PluginxxHost* host, std::string_view iid) noex
 }
 
 template<typename Iface>
-const Iface*
-    queryInterface(const PluginxxHost* host, const PluginxxStringView& iid) noexcept {
+const Iface* queryInterface(const PluginxxHost* host, const PluginxxStringView& iid) noexcept {
     if (!host || !host->vtable || !host->vtable->query_interface || PluginStringView::empty(iid)) {
         return nullptr;
     }
@@ -397,6 +396,7 @@ const Iface* queryInterface(const PluginxxHost* host, const char* iid) noexcept 
     PluginxxStringView sv = PluginStringView::fromCstr(iid);
     return validateInterface<Iface>(host->vtable->query_interface(host, &sv));
 }
+
 /* ==================== 通用接口表聚合 ==================== */
 
 /// 通用接口表聚合 (与宿主领域无关的十个表; 成员为 NULL 表示宿主未实现该接口)
@@ -405,17 +405,17 @@ const Iface* queryInterface(const PluginxxHost* host, const char* iid) noexcept 
 /// 由宿主在自己的聚合体中补充: agentxx 侧的 `AgentIfaces` 是本聚合
 /// 的超集, 可直接作为 [PluginBaseT] 的模板实参。
 struct PluginIfaceCore {
-    const PluginxxLogIface*              log       = nullptr; ///< "pluginxx.log"
-    const PluginxxJsonIface*             json      = nullptr; ///< "pluginxx.json"
-    const PluginxxConfigIface*           config    = nullptr; ///< "pluginxx.config"
-    const PluginxxPluginsIface*                plugins   = nullptr; ///< "pluginxx.plugins"
-    const PluginxxEventsIface*           events    = nullptr; ///< "pluginxx.events"
-    const PluginxxCapabilitiesIface*     capabilities = nullptr; ///< "pluginxx.capabilities"
-    const PluginxxSchedulerIface*        scheduler = nullptr; ///< "pluginxx.scheduler"
+    const PluginxxLogIface*          log          = nullptr; ///< "pluginxx.log"
+    const PluginxxJsonIface*         json         = nullptr; ///< "pluginxx.json"
+    const PluginxxConfigIface*       config       = nullptr; ///< "pluginxx.config"
+    const PluginxxPluginsIface*      plugins      = nullptr; ///< "pluginxx.plugins"
+    const PluginxxEventsIface*       events       = nullptr; ///< "pluginxx.events"
+    const PluginxxCapabilitiesIface* capabilities = nullptr; ///< "pluginxx.capabilities"
+    const PluginxxSchedulerIface*    scheduler    = nullptr; ///< "pluginxx.scheduler"
     /// "pluginxx.coroutine_runtime": 协程驱动 (host driver/wake 协议)
     const PluginxxCoroutineRuntimeIface* coroutineRuntime = nullptr;
-    const PluginxxTasksIface*            tasks  = nullptr; ///< "pluginxx.tasks"
-    const PluginxxCancelIface*           cancel = nullptr; ///< "pluginxx.cancel"
+    const PluginxxTasksIface*            tasks            = nullptr; ///< "pluginxx.tasks"
+    const PluginxxCancelIface*           cancel           = nullptr; ///< "pluginxx.cancel"
 
     /// 从宿主查询全部通用接口表 (host 为空时返回全 NULL 聚合)
     static PluginIfaceCore query(const PluginxxHost* host) {
@@ -423,30 +423,22 @@ struct PluginIfaceCore {
         if (!host || !host->vtable || !host->vtable->query_interface) {
             return f;
         }
-        f.log = queryInterface<PluginxxLogIface>(host, PLUGINXX_IFACE_LOG);
-        f.json = queryInterface<PluginxxJsonIface>(host, PLUGINXX_IFACE_JSON);
-        f.config
-            = queryInterface<PluginxxConfigIface>(host, PLUGINXX_IFACE_CONFIG);
+        f.log     = queryInterface<PluginxxLogIface>(host, PLUGINXX_IFACE_LOG);
+        f.json    = queryInterface<PluginxxJsonIface>(host, PLUGINXX_IFACE_JSON);
+        f.config  = queryInterface<PluginxxConfigIface>(host, PLUGINXX_IFACE_CONFIG);
         f.plugins = queryInterface<PluginxxPluginsIface>(host, PLUGINXX_IFACE_PLUGINS);
-        f.events
-            = queryInterface<PluginxxEventsIface>(host, PLUGINXX_IFACE_EVENTS);
-        f.capabilities = queryInterface<PluginxxCapabilitiesIface>(
-            host,
-            PLUGINXX_IFACE_CAPABILITIES
-        );
-        f.scheduler = queryInterface<PluginxxSchedulerIface>(
-            host,
-            PLUGINXX_IFACE_SCHEDULER
-        );
-        f.coroutineRuntime = queryInterface<PluginxxCoroutineRuntimeIface>(
-            host,
-            PLUGINXX_IFACE_COROUTINE_RUNTIME
-        );
+        f.events  = queryInterface<PluginxxEventsIface>(host, PLUGINXX_IFACE_EVENTS);
+        f.capabilities
+            = queryInterface<PluginxxCapabilitiesIface>(host, PLUGINXX_IFACE_CAPABILITIES);
+        f.scheduler = queryInterface<PluginxxSchedulerIface>(host, PLUGINXX_IFACE_SCHEDULER);
+        f.coroutineRuntime
+            = queryInterface<PluginxxCoroutineRuntimeIface>(host, PLUGINXX_IFACE_COROUTINE_RUNTIME);
         f.tasks  = queryInterface<PluginxxTasksIface>(host, PLUGINXX_IFACE_TASKS);
         f.cancel = queryInterface<PluginxxCancelIface>(host, PLUGINXX_IFACE_CANCEL);
         return f;
     }
 };
+
 /* ==================== 取消异常 ==================== */
 
 class CancelledException : public std::exception {
@@ -461,16 +453,15 @@ public:
         return msg_.c_str();
     }
 };
+
 /* ==================== 实例级 Logger ==================== */
 
 struct Logger {
     const PluginxxHost*     host     = nullptr;
     const PluginxxLogIface* logIface = nullptr;
-    void(PLUGINXX_CALL* logFn)(
-        const PluginxxHost*       host,
-        int32_t                        level,
-        const PluginxxStringView* msg
-    ) = nullptr;
+    void(PLUGINXX_CALL*
+             logFn)(const PluginxxHost* host, int32_t level, const PluginxxStringView* msg)
+        = nullptr;
 
     void log(int32_t level, std::string_view msg) const noexcept {
         if (!host) {
@@ -541,8 +532,8 @@ inline void pluginLog(const Ctx* ctx, int32_t level, std::string_view msg) {
 inline void pluginLog(
     const PluginxxHost*     host,
     const PluginxxLogIface* logIf,
-    int32_t                      level,
-    std::string_view             msg
+    int32_t                 level,
+    std::string_view        msg
 ) {
     if (!host || !logIf || !logIf->log) {
         return;
@@ -595,7 +586,7 @@ inline std::string
     jsonEscape(const PluginxxHost* host, const JsonIface* jsonIface, std::string_view text) {
     if (host && jsonIface && jsonIface->json_escape) {
         PluginxxString esc{nullptr, 0};
-        auto                sv = PluginStringView::from(text.data(), text.size());
+        auto           sv = PluginStringView::from(text.data(), text.size());
         if (jsonIface->json_escape(host, &sv, &esc) == 0 && esc.data) {
             std::string out(esc.data, static_cast<size_t>(esc.size));
             PluginString::free(host, &esc);
@@ -645,6 +636,7 @@ inline std::string
     out.push_back('"');
     return out;
 }
+
 /* ==================== 协程驱动桥 (PollOneBridge) ====================
  *
  * 定位: 让插件协程与宿主协程在**同一宿主 IO 执行序列**中交错推进的适配层。
@@ -709,11 +701,7 @@ public:
 
     using DestroyFrameFn = void (*)(void* frame) noexcept;
 
-    BridgeRoot(
-        const PluginxxOperatorNotify& notify,
-        void*                              frame,
-        DestroyFrameFn                     destroyFrame
-    ) :
+    BridgeRoot(const PluginxxOperatorNotify& notify, void* frame, DestroyFrameFn destroyFrame) :
         notify_(notify),
         frame_(frame),
         destroyFrame_(destroyFrame) {}
@@ -812,12 +800,12 @@ public:
 private:
 
     PluginxxOperatorNotify notify_{nullptr, nullptr};
-    std::atomic<void*>          frame_{nullptr};
-    DestroyFrameFn              destroyFrame_ = nullptr;
-    PollOneBridge*              owner_        = nullptr;
-    std::function<void()>       cleanup_;
-    std::atomic<bool>           claimed_{false};
-    std::atomic<bool>           abandoned_{false};
+    std::atomic<void*>     frame_{nullptr};
+    DestroyFrameFn         destroyFrame_ = nullptr;
+    PollOneBridge*         owner_        = nullptr;
+    std::function<void()>  cleanup_;
+    std::atomic<bool>      claimed_{false};
+    std::atomic<bool>      abandoned_{false};
 };
 
 /// 受控轮询根 (asio 协程) 的仲裁对象。
@@ -886,8 +874,8 @@ public:
 private:
 
     PluginxxOperatorNotify notify_{nullptr, nullptr};
-    std::function<void()>       cleanup_;
-    std::atomic<bool>           claimed_{false};
+    std::function<void()>  cleanup_;
+    std::atomic<bool>      claimed_{false};
 };
 
 /// 单实例协程驱动桥 (每个插件实例独立一份; 无任何进程级可变状态)。
@@ -1107,7 +1095,7 @@ public:
     /// 注销一个受控轮询根 (协程结束后调用)。
     /// 计数归零时停止轮询: 取消在途退避定时器, 之后不再申请请求。
     void removePolledRoot(const std::shared_ptr<PolledRoot>& root) noexcept {
-        bool                         last   = false;
+        bool                    last   = false;
         PluginxxOperatorHandle* waitOp = nullptr;
         {
             std::lock_guard lock(rootsMutex_);
@@ -1267,7 +1255,7 @@ public:
             return;
         }
         PluginxxStringView iid = PluginStringView::fromCstr(PLUGINXX_IFACE_LOG);
-        const auto*             logIface
+        const auto*        logIface
             = static_cast<const PluginxxLogIface*>(host->vtable->query_interface(host, &iid));
         if (!logIface || !logIface->log) {
             logFallback(message);
@@ -1506,7 +1494,7 @@ private:
             return;
         }
         PluginxxString error{nullptr, 0};
-        auto* op = sched_->sleep(host_, ms, &PollOneBridge::pumpWaitDone, this, &error);
+        auto*          op = sched_->sleep(host_, ms, &PollOneBridge::pumpWaitDone, this, &error);
         if (!op) {
             std::string message = "scheduler timer rejected";
             if (error.data) {
@@ -1583,24 +1571,24 @@ private:
     mutable std::mutex                                         mutex_;
     asio::io_context                                           localIo_;
     asio::executor_work_guard<asio::io_context::executor_type> work_;
-    const PluginxxHost*                                   host_    = nullptr;
-    const PluginxxCoroutineRuntimeIface*                  runtime_ = nullptr;
+    const PluginxxHost*                                        host_    = nullptr;
+    const PluginxxCoroutineRuntimeIface*                       runtime_ = nullptr;
     /// 宿主计时器/卸载接口表 (`scheduler.sleep` 用于受控轮询的退避量子,
     /// `op_cancel` 用于取消在途退避); 缺失时为 nullptr。
     const PluginxxSchedulerIface* sched_ = nullptr;
 
-    bool                 stopping_      = false;
-    bool                 wakePending_   = false;
-    bool                 driverQueued_  = false;
-    bool                 driverRunning_ = false;
+    bool            stopping_      = false;
+    bool            wakePending_   = false;
+    bool            driverQueued_  = false;
+    bool            driverRunning_ = false;
     PluginxxDriver* driver_        = nullptr;
-    uint64_t             nextEpoch_     = 0;
-    uint64_t             pendingEpoch_  = 0;
+    uint64_t        nextEpoch_     = 0;
+    uint64_t        pendingEpoch_  = 0;
 
     /// 受控轮询的下一次请求理由 (见 [pumpNextLocked]/[prepareScheduleLocked])。
     bool pumpPending_ = false;
     /// 在途退避定时器 (调度状态与其句柄同属 [mutex_])。
-    bool                         pumpWaitScheduled_ = false;
+    bool                    pumpWaitScheduled_ = false;
     PluginxxOperatorHandle* pumpWaitOp_        = nullptr;
     /// 连续"有进展"步数 (受控轮询突发计数)。
     int pollBurst_ = 0;
@@ -1644,6 +1632,7 @@ inline void BridgeRoot::abandon(std::string_view reason) noexcept {
 }
 
 } // namespace detail
+
 /* ==================== 插件框架事件驱动取消注册表 (CancelRegistry) ==================== */
 
 /// 插件框架事件驱动取消注册表
@@ -1923,24 +1912,25 @@ private:
     std::unordered_map<RegId, std::string>                    idToKey_;
     std::unordered_set<std::string>                           cancelledKeys_;
 };
+
 /* ==================== 操作控制对象 (OpCtl) ==================== */
 
 struct OpCtl {
     std::shared_ptr<std::atomic<bool>> cancelFlag;
-    const PluginxxHost*           host        = nullptr;
-    const PluginxxCancelIface*    cancelIface = nullptr;
-    std::string                        threadId;
+    const PluginxxHost*                host        = nullptr;
+    const PluginxxCancelIface*         cancelIface = nullptr;
+    std::string                        sessionId;
     CancelRegistry*                    cancelRegistry = nullptr;
 
     bool cancelled() const noexcept {
         if (cancelFlag && cancelFlag->load(std::memory_order_acquire)) {
             return true;
         }
-        if (cancelRegistry && !threadId.empty() && cancelRegistry->isCancelled(threadId)) {
+        if (cancelRegistry && !sessionId.empty() && cancelRegistry->isCancelled(sessionId)) {
             return true;
         }
-        if (host && cancelIface && cancelIface->is_cancelled && !threadId.empty()) {
-            auto sv = PluginStringView::from(threadId.data(), threadId.size());
+        if (host && cancelIface && cancelIface->is_cancelled && !sessionId.empty()) {
+            auto sv = PluginStringView::from(sessionId.data(), sessionId.size());
             return cancelIface->is_cancelled(host, &sv) != 0;
         }
         return false;
@@ -1952,6 +1942,7 @@ struct OpCtl {
         }
     }
 };
+
 /* ==================== 强类型参数提取器 ArgReader ==================== */
 
 namespace detail {
@@ -2124,7 +2115,7 @@ public:
 
 private:
 
-    utilxx_base::Json      root_          = utilxx_base::Json::object();
+    utilxx_base::Json        root_          = utilxx_base::Json::object();
     bool                     hasParseError_ = false;
     std::vector<std::string> errors_;
 };
@@ -2175,9 +2166,9 @@ inline void finishIfDone(std::coroutine_handle<Promise> h) {
     }
 
     PluginxxOperatorNotify notify  = p.notify_;
-    auto                        cleanup = std::move(p.opCleanup_);
-    p.opCleanup_                        = nullptr;
-    auto root                           = std::move(p.bridgeRoot_);
+    auto                   cleanup = std::move(p.opCleanup_);
+    p.opCleanup_                   = nullptr;
+    auto root                      = std::move(p.bridgeRoot_);
 
     // 终态 payload: OK=结果, FAILED=错误信息, CANCELLED=空 (与既有契约一致)
     std::string_view payload;
@@ -2270,10 +2261,10 @@ inline void resumePluginCoroutine(
 /// `return`: 该根的仲裁对象 (调用方通常不再需要, 资源释放已由 cleanup 覆盖)。
 template<typename Promise>
 inline std::shared_ptr<detail::BridgeRoot> startBridgedRoot(
-    detail::PollOneBridge&             bridge,
-    const PluginxxOperatorNotify& notify,
-    std::coroutine_handle<Promise>     h,
-    std::function<void()>              cleanup
+    detail::PollOneBridge&         bridge,
+    const PluginxxOperatorNotify&  notify,
+    std::coroutine_handle<Promise> h,
+    std::function<void()>          cleanup
 ) {
     auto root
         = std::make_shared<detail::BridgeRoot>(notify, h.address(), &destroyBridgeFrame<Promise>);
@@ -2329,7 +2320,7 @@ struct RootRequest {
     std::string configJson; ///< 图节点 config JSON（仅图节点操作）
     std::string stateJson;  ///< GraphState::serialize() 只读快照（仅图节点操作）
 
-    const PluginxxHost* host = nullptr;
+    const PluginxxHost*        host        = nullptr;
     const PluginxxCancelToken* cancelToken = nullptr; ///< offload/worker 内的取消令牌视图
 
     static std::string copyView(const PluginxxStringView* sv, const char* fallback = "") {
@@ -2355,8 +2346,7 @@ struct RootRequest {
     }
 
     /// 钩子：node_input_json（args 为空时按 "{}"）
-    static RootRequest
-        forHook(const PluginxxHost* host, const PluginxxStringView* nodeInputJson) {
+    static RootRequest forHook(const PluginxxHost* host, const PluginxxStringView* nodeInputJson) {
         RootRequest req;
         req.host     = host;
         req.argsJson = copyView(nodeInputJson, "{}");
@@ -2382,14 +2372,14 @@ struct RootRequest {
         const PluginxxStringView* nodeName,
         const PluginxxStringView* configJson,
         const PluginxxStringView* stateJson,
-        const PluginxxStringView* threadId
+        const PluginxxStringView* sessionId
     ) {
         RootRequest req;
         req.host       = host;
         req.nodeName   = copyView(nodeName);
         req.configJson = copyView(configJson, "{}");
         req.stateJson  = copyView(stateJson, "{}");
-        req.sessionId  = copyView(threadId);
+        req.sessionId  = copyView(sessionId);
         return req;
     }
 
@@ -2498,15 +2488,15 @@ public:
 private:
 
     PluginxxOperatorNotify notify_{nullptr, nullptr};
-    std::atomic<bool>           done_{false};
+    std::atomic<bool>      done_{false};
 };
 
 template<typename T>
 struct PromiseBase {
     using value_type = T;
 
-    PluginxxOperatorNotify        notify_{nullptr, nullptr};
-    const PluginxxHost*           host_{nullptr};
+    PluginxxOperatorNotify             notify_{nullptr, nullptr};
+    const PluginxxHost*                host_{nullptr};
     std::shared_ptr<std::atomic<bool>> cancelFlag_{nullptr};
     std::function<void()>              outstandingCancel_{nullptr};
     std::exception_ptr                 exception_{nullptr};
@@ -2578,6 +2568,7 @@ struct PromiseBase {
 };
 
 } // namespace detail
+
 /// 根操作拥有型输入的公开别名：插件业务签名可直接写 `const RootRequest&`
 /// （tool/hook/capability/graph 通用；异步路径由 Job 持有到协程结束）。
 using RootRequest = detail::RootRequest;
@@ -2727,6 +2718,7 @@ struct Task<void> {
         return Awaiter{std::exchange(handle_, {})};
     }
 };
+
 /* ==================== 后台协作任务 spawn 实现 ==================== */
 
 namespace detail {
@@ -2734,10 +2726,10 @@ namespace detail {
 template<typename Ctx, typename Fn>
 inline void spawnTaskImpl(Ctx& ctx, Fn&& fn) {
     // SpawnRecord 定义在实例上下文基类内 (与派生类共享同一记录类型)
-    using SpawnRecord = typename std::remove_reference_t<Ctx>::SpawnRecord;
-    auto cancelFlag                                = std::make_shared<std::atomic<bool>>(false);
-    auto rec                                       = std::make_shared<SpawnRecord>();
-    rec->cancelFlag                                = cancelFlag;
+    using SpawnRecord                  = typename std::remove_reference_t<Ctx>::SpawnRecord;
+    auto cancelFlag                    = std::make_shared<std::atomic<bool>>(false);
+    auto rec                           = std::make_shared<SpawnRecord>();
+    rec->cancelFlag                    = cancelFlag;
     std::weak_ptr<SpawnRecord> recWeak = rec;
 
     PluginxxOperatorNotify  hostNotify{nullptr, nullptr};
@@ -2839,10 +2831,12 @@ inline void spawnTaskImpl(Ctx& ctx, Fn&& fn) {
 }
 
 } // namespace detail
+
 template<typename Ctx, typename Fn>
 inline void spawn(Ctx& ctx, Fn&& fn) {
     detail::spawnTaskImpl(ctx, std::forward<Fn>(fn));
 }
+
 /* ==================== 插件实例上下文基类 (通用部分) ==================== */
 
 /// 插件实例上下文基类 (通用部分; header-only)
@@ -2859,8 +2853,8 @@ class PluginBaseT {
 public:
 
     const PluginxxHost* host = nullptr;
-    IfacesT                  iface;
-    Logger                   log;
+    IfacesT             iface;
+    Logger              log;
     CancelRegistry cancelRegistry; ///< 框架级事件驱动取消注册表 (每个实例独立一份)
 
     PluginBaseT() = default;
@@ -3052,7 +3046,7 @@ public:
             return "\"\"";
         }
         PluginxxString esc{nullptr, 0};
-        auto                sSv = PluginStringView::from(s.data, s.size);
+        auto           sSv = PluginStringView::from(s.data, s.size);
         iface.json->json_escape(host, &sSv, &esc);
         if (!esc.data) {
             return "\"\"";
@@ -3078,8 +3072,8 @@ public:
         if (!host || !iface.json || !iface.json->json_get_string) {
             return {};
         }
-        auto                jsonSv = PluginStringView::from(json.data(), json.size());
-        auto                keySv  = PluginStringView::from(key.data(), key.size());
+        auto           jsonSv = PluginStringView::from(json.data(), json.size());
+        auto           keySv  = PluginStringView::from(key.data(), key.size());
         PluginxxString out{nullptr, 0};
         iface.json->json_get_string(host, &jsonSv, &keySv, &out);
         if (!out.data) {
@@ -3144,6 +3138,7 @@ protected:
     /// 领域挂钩: [init] 末尾调用, 由宿主侧派生基类补齐领域初始化
     /// (agentxx 侧在此订阅会话轮次开始事件, 用于重置会话级取消登记)
     virtual void onHostReady() {}
+
 private:
 
     std::shared_ptr<std::atomic<bool>> lifeToken_ = std::make_shared<std::atomic<bool>>(true);
@@ -3151,6 +3146,7 @@ private:
     /// 之后销毁 (它在 stop 时会终结仍在排队的根)。
     mutable std::unique_ptr<detail::PollOneBridge> bridge_;
 };
+
 /* ==================== 锚定原语 awaiter 族 ==================== */
 
 namespace detail {
@@ -3159,11 +3155,11 @@ struct SleepAwaiter {
     const PluginxxHost*           host;
     const PluginxxSchedulerIface* sched;
     /// 协程驱动桥 (宿主支持时为非空): 完成回调经它投递 continuation 并唤醒 driver。
-    PollOneBridge*               bridge = nullptr;
-    int64_t                      ms;
-    void*                        coroAddr  = nullptr;
+    PollOneBridge*          bridge = nullptr;
+    int64_t                 ms;
+    void*                   coroAddr  = nullptr;
     PluginxxOperatorHandle* operation = nullptr;
-    std::string                  error;
+    std::string             error;
 
     bool await_ready() noexcept {
         if (ms <= 0) {
@@ -3249,16 +3245,16 @@ struct OffloadAwaiter {
 
     const PluginxxHost*           host;
     const PluginxxSchedulerIface* sched;
-    WorkFn                             work;
+    WorkFn                        work;
     /// 协程驱动桥。**注意**: offload 的工作体本身仍运行在宿主工作线程池
     /// (显式声明的例外), 只有"完成后的恢复"经桥回到 driver 序列。
     PollOneBridge*     bridge = nullptr;
     std::exception_ptr exPtr  = nullptr;
     std::conditional_t<std::is_void_v<ResultType>, std::monostate, std::optional<ResultType>>
-                                 result;
+                            result;
     PluginxxOperatorHandle* operation = nullptr;
-    int32_t                      status    = PLUGINXX_OPERATOR_OK;
-    std::string                  error;
+    int32_t                 status    = PLUGINXX_OPERATOR_OK;
+    std::string             error;
 
     bool await_ready() noexcept {
         if (!sched || !sched->offload) {
@@ -3275,8 +3271,7 @@ struct OffloadAwaiter {
         PluginxxString errorOut{};
         operation = sched->offload(
             host,
-            [](void* ud, const PluginxxCancelToken* token, PluginxxString* error_out
-            ) -> void* {
+            [](void* ud, const PluginxxCancelToken* token, PluginxxString* error_out) -> void* {
                 auto* self = static_cast<OffloadAwaiter*>(ud);
                 try {
                     if constexpr (std::is_void_v<ResultType>) {
@@ -3347,16 +3342,16 @@ struct InvokeCapState {
     const PluginxxHost*              host = nullptr;
     const PluginxxCapabilitiesIface* caps = nullptr;
     /// 协程驱动桥 (可空): 完成回调经它投递 continuation 并唤醒 driver。
-    PollOneBridge*               bridge = nullptr;
-    std::string                  capability;
-    std::string                  method;
-    std::string                  argsJson;
-    PluginxxOperatorHandle* opHandle = nullptr;
-    int32_t                      status   = PLUGINXX_OPERATOR_OK;
-    std::string                  payload;
-    std::string                  startError;
-    std::atomic<AwaiterState>    state{AwaiterState::INIT};
-    void*                        coroAddr = nullptr;
+    PollOneBridge*            bridge = nullptr;
+    std::string               capability;
+    std::string               method;
+    std::string               argsJson;
+    PluginxxOperatorHandle*   opHandle = nullptr;
+    int32_t                   status   = PLUGINXX_OPERATOR_OK;
+    std::string               payload;
+    std::string               startError;
+    std::atomic<AwaiterState> state{AwaiterState::INIT};
+    void*                     coroAddr = nullptr;
 };
 
 struct InvokeCapAwaiter {
@@ -3365,10 +3360,10 @@ struct InvokeCapAwaiter {
     InvokeCapAwaiter(
         const PluginxxHost*              in_host,
         const PluginxxCapabilitiesIface* in_caps,
-        std::string_view                      in_cap,
-        std::string_view                      in_method,
-        std::string_view                      in_args,
-        PollOneBridge*                        in_bridge = nullptr
+        std::string_view                 in_cap,
+        std::string_view                 in_method,
+        std::string_view                 in_args,
+        PollOneBridge*                   in_bridge = nullptr
     ) :
         st(std::make_shared<InvokeCapState>()) {
         st->host       = in_host;
@@ -3388,11 +3383,11 @@ struct InvokeCapAwaiter {
         st->coroAddr = h.address();
         st->state.store(AwaiterState::CALLING, std::memory_order_release);
 
-        auto*               holder = new std::shared_ptr<InvokeCapState>(st);
+        auto*          holder = new std::shared_ptr<InvokeCapState>(st);
         PluginxxString err{nullptr, 0};
-        auto capSv  = PluginStringView::from(st->capability.data(), st->capability.size());
-        auto methSv = PluginStringView::from(st->method.data(), st->method.size());
-        auto argsSv = PluginStringView::from(st->argsJson.data(), st->argsJson.size());
+        auto           capSv = PluginStringView::from(st->capability.data(), st->capability.size());
+        auto           methSv = PluginStringView::from(st->method.data(), st->method.size());
+        auto           argsSv = PluginStringView::from(st->argsJson.data(), st->argsJson.size());
 
         st->opHandle = st->caps->invoke_capability_async(
             st->host,
@@ -3473,6 +3468,7 @@ struct InvokeCapAwaiter {
 };
 
 } // namespace detail
+
 /// 宿主计时器适配 (非轮询): 计时器到期时宿主回调 adapter, adapter 把 continuation
 /// 投递到本地执行器并 [detail::PollOneBridge::wake]; continuation 由下一次 driver
 /// 推进, 因此既不需要额外线程, 也不占用宿主 IO 线程执行插件工作。
@@ -3499,12 +3495,13 @@ inline auto offload(const Ctx& ctx, WorkFn&& work) {
         &ctx.bridge()
     };
 }
+
 template<typename Ctx>
 inline detail::InvokeCapAwaiter invoke_cap(
-    const Ctx& ctx,
-    std::string_view  capability,
-    std::string_view  method,
-    std::string_view  argsJson = "{}"
+    const Ctx&       ctx,
+    std::string_view capability,
+    std::string_view method,
+    std::string_view argsJson = "{}"
 ) {
     return detail::InvokeCapAwaiter{
         ctx.host,
@@ -3515,6 +3512,7 @@ inline detail::InvokeCapAwaiter invoke_cap(
         &ctx.bridge()
     };
 }
+
 namespace detail {
 
 /// 按可调用性选择能力业务签名：fn(ctx, caller, method, args) /
@@ -3523,11 +3521,11 @@ namespace detail {
 /// （与 [invokeHook] 相同的严格分发策略）。
 template<typename CapFn, typename Ctx>
 inline decltype(auto) invokeCap(
-    CapFn&                   fn,
-    Ctx&                     ctx,
+    CapFn&              fn,
+    Ctx&                ctx,
     const PluginxxHost* caller,
-    std::string_view         method,
-    std::string_view         args
+    std::string_view    method,
+    std::string_view    args
 ) {
     if constexpr (std::is_invocable_v<
                       CapFn,
@@ -3567,7 +3565,7 @@ inline void capability(Ctx& ctx, std::string_view capName, CapFn&& fn) {
         ctx.iface.capabilities->register_capability_ex(
             ctx.host,
             &capSv,
-            [](void*                              user_data,
+            [](void*                         user_data,
                const PluginxxHost*           caller_host,
                const PluginxxStringView*     method,
                const PluginxxStringView*     args_json,
@@ -3643,11 +3641,11 @@ inline void capability(Ctx& ctx, std::string_view capName, CapFn&& fn) {
                         guard.failed("capability returned an empty task");
                         return nullptr;
                     }
-                    auto h       = task.handle_;
-                    task.handle_ = nullptr;
-                    auto& p      = h.promise();
-                    p.notify_    = notify ? *notify : PluginxxOperatorNotify{nullptr, nullptr};
-                    p.host_      = job->request.host;
+                    auto h        = task.handle_;
+                    task.handle_  = nullptr;
+                    auto& p       = h.promise();
+                    p.notify_     = notify ? *notify : PluginxxOperatorNotify{nullptr, nullptr};
+                    p.host_       = job->request.host;
                     p.cancelFlag_ = job->cancelFlag;
                     job->coroAddr = h.address();
 
@@ -3678,13 +3676,14 @@ inline void capability(Ctx& ctx, std::string_view capName, CapFn&& fn) {
         );
     }
 }
+
 inline PluginxxString invoke_capability_blocking(
     const PluginxxHost*              host,
     const PluginxxCapabilitiesIface* caps,
     const PluginxxSchedulerIface*    sched,
-    std::string_view                      capability,
-    std::string_view                      method,
-    std::string_view                      args_json,
+    std::string_view                 capability,
+    std::string_view                 method,
+    std::string_view                 args_json,
     PluginxxString*                  error_out
 ) {
     if (!host || !caps || !caps->invoke_capability_async) {
@@ -3756,6 +3755,7 @@ inline PluginxxString invoke_capability_blocking(
     auto paySv = PluginStringView::from(state.payload.data(), state.payload.size());
     return PluginString::from(host, &paySv);
 }
+
 /* ==================== 一键式插件入口导出宏 ==================== */
 
 namespace detail {
@@ -3765,11 +3765,11 @@ namespace detail {
 template<typename Fn>
 inline void* callLifecycleEntry(
     const PluginxxHost*           host,
-    void*                              plugin_ctx,
+    void*                         plugin_ctx,
     const PluginxxOperatorNotify* notify,
     PluginxxString*               err,
-    const char*                        label,
-    Fn&&                               fn
+    const char*                   label,
+    Fn&&                          fn
 ) noexcept {
     try {
         if (!plugin_ctx) {
@@ -3803,15 +3803,14 @@ inline void autoStopSpawns(Ctx* ctx) noexcept {
 /// create 阶段异常上报 (上下文可能尚未构造成功, 直接经宿主日志接口输出)
 inline void logCreateFailure(
     const PluginxxHost* host,
-    std::string_view         plugin,
-    std::string_view         msg
+    std::string_view    plugin,
+    std::string_view    msg
 ) noexcept {
     if (!host || !host->vtable || !host->vtable->query_interface) {
         return;
     }
-    auto  iid = PluginStringView::fromCstr(PLUGINXX_IFACE_LOG);
-    auto* iface
-        = static_cast<const PluginxxLogIface*>(host->vtable->query_interface(host, &iid));
+    auto  iid   = PluginStringView::fromCstr(PLUGINXX_IFACE_LOG);
+    auto* iface = static_cast<const PluginxxLogIface*>(host->vtable->query_interface(host, &iid));
     if (!iface || !iface->log) {
         return;
     }
@@ -3819,6 +3818,7 @@ inline void logCreateFailure(
     auto        sv   = PluginStringView::from(text.data(), text.size());
     iface->log(host, 4, &sv);
 }
+
 /// 入口符号名拼接: `PLUGINXX_ENTRY_SYMBOL(musicxx_plugin_, create)` → `musicxx_plugin_create`
 ///
 /// 符号前缀由宿主给出 (内核不含任何宿主专名); 宿主在自己的 SDK 头里用它包出对插件作者
@@ -3843,78 +3843,77 @@ inline void logCreateFailure(
 ///
 /// `StartFn` / `StopFn` 形如
 /// `void*(CtxType&, const PluginxxOperatorNotify*, PluginxxString* error_out)`。
-#define PLUGINXX_EXPORT_PLUGIN(SymbolPrefix, CtxType, Name, Ver, Desc, StartFn, StopFn)        \
-    extern "C" PLUGINXX_EXPORT const PluginxxInfo* PLUGINXX_CALL                               \
-        PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, get_info)(void) {                                  \
-        static const PluginxxInfo info{                                                        \
-            PLUGINXX_API_VERSION,                                                              \
-            0,                                                                                 \
-            pluginxx::PluginStringView::fromCstr(Name),                                        \
-            pluginxx::PluginStringView::fromCstr(Ver),                                         \
-            pluginxx::PluginStringView::fromCstr(Desc),                                        \
-        };                                                                                     \
-        return &info;                                                                          \
-    }                                                                                          \
-    extern "C" PLUGINXX_EXPORT int32_t PLUGINXX_CALL                                           \
+#define PLUGINXX_EXPORT_PLUGIN(SymbolPrefix, CtxType, Name, Ver, Desc, StartFn, StopFn)            \
+    extern "C" PLUGINXX_EXPORT const PluginxxInfo* PLUGINXX_CALL                                   \
+        PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, get_info)(void) {                                      \
+        static const PluginxxInfo info{                                                            \
+            PLUGINXX_API_VERSION,                                                                  \
+            0,                                                                                     \
+            pluginxx::PluginStringView::fromCstr(Name),                                            \
+            pluginxx::PluginStringView::fromCstr(Ver),                                             \
+            pluginxx::PluginStringView::fromCstr(Desc),                                            \
+        };                                                                                         \
+        return &info;                                                                              \
+    }                                                                                              \
+    extern "C" PLUGINXX_EXPORT int32_t PLUGINXX_CALL                                               \
         PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, create)(const PluginxxHost* host, void** plugin_ctx) { \
-        if (!host || !plugin_ctx) {                                                            \
-            return -1;                                                                         \
-        }                                                                                      \
-        try {                                                                                  \
-            auto ctx = std::make_unique<CtxType>();                                            \
-            ctx->init(host);                                                                   \
-            *plugin_ctx = ctx.release();                                                       \
-            return 0;                                                                          \
-        } catch (const std::exception& e) {                                                    \
-            pluginxx::logCreateFailure(host, Name, e.what());                                  \
-        } catch (...) {                                                                        \
-            pluginxx::logCreateFailure(host, Name, "unknown exception");                       \
-        }                                                                                      \
-        return -1;                                                                             \
-    }                                                                                          \
-    extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL                                             \
-        PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, start)(                                            \
-            void*                         plugin_ctx,                                          \
-            const PluginxxOperatorNotify* notify,                                              \
-            PluginxxString*               err                                                  \
-        ) {                                                                                    \
-        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                         \
-        return pluginxx::detail::callLifecycleEntry(                                           \
-            ctx ? ctx->host : nullptr,                                                         \
-            plugin_ctx,                                                                        \
-            notify,                                                                            \
-            err,                                                                               \
-            "plugin start",                                                                    \
-            [&]() -> void* {                                                                   \
-                return (StartFn)(*ctx, notify, err);                                           \
-            }                                                                                  \
-        );                                                                                     \
-    }                                                                                          \
-    extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL                                             \
-        PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, stop)(                                             \
-            void*                         plugin_ctx,                                          \
-            const PluginxxOperatorNotify* notify,                                              \
-            PluginxxString*               err                                                  \
-        ) {                                                                                    \
-        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                         \
-        return pluginxx::detail::callLifecycleEntry(                                           \
-            ctx ? ctx->host : nullptr,                                                         \
-            plugin_ctx,                                                                        \
-            notify,                                                                            \
-            err,                                                                               \
-            "plugin stop",                                                                     \
-            [&]() -> void* {                                                                   \
-                pluginxx::detail::autoStopSpawns(ctx);                                         \
-                return (StopFn)(*ctx, notify, err);                                            \
-            }                                                                                  \
-        );                                                                                     \
-    }                                                                                          \
-    extern "C" PLUGINXX_EXPORT void PLUGINXX_CALL                                              \
-        PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, destroy)(void* plugin_ctx) {                       \
-        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                         \
-        if (ctx) {                                                                             \
-            delete ctx;                                                                        \
-        }                                                                                      \
+        if (!host || !plugin_ctx) {                                                                \
+            return -1;                                                                             \
+        }                                                                                          \
+        try {                                                                                      \
+            auto ctx = std::make_unique<CtxType>();                                                \
+            ctx->init(host);                                                                       \
+            *plugin_ctx = ctx.release();                                                           \
+            return 0;                                                                              \
+        } catch (const std::exception& e) {                                                        \
+            pluginxx::logCreateFailure(host, Name, e.what());                                      \
+        } catch (...) {                                                                            \
+            pluginxx::logCreateFailure(host, Name, "unknown exception");                           \
+        }                                                                                          \
+        return -1;                                                                                 \
+    }                                                                                              \
+    extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, start)(     \
+        void*                         plugin_ctx,                                                  \
+        const PluginxxOperatorNotify* notify,                                                      \
+        PluginxxString*               err                                                          \
+    ) {                                                                                            \
+        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                             \
+        return pluginxx::detail::callLifecycleEntry(                                               \
+            ctx ? ctx->host : nullptr,                                                             \
+            plugin_ctx,                                                                            \
+            notify,                                                                                \
+            err,                                                                                   \
+            "plugin start",                                                                        \
+            [&]() -> void* {                                                                       \
+                return (StartFn)(*ctx, notify, err);                                               \
+            }                                                                                      \
+        );                                                                                         \
+    }                                                                                              \
+    extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, stop)(      \
+        void*                         plugin_ctx,                                                  \
+        const PluginxxOperatorNotify* notify,                                                      \
+        PluginxxString*               err                                                          \
+    ) {                                                                                            \
+        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                             \
+        return pluginxx::detail::callLifecycleEntry(                                               \
+            ctx ? ctx->host : nullptr,                                                             \
+            plugin_ctx,                                                                            \
+            notify,                                                                                \
+            err,                                                                                   \
+            "plugin stop",                                                                         \
+            [&]() -> void* {                                                                       \
+                pluginxx::detail::autoStopSpawns(ctx);                                             \
+                return (StopFn)(*ctx, notify, err);                                                \
+            }                                                                                      \
+        );                                                                                         \
+    }                                                                                              \
+    extern "C" PLUGINXX_EXPORT void PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, destroy)(    \
+        void* plugin_ctx                                                                           \
+    ) {                                                                                            \
+        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                             \
+        if (ctx) {                                                                                 \
+            delete ctx;                                                                            \
+        }                                                                                          \
     }
 
 /// 只导出 start/stop 两个入口 (供手写 create/destroy 的插件使用)。
@@ -3922,13 +3921,12 @@ inline void logCreateFailure(
 /// 少数插件需要自己控制实例构造或销毁 (如按平台条件创建运行时对象、加自定义日志),
 /// 它们手写 `<SymbolPrefix>create` / `<SymbolPrefix>destroy`, 但仍用本宏生成带异常兜底的
 /// start/stop trampoline —— 与 [PLUGINXX_EXPORT_PLUGIN] 的生命周期部分同语义。
-#define PLUGINXX_EXPORT_PLUGIN_LIFECYCLE(SymbolPrefix, CtxType, StartFn, StopFn)                \
-    extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL                                             \
-        PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, start)(                                            \
-            void*                         plugin_ctx,                                          \
-            const PluginxxOperatorNotify* notify,                                              \
-            PluginxxString*               err                                                  \
-        ) {                                                                                    \
+#define PLUGINXX_EXPORT_PLUGIN_LIFECYCLE(SymbolPrefix, CtxType, StartFn, StopFn)               \
+    extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, start)( \
+        void*                         plugin_ctx,                                              \
+        const PluginxxOperatorNotify* notify,                                                  \
+        PluginxxString*               err                                                      \
+    ) {                                                                                        \
         auto* ctx = static_cast<CtxType*>(plugin_ctx);                                         \
         return pluginxx::detail::callLifecycleEntry(                                           \
             ctx ? ctx->host : nullptr,                                                         \
@@ -3941,12 +3939,11 @@ inline void logCreateFailure(
             }                                                                                  \
         );                                                                                     \
     }                                                                                          \
-    extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL                                             \
-        PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, stop)(                                             \
-            void*                         plugin_ctx,                                          \
-            const PluginxxOperatorNotify* notify,                                              \
-            PluginxxString*               err                                                  \
-        ) {                                                                                    \
+    extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, stop)(  \
+        void*                         plugin_ctx,                                              \
+        const PluginxxOperatorNotify* notify,                                                  \
+        PluginxxString*               err                                                      \
+    ) {                                                                                        \
         auto* ctx = static_cast<CtxType*>(plugin_ctx);                                         \
         return pluginxx::detail::callLifecycleEntry(                                           \
             ctx ? ctx->host : nullptr,                                                         \
