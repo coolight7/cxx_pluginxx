@@ -236,8 +236,10 @@ bool parseManifestNode(
         XX_LOGE("Parse plugin manifest `{}` failed: {}", logHint, e.what());
         return false;
     }
-    if (name.empty() || entry.empty()) {
-        XX_LOGE("Plugin manifest `{}` invalid: name/entry required", logHint);
+    // `entry` 可以缺省: JS 插件缺省用 plugin.js, 动态库插件的入口按平台默认库名与
+    // 目录里唯一的库文件解析 (见 host/loader 与宿主的多目标分支选择)。
+    if (name.empty()) {
+        XX_LOGE("Plugin manifest `{}` invalid: name required", logHint);
         return false;
     }
     return true;

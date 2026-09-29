@@ -190,14 +190,14 @@ public:
         } catch (...) {
             XX_LOGW("{}Plugin `{}` get_info threw unknown exception", logTag(), path);
         }
-        if (info && info->api_version != PLUGINXX_API_VERSION) {
+        if (info && info->api_version < PLUGINXX_MIN_API_VERSION) {
             NativeLoader::close(dl);
             XX_LOGE(
-                "{}Plugin `{}` API version mismatch (got {}, host requires {})",
+                "{}Plugin `{}` API version too old (got {}, framework requires >= {})",
                 logTag(),
                 path,
                 info->api_version,
-                PLUGINXX_API_VERSION
+                PLUGINXX_MIN_API_VERSION
             );
             co_return nullptr;
         }

@@ -50,8 +50,16 @@ extern "C" {
 #define PLUGINXX_CALL
 #endif
 
-/// 全局 API 版本 (agent 侧)
+/// 全局 API 版本 (agent 侧; 当前框架版本, 用于展示与新增能力判定)
 #define PLUGINXX_API_VERSION 1
+
+/// 框架支持的最低插件 API 版本
+///
+/// 检查口径只有这一条: 插件 `PluginxxInfo.api_version >= PLUGINXX_MIN_API_VERSION`。
+/// 插件声明更高版本不再被拒绝 (更高版本意味着它可能用了当前框架没有的能力, 由插件
+/// 自己在 `get_info` 里读 `PLUGINXX_API_VERSION` 决定要不要降级), 也允许插件声明
+/// 比当前框架更低的版本继续运行。
+#define PLUGINXX_MIN_API_VERSION 1
 
 #pragma pack(push, 8)
 
@@ -77,7 +85,7 @@ typedef struct PluginxxString {
 /// ==================== 插件元信息 ====================
 
 typedef struct PluginxxInfo {
-    int32_t                 api_version; ///< 必须 >= PLUGINXX_API_VERSION
+    int32_t                 api_version; ///< 必须 >= PLUGINXX_MIN_API_VERSION
     uint32_t                _reserved;   ///< 8 字节补齐
     PluginxxStringView name;        ///< 唯一标识 (只读借用)
     PluginxxStringView version;
