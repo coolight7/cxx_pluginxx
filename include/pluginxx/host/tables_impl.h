@@ -111,7 +111,6 @@ struct GenericTableEntries {
 
     static void PLUGINXX_CALL
         logEntry(const PluginxxHost* host, int32_t level, const PluginxxStringView* msg) {
-        (void)host;
         using utilxx_base::LogLevel;
         LogLevel lv = LogLevel::Info;
         switch (level) {
@@ -133,7 +132,16 @@ struct GenericTableEntries {
             default:
                 break;
         }
-        utilxx_base::xxLogPrint(lv, svToStr(msg));
+        // 模块名 `plugin.<插件名>` (计划 OBS-5): 宿主可按插件前缀单独调日志级别
+        // (如 `plugin.agentxx_codegraph=debug`); 只读查询入口, 关闭过程中也允许记录
+        std::string module{"plugin"};
+        if (auto call = enterHost(host, /*allowClosing=*/true); call.ok()) {
+            if (const auto* inst = call.instance(); inst != nullptr && !inst->name.empty()) {
+                module += ".";
+                module += inst->name;
+            }
+        }
+        utilxx_base::xxLogPrint(lv, module, svToStr(msg));
     }
 
     // =====================================================================
