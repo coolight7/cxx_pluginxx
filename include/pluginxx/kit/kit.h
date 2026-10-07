@@ -659,7 +659,7 @@ inline std::string
  * - `driverRunning_`: 回调正在执行;
  * 单个 `bool scheduled` 会在"回调收尾清标志"与"外部投递写标志"之间丢通知: 例如
  * 并发启动 N 个根时, N 次 wake 若被合并成一次请求, 就只有 1 个根会被推进。因此
- * 这里用"步骤计数 + 显式 wake 标记 + 两个在途标志 + epoch"组合, 保证任何窗口中的
+ * 这里用"步骤计数 + 显式 wake 标记 + 两个进行中标志 + epoch"组合, 保证任何窗口中的
  * 投递最终都会被推进, 且没有新工作时请求数不再增长。
  *
  * 线程: `wake()` 可从外部完成回调线程调用; `driveOnce()` 在宿主 IO 线程执行;
@@ -891,8 +891,8 @@ private:
 ///   空闲时不自旋;
 /// - **受控轮询根** ([PolledRoot], 声明式 `polled_tool`): 等的是插件本地 reactor 上
 ///   的内核就绪事件 (socket/管道/文件/本地 timer)。`poll_one` 只能"执行已就绪
-///   handler", 不会让等待对象到期, 因此这类根需要"有在途操作时轮询":
-///   有进展立即续票、无进展退避 `kPollIntervalMs`, 空闲 (无在途 polled 操作) 时
+///   handler", 不会让等待对象到期, 因此这类根需要"有操作进行中时轮询":
+///   有进展立即续票、无进展退避 `kPollIntervalMs`, 空闲 (无未结束的 polled 操作) 时
 ///   不申请请求、不建定时器, 与事件驱动路径共享同一次请求/同一次 `poll_one`。
 class PollOneBridge {
 public:
@@ -1005,7 +1005,7 @@ public:
         return roots_.size();
     }
 
-    /// 在途受控轮询操作数 (诊断: 0 表示"不轮询、不建定时器")。
+    /// 未结束的受控轮询操作数 (诊断: 0 表示"不轮询、不建定时器")。
     uint64_t polledRootCount() const noexcept {
         return polledRoots_.load(std::memory_order_acquire);
     }
@@ -1015,13 +1015,13 @@ public:
         return idlePollCount_.load(std::memory_order_acquire);
     }
 
-    /// 是否有在途的退避定时器 (诊断)。
+    /// 是否有已排定的退避定时器 (诊断)。
     bool isPumpWaitScheduled() const {
         std::lock_guard lock(mutex_);
         return pumpWaitScheduled_;
     }
 
-    /// 是否正在受控轮询 (有在途 polled 操作)。
+    /// 是否正在受控轮询 (有未结束的 polled 操作)。
     bool isPumping() const noexcept {
         return polledRoots_.load(std::memory_order_acquire) > 0;
     }
@@ -1093,7 +1093,7 @@ public:
     }
 
     /// 注销一个受控轮询根 (协程结束后调用)。
-    /// 计数归零时停止轮询: 取消在途退避定时器, 之后不再申请请求。
+    /// 计数归零时停止轮询: 取消已排定的退避定时器, 之后不再申请请求。
     void removePolledRoot(const std::shared_ptr<PolledRoot>& root) noexcept {
         bool                    last   = false;
         PluginxxOperatorHandle* waitOp = nullptr;
@@ -1118,7 +1118,7 @@ public:
         }
     }
 
-    /// 立即结束在途退避 (取消退避定时器, 让下一次驱动马上到来)。
+    /// 立即结束已排定的退避 (取消退避定时器, 让下一次驱动马上到来)。
     /// 用于 `execute_cancel`: 插件不必等满一个退避量子就能看到取消并收束根。
     void kickPumpWait() noexcept {
         PluginxxOperatorHandle* waitOp = nullptr;
@@ -1129,7 +1129,7 @@ public:
         cancelSchedulerOp(waitOp);
     }
 
-    /// 宿主拒绝再提供驱动 / 桥停止时, 终结全部在途受控轮询根 (幂等)。
+    /// 宿主拒绝再提供驱动 / 桥停止时, 终结全部未结束的受控轮询根 (幂等)。
     ///
     /// 帧不在这里销毁 (由 asio 随本地 reactor 释放); 这里只负责:
     /// - 每个根按 FAILED 上报一次 (`claimFinish` 仲裁, 与正常完成路径互斥);
@@ -1413,7 +1413,7 @@ private:
             // 到达时会自己调用 [wake]。
             needRequest = prepareScheduleLocked();
             if (!needRequest) {
-                // 受控轮询: 有在途 polled 操作时按"有进展立即续, 无进展退避"继续，
+                // 受控轮询: 有未结束的 polled 操作时按"有进展立即续, 无进展退避"继续，
                 // 否则不申请请求 (空闲零开销)。
                 switch (pumpNextLocked(progressed, backoffMs)) {
                     case PumpDecision::Immediate:
@@ -1436,18 +1436,18 @@ private:
 
     /// 下一轮驱动的决策 (调用方持 [mutex_]; 不在此处调用宿主接口)。
     enum class PumpDecision {
-        Stop,      ///< 不轮询: 无在途 polled 操作, 或已停止
+        Stop,      ///< 不轮询: 无未结束的 polled 操作, 或已停止
         Immediate, ///< 有进展: 立即申请下一次请求 (不等退避)
         Backoff,   ///< 无进展或达到突发上限: 安排一次退避后再驱动
     };
 
     /// 受控轮询的调度策略 (调用方持 [mutex_])。
     ///
-    /// - 无在途 polled 操作 (`polledRoots_ == 0`): 不轮询, 突发计数归零;
+    /// - 无未结束的 polled 操作 (`polledRoots_ == 0`): 不轮询, 突发计数归零;
     /// - 本轮 `poll_one` 执行到了 handler (有进展) 且未达突发上限: 立即续票,
     ///   等待中的网络/子进程/文件就能在就绪的下一个瞬间被处理 (最坏延迟 = 退避量子);
     /// - 否则: 安排一次退避 (无进展 = `kPollIntervalMs`; 达到突发上限 = 让出
-    ///   `kPollBurstYieldMs` 给宿主与同实例其它操作), 已有在途退避时不重复安排。
+    ///   `kPollBurstYieldMs` 给宿主与同实例其它操作), 已有已排定的退避时不重复安排。
     PumpDecision pumpNextLocked(std::size_t progressed, int64_t& backoffMs) noexcept {
         backoffMs = 0;
         if (stopping_ || polledRoots_.load(std::memory_order_acquire) == 0) {
@@ -1469,7 +1469,7 @@ private:
             backoffMs  = kPollIntervalMs;
         }
         if (pumpWaitScheduled_) {
-            return PumpDecision::Stop; // 已有在途退避: 到点后会自己续票
+            return PumpDecision::Stop; // 已有已排定的退避: 到点后会自己续票
         }
         pumpWaitScheduled_ = true;
         idlePollCount_.fetch_add(1, std::memory_order_acq_rel);
@@ -1480,7 +1480,7 @@ private:
     ///
     /// - 到期回调 [pumpWaitDone] 只做"请求下一次请求", 不恢复插件协程;
     /// - 必须在 [mutex_] 之外调用宿主 `sleep` (回调可能同步到达);
-    /// - 宿主计时器不可用时无法退避: 记一次错误并终结在途 polled 根,
+    /// - 宿主计时器不可用时无法退避: 记一次错误并终结未结束的 polled 根,
     ///   避免"根永远不被推进"这类静默悬挂。
     void schedulePumpWait(int64_t ms) noexcept {
         if (!sched_ || !sched_->sleep) {
@@ -1551,7 +1551,7 @@ private:
         }
     }
 
-    /// 取出在途退避句柄并复位调度状态 (调用方持 [mutex_]; 取消动作在锁外执行)。
+    /// 取出已排定的退避句柄并复位调度状态 (调用方持 [mutex_]; 取消动作在锁外执行)。
     PluginxxOperatorHandle* takePumpWaitLocked() noexcept {
         auto* op           = pumpWaitOp_;
         pumpWaitOp_        = nullptr;
@@ -1574,7 +1574,7 @@ private:
     const PluginxxHost*                                        host_    = nullptr;
     const PluginxxCoroutineRuntimeIface*                       runtime_ = nullptr;
     /// 宿主计时器/卸载接口表 (`scheduler.sleep` 用于受控轮询的退避量子,
-    /// `op_cancel` 用于取消在途退避); 缺失时为 nullptr。
+    /// `op_cancel` 用于取消已排定的退避); 缺失时为 nullptr。
     const PluginxxSchedulerIface* sched_ = nullptr;
 
     bool            stopping_      = false;
@@ -1587,7 +1587,7 @@ private:
 
     /// 受控轮询的下一次请求理由 (见 [pumpNextLocked]/[prepareScheduleLocked])。
     bool pumpPending_ = false;
-    /// 在途退避定时器 (调度状态与其句柄同属 [mutex_])。
+    /// 已排定的退避定时器 (调度状态与其句柄同属 [mutex_])。
     bool                    pumpWaitScheduled_ = false;
     PluginxxOperatorHandle* pumpWaitOp_        = nullptr;
     /// 连续"有进展"步数 (受控轮询突发计数)。
@@ -1598,7 +1598,7 @@ private:
     std::atomic<uint64_t> readySteps_{0};
     std::atomic<uint64_t> ticketsIssued_{0};
     std::atomic<uint64_t> driverSteps_{0};
-    /// 在途受控轮询操作数 (与 `polledRootList_` 同步; 读端不加锁)。
+    /// 未结束的受控轮询操作数 (与 `polledRootList_` 同步; 读端不加锁)。
     std::atomic<uint64_t> polledRoots_{0};
     /// 已发生的"无进展退避"次数 (诊断)。
     std::atomic<uint64_t> idlePollCount_{0};
@@ -1611,7 +1611,7 @@ private:
     std::vector<std::shared_ptr<BridgeRoot>> roots_;
     /// 被放弃 (宿主拒绝驱动/桥停止) 的根: 保活到桥销毁, 期间迟到回调只会安全跳过。
     std::vector<std::shared_ptr<BridgeRoot>> abandonedRoots_;
-    /// 在途受控轮询根 (与 `polledRoots_` 计数一致)。
+    /// 未结束的受控轮询根 (与 `polledRoots_` 计数一致)。
     std::vector<std::shared_ptr<PolledRoot>> polledRootList_;
     /// 被放弃的受控轮询根留下的清理回调 (回收 Job); 桥销毁时执行。
     std::vector<std::function<void()>> abandonedCleanups_;

@@ -55,7 +55,7 @@ extern "C" {
 
 /// 框架支持的最低插件 API 版本
 ///
-/// 检查口径只有这一条: 插件 `PluginxxInfo.api_version >= PLUGINXX_MIN_API_VERSION`。
+/// 检查规则只有这一条: 插件 `PluginxxInfo.api_version >= PLUGINXX_MIN_API_VERSION`。
 /// 插件声明更高版本不再被拒绝 (更高版本意味着它可能用了当前框架没有的能力, 由插件
 /// 自己在 `get_info` 里读 `PLUGINXX_API_VERSION` 决定要不要降级), 也允许插件声明
 /// 比当前框架更低的版本继续运行。

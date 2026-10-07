@@ -68,7 +68,7 @@ protected:
     std::shared_ptr<MyInstance> createInstance(std::string name) override;
     const PluginxxHostVtable*    hostVtable() override;
     // 生命周期接缝 (可选): 领域注册摘除与清空 / 清单资源应用与释放 / 启停状态通知 /
-    // 装载卸载收尾 / 卸载级联口径 / 日志前缀
+    // 装载卸载收尾 / 卸载级联定义 / 日志前缀
     void detachDomainRegistrations(MyInstance* inst) override;
 };
 ```
@@ -84,7 +84,7 @@ protected:
   取通用表，未命中再分发宿主的领域表 (agentxx 侧见
   `agent/lib/src/plugins/plugin_manager_vtable.cpp`)。
 
-> 已落地: `api/` 两个纯 C 头、`kit/` (插件 SDK 通用部分 + 边界守卫)、
+> 已实现: `api/` 两个纯 C 头、`kit/` (插件 SDK 通用部分 + 边界守卫)、
 > `runtime/` (实例状态机/执行 lease/协程驱动/Operation 驱动器/管理器基类)、
 > `host/` (装载/清单/ABI 辅助/能力注册表/事件后端/领域钩子/宿主核心/通用表入口/
 > 生命周期骨架) —— agentxx 侧的 `agentxx/plugin/api/plugin_kit.h` 与 `plugin_guard.h`

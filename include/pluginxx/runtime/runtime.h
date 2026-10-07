@@ -414,7 +414,7 @@ inline bool runtimeExecutorStopped(const asio::any_io_executor& executor) noexce
 }
 
 /// 当前线程是否为该运行时的 IO 线程 (仅用于断言与诊断)
-/// - executor 缺失或已停止时返回 false (与 [PluginManagerBase::isIoThread] 同口径):
+/// - executor 缺失或已停止时返回 false (与 [PluginManagerBase::isIoThread] 同一套规则):
 ///   io_context 停止后即使当前线程正是最后绑定 executor 的线程, 也不得视为 io 线程,
 ///   否则同步 ABI 调用会在已关闭的 runtime 上继续执行
 inline bool isRuntimeIoThread(const std::shared_ptr<PluginRuntime>& runtime) noexcept {
