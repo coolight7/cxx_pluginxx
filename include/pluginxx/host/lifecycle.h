@@ -1005,12 +1005,13 @@ protected:
         }
         detachInstanceRegistrations(inst.get());
         releaseInstanceResources(*inst);
-        inst->destroyPlugin();
+        const bool destroyed = inst->destroyPlugin();
         this->plugins_.erase(inst->name);
         this->releasePluginName(inst->name);
-        if (closeHandle && inst->dlHandle) {
-            NativeLoader::close(inst->dlHandle);
-            inst->dlHandle = nullptr;
+        /// destroy 被活动 lease 挡下时不关句柄: 插件代码可能还在运行, 这时候卸载
+        /// 动态库会直接崩 (实例随最后一个引用释放时由析构兜底)。
+        if (closeHandle && destroyed) {
+            inst->closeLibraryHandle();
         }
     }
 
@@ -1070,6 +1071,9 @@ protected:
             );
             return;
         }
+        /// 插件上下文已销毁: 关闭动态库句柄, 释放对插件文件的占用
+        /// (否则卸载后插件目录仍删不掉、库文件也换不掉)。
+        inst->closeLibraryHandle();
         if (inst->lifetime) {
             inst->lifetime->setState(PluginInstanceState::Closed);
         }
@@ -1103,6 +1107,9 @@ protected:
                     XX_LOGE("Plugin `{}` idle cleanup still has active leases", inst->name);
                     return;
                 }
+                /// 上下文已销毁: 动态库句柄在这里关掉 (实例可能已经没有别的持有者,
+                /// 句柄不关就会被占住到进程退出)。
+                inst->closeLibraryHandle();
                 inst->lifetime->setState(PluginInstanceState::Closed);
                 // 管理器仍存活时释放同一实例的名称预占，使后续加载可以重试。
                 // manager 已析构时 weak_ptr 为空，实例会在 cleanup 返回后自然释放。
@@ -1393,6 +1400,9 @@ protected:
             );
             co_return false;
         }
+        /// 插件上下文已销毁、lease 已归零: 关闭动态库句柄, 让插件文件在卸载之后
+        /// 可以删除/替换 (不关的话 Windows 上目录与库文件都被占住)。
+        inst->closeLibraryHandle();
         if (inst->lifetime) {
             inst->lifetime->setState(PluginInstanceState::Closed);
         }

@@ -122,7 +122,25 @@ struct PluginInstanceBase {
     ///   [pluginDestroySymbol] 查符号) 并调用, 随后退休宿主控制块 —— 插件上下文
     ///   销毁后, 插件持有的旧 host 指针只能安全失败。
     /// - 幂等: 已销毁时直接返回 true。
+    ///
+    /// 返回 true 之后调用方应调用 [closeLibraryHandle] 释放动态库: 插件代码不会再
+    /// 执行了 (stop 已补齐、lease 已归零), 再留着句柄只会占住插件文件。
     bool destroyPlugin() noexcept;
+
+    /// 关闭动态库句柄, 释放宿主对插件文件的占用。
+    ///
+    /// **只能在插件代码不会再执行时调用**: stop 事务已完成、活动 lease 已归零、
+    /// 实例也已从插件表摘除。Windows 上没关掉的句柄会一直映射着插件文件, 插件目录
+    /// 删不掉、库文件也换不掉 (表现为"拒绝访问"), 卸载与插件更新都做不下去。
+    ///
+    /// 内置插件没有句柄 ([dlHandle] 为空), 调用是空操作; 重复调用同样安全。
+    void closeLibraryHandle() noexcept {
+        if (!dlHandle) {
+            return;
+        }
+        NativeLoader::close(dlHandle);
+        dlHandle = nullptr;
+    }
 
     /// stop 事务仍未执行: 同步关闭路径无法等待该事务，因此必须保留实例、
     /// 上下文与动态库，交由仍运行的异步 owner (unloadAsync/shutdownAsync) 收尾。
@@ -304,7 +322,14 @@ public:
     explicit PluginInstanceBase(std::string in_name) :
         name(std::move(in_name)) {}
 
-    virtual ~PluginInstanceBase() = default;
+    /// 析构时的最后一道保险: 插件上下文已经销毁 (或从未创建) 时, 句柄没被显式关闭
+    /// 也在这里放掉 —— 否则插件文件会一直被进程占用到退出 (删不掉、换不掉)。
+    /// 上下文还在时不关: 插件代码可能仍在运行, 关掉只会崩。
+    virtual ~PluginInstanceBase() {
+        if (pluginDestroyed || !pluginCreated) {
+            closeLibraryHandle();
+        }
+    }
 
     PluginInstanceBase(const PluginInstanceBase&)            = delete;
     PluginInstanceBase& operator=(const PluginInstanceBase&) = delete;
