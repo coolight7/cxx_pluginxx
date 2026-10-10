@@ -1,11 +1,11 @@
-/// pluginxx 插件管理器公共基类 (宿主侧, 与宿主领域无关)
+/// pluginxx 插件管理器公共基类 (主程序侧, 与主程序业务无关)
 ///
 /// 背景: agent 侧 PluginManager 与 client 侧 ClientPluginManager 存在大量重复基建
 /// (插件表查找/名称预占、io 线程投递、实例 lease 归零等待、反向必选依赖收集)。
 /// 提取到本基类避免两侧行为漂移。
 ///
 /// 内容:
-/// - [PluginHostCall] / [enterPluginHost]: vtable 入口公共上下文 (解析宿主控制块 →
+/// - [PluginHostCall] / [enterPluginHost]: vtable 入口公共上下文 (解析框架控制块 →
 ///   实例/管理器强引用 + admission lease), 使"已排队但尚未执行"的请求也被卸载的
 ///   idle 等待覆盖;
 /// - [PluginManagerBase<InstanceT>]: 插件表 / io executor / io 线程投递 /
@@ -13,7 +13,7 @@
 /// - [collectReverseRequiredDeps]: 反向必选依赖收集 (模板)。
 ///
 /// InstanceT 须继承 [pluginxx::PluginInstanceBase]; 具体加载/卸载/注册动作由派生类
-/// 实现 (本类不持有宿主领域字段)。
+/// 实现 (本类不持有主程序业务字段)。
 ///
 /// 线程约定: 插件表仅 io 线程读写; `ioThreadId_` 与 inflight 计数为原子 (跨线程读写)。
 #pragma once
@@ -43,11 +43,11 @@ namespace pluginxx {
 // vtable 入口公共上下文
 // =====================================================================
 
-/// vtable 入口的公共上下文：解析宿主控制块，并持有实例/管理器强引用与
+/// vtable 入口的公共上下文：解析框架控制块，并持有实例/管理器强引用与
 /// admission lease。
 ///
 /// - `ok()` 为 false 时入口必须安全失败（返回非 0 / NULL + error）：
-///   实例已卸载、已关闭、正在关闭（`allowClosing=false`）或参数不是本宿主
+///   实例已卸载、已关闭、正在关闭（`allowClosing=false`）或参数不是本主程序
 ///   发放的 host 视图。
 /// - `guard` 是 admission lease。投递到 IO 线程的闭包按值捕获本对象即可让
 ///   卸载的 idle 等待覆盖“已排队但尚未执行”的阶段，避免 dlclose 越过闭包。
@@ -355,7 +355,7 @@ protected:
     /// 一并写入实例 ([PluginInstanceBase::runtime])。
     ///
     /// 运行时经弱引用登记, 使 Operation 驱动器与驱动请求无需回查管理器类型即可
-    /// 拿到 io executor 与线程标识 (框架内核因此不依赖宿主的管理器具体类型)。
+    /// 拿到 io executor 与线程标识 (框架内核因此不依赖主程序的管理器具体类型)。
     std::shared_ptr<pluginxx::InstanceLifetime>
         makeLifetime(const std::shared_ptr<PluginInstanceBase>& inst) {
         if (inst) {

@@ -1,14 +1,14 @@
-/// pluginxx 通用事件表的事件后端与订阅句柄 (宿主侧, 与宿主领域无关)
+/// pluginxx 通用事件表的事件后端与订阅句柄 (主程序侧, 与主程序业务无关)
 ///
 /// 内容:
-/// - [EventSource]: 宿主事件总线的最小抽象 (订阅 / 撤销 / 发布) —— 宿主用自己已有的
+/// - [EventSource]: 主程序事件总线的最小抽象 (订阅 / 撤销 / 发布) —— 主程序用自己已有的
 ///   事件系统实现它 (agentxx 侧见 `agentxx/plugin/plugin_event_source.h`);
 /// - [PluginxxSubscription]: 事件订阅句柄的**实现体** (C ABI 中作为不透明指针
 ///   `PluginxxSubscription*` 传递, 因此名字保持 ABI 冻结时的形态);
-/// - [unsubscribePluginSubscription]: 幂等撤销 (任意线程; 宿主侧簿记在 IO 线程执行)。
+/// - [unsubscribePluginSubscription]: 幂等撤销 (任意线程; 主程序侧簿记在 IO 线程执行)。
 ///
 /// 线程约定:
-/// - 订阅登记 / 撤销簿记只在宿主 IO 线程执行 (与其它注册事务同一串行上下文);
+/// - 订阅登记 / 撤销簿记只在主程序 IO 线程执行 (与其它注册事务同一串行上下文);
 /// - `alive` 为原子标志: 撤销返回后事件线程据此立即短路, 不再回调插件;
 /// - 事件回调本身经实例执行 lease 保护 (见 [PluginHostCore::subscribe])。
 #pragma once
@@ -34,7 +34,7 @@ namespace pluginxx {
 
 class PluginInstanceBase;
 
-/// 宿主事件源 (通用事件表的事件后端)
+/// 主程序事件源 (通用事件表的事件后端)
 ///
 /// 主题的命名空间补齐由 [DomainHooks::qualifyEventTopic] 完成, 本接口收到的
 /// 已经是最终主题, 实现方只负责"把主题映射到自己的事件系统"。
@@ -44,7 +44,7 @@ public:
     virtual ~EventSource() = default;
 
     /// 订阅主题
-    /// - handler 由宿主在其事件线程调用, **不得抛异常** (抛出的异常会被短路成日志)
+    /// - handler 由主程序在其事件线程调用, **不得抛异常** (抛出的异常会被短路成日志)
     /// - `return` 订阅句柄 (0 表示失败; 0 不会交给 [unsubscribe])
     virtual size_t subscribe(std::string_view topic, std::function<void(std::string_view)> handler)
         = 0;
@@ -70,7 +70,7 @@ struct PluginxxSubscription {
     size_t subscriptionId = 0;
     /// 订阅者实例 (弱引用: 句柄不延长实例生命周期)
     std::weak_ptr<pluginxx::PluginInstanceBase> inst;
-    /// 宿主运行时 (撤销时把簿记投递到 IO 线程; 弱引用不延长其生命周期)
+    /// 插件框架运行时 (撤销时把簿记投递到 IO 线程; 弱引用不延长其生命周期)
     std::weak_ptr<pluginxx::PluginRuntime> runtime;
     /// 插件事件回调 (C ABI 函数指针)
     void(PLUGINXX_CALL* handler)(const PluginxxStringView* event_json, void* ud)
@@ -83,7 +83,7 @@ struct PluginxxSubscription {
 namespace pluginxx {
 namespace detail {
 
-/// 撤销簿记的具体动作 (**须在宿主 IO 线程执行**): 撤销后端订阅并移出实例订阅表。
+/// 撤销簿记的具体动作 (**须在主程序 IO 线程执行**): 撤销后端订阅并移出实例订阅表。
 /// - 幂等: `subscriptionId` 置 0 后重复调用是空操作;
 /// - 异常不外抛 (撤销发生在实例关闭路径, 不能因为后端报错而留下悬挂登记)。
 ///
@@ -97,7 +97,7 @@ void revokeSubscription(PluginxxSubscription* sub) noexcept;
 ///
 /// 步骤:
 /// 1. 原子置 `alive=false`: 之后到达的事件立即不再回调插件, 不必等待簿记完成;
-/// 2. 在宿主 IO 线程撤销后端订阅并移出实例的订阅表 (非 IO 线程时同步等待投递完成,
+/// 2. 在主程序 IO 线程撤销后端订阅并移出实例的订阅表 (非 IO 线程时同步等待投递完成,
 ///    与其它 vtable 入口的投递语义一致);
 /// 3. 运行时不可投递 (io executor 缺失/已停止) 时就地完成簿记 —— 此时实例正在
 ///    关闭, 不再有并发访问实例订阅表的执行体。

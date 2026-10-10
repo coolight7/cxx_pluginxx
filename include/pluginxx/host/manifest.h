@@ -1,4 +1,4 @@
-/// pluginxx 插件清单与名称推导 (宿主侧, 与宿主领域无关)
+/// pluginxx 插件清单与名称推导 (主程序侧, 与主程序业务无关)
 ///
 /// 内容:
 /// - 插件名推导: [pluginNameFromPath] (`libfoo.so` → `foo`)、`builtin://` 简写解析;
@@ -9,7 +9,7 @@
 /// - 入口路径解析: [resolvePluginEntryPath] (平台扩展名修正 + 配置子目录回退);
 /// - 依赖排序: [PluginSortItem] / [topoSortPlugins] (Kahn 拓扑排序)。
 ///
-/// 接口声明的**协商** (前缀归属与宿主支持集比对) 属于宿主领域, 见宿主侧
+/// 接口声明的**协商** (前缀归属与主程序支持集比对) 属于主程序业务, 见主程序侧
 /// `agentxx/plugin/plugin_interfaces.h`。
 ///
 /// 线程约定: 本头内函数均为纯函数, 可在任意线程调用。
@@ -41,12 +41,12 @@ inline std::string parseBuiltinName(std::string_view p) {
     return std::string(p.substr(10));
 }
 
-/// 内置插件清单提供者: 由"把插件合并编译进自身二进制"的宿主注册
+/// 内置插件清单提供者: 由"把插件合并编译进自身二进制"的主程序注册
 ///
-/// 背景: 内置插件表由宿主经 `configure_file` 生成 (见 agentxx 的
+/// 背景: 内置插件表由主程序经 `configure_file` 生成 (见 agentxx 的
 /// `plugins/builtin_plugins.cpp.in`), 其符号不属于框架内核。框架内核因此不直接
-/// 引用宿主符号, 改由宿主在启动早期把提供者注册进来; 未注册时视为"无内置插件"
-/// (返回 0 项), 纯动态库宿主无需注册。
+/// 引用主程序符号, 改由主程序在启动早期把提供者注册进来; 未注册时视为"无内置插件"
+/// (返回 0 项), 纯动态库主程序无需注册。
 struct BuiltinPluginProvider {
     /// 返回内置插件描述静态数组, 并写出元素个数 (可为空)
     const PluginxxBuiltinInfo* (*plugins)(uint64_t* count) = nullptr;
@@ -54,7 +54,7 @@ struct BuiltinPluginProvider {
     const PluginxxBuiltinManifest* (*manifests)(uint64_t* count) = nullptr;
 };
 
-/// 注册内置插件清单提供者 (宿主静态初始化期调用一次即可; 幂等覆盖)
+/// 注册内置插件清单提供者 (主程序静态初始化期调用一次即可; 幂等覆盖)
 PLUGINXX_API void setBuiltinPluginProvider(BuiltinPluginProvider provider) noexcept;
 
 /// 读取当前注册的内置插件清单提供者
@@ -78,7 +78,7 @@ PLUGINXX_API std::string pluginNameFromPath(const std::string& path);
 ///     skill:  [dir, ...]                  → skillDirs
 ///     memory: [file, ...]                 → memoryFiles
 ///     mcp:    [{namespace,url,timeout},…] → mcpServers
-/// - 仅 agent 侧使用; client 侧插件宿主忽略资源声明
+/// - 仅 agent 侧使用; client 侧插件主程序忽略资源声明
 struct PluginManifestResources {
     /// 单个 MCP server 声明
     struct McpDecl {
@@ -96,8 +96,8 @@ struct PluginManifestResources {
 ///   interfaces:
 ///     require:  [agentxx.agent.core, agentxx.client.command]
 ///     optional: [agentxx.client.toast]
-/// - 同一清单可同时声明两侧接口 (前缀决定归属), 服务 cli/tui/gui 多宿主
-/// - 归属过滤与宿主支持集比对由宿主侧的 checkInterfacesForSide 完成
+/// - 同一清单可同时声明两侧接口 (前缀决定归属), 服务 cli/tui/gui 多主程序
+/// - 归属过滤与主程序支持集比对由主程序侧的 checkInterfacesForSide 完成
 struct PluginManifestInterfaces {
     std::vector<std::string> require;
     std::vector<std::string> optional;

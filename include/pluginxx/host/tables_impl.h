@@ -1,6 +1,6 @@
-/// pluginxx 通用表入口实现 (宿主侧 vtable 的通用部分, 与宿主领域无关)
+/// pluginxx 通用表入口实现 (主程序侧 vtable 的通用部分, 与主程序业务无关)
 ///
-/// 用法 (宿主侧 `query_interface` 实现):
+/// 用法 (主程序侧 `query_interface` 实现):
 /// ```cpp
 /// const void* PLUGINXX_CALL xx_query_interface(
 ///     const PluginxxHost*, const PluginxxStringView* iid) {
@@ -14,7 +14,7 @@
 ///
 /// 覆盖 10 张通用表: log / json / config / plugins / events / scheduler /
 /// coroutine_runtime / tasks / cancel / capabilities。入口体只做三件事:
-/// 解析宿主控制块 (取实例/管理器 + admission lease) → 投递到 IO 线程 → 调用
+/// 解析框架控制块 (取实例/管理器 + admission lease) → 投递到 IO 线程 → 调用
 /// [PluginHostCore] 的同名方法; 领域数据一律由 [DomainHooks] 提供。
 ///
 /// 线程约定: 入口可在任意线程调用 (内部投递并同步等待); 表结构体首次查询时构造,
@@ -132,7 +132,7 @@ struct GenericTableEntries {
             default:
                 break;
         }
-        // 模块名 `plugin.<插件名>` (计划 OBS-5): 宿主可按插件前缀单独调日志级别
+        // 模块名 `plugin.<插件名>` (计划 OBS-5): 主程序可按插件前缀单独调日志级别
         // (如 `plugin.agentxx_codegraph=debug`); 只读查询入口, 关闭过程中也允许记录
         std::string module{"plugin"};
         if (auto call = enterHost(host, /*allowClosing=*/true); call.ok()) {
@@ -974,7 +974,7 @@ struct GenericTableEntries {
     }
 };
 
-/// 按 IID 查询**通用表** (未命中返回 nullptr, 宿主继续查自己的领域表)
+/// 按 IID 查询**通用表** (未命中返回 nullptr, 主程序继续查自己的领域表)
 /// - 覆盖 10 张通用表; IID 为编译期常量字符串, 比较用 string_view (不构造临时串)
 template<typename InstanceT, typename ManagerT>
 const void* queryGenericPluginIface(std::string_view iid) {

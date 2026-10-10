@@ -1,14 +1,14 @@
-/// pluginxx 宿主领域钩子 (通用表实现的取数入口)
+/// pluginxx 主程序业务钩子 (通用表实现的取数入口)
 ///
 /// 定位: 通用表 (**与会话/模型/工具/提示词/图无关**的表) 的实现位于 cxx_pluginxx,
-/// 但其中少数入口需要宿主数据 (配置内容 / 语言 / 会话工作目录 / 会话取消状态 /
+/// 但其中少数入口需要主程序数据 (配置内容 / 语言 / 会话工作目录 / 会话取消状态 /
 /// 插件清单 / 工作线程池 / 事件总线)。这些数据一律经本接口取, 因此 pluginxx 源码
-/// 不包含任何宿主头、不依赖任何宿主类型。
+/// 不包含任何主程序头、不依赖任何主程序类型。
 ///
-/// 宿主侧用法: 宿主管理器实现本接口, 并在任何通用表入口可能被调用之前
+/// 主程序侧用法: 主程序管理器实现本接口, 并在任何通用表入口可能被调用之前
 /// 经 [PluginHostCore::setDomainHooks] 注入 (通常在管理器构造函数体内完成)。
 ///
-/// 线程约定: 下列方法都在宿主 IO 线程被调用 (通用表入口先投递到 IO 线程),
+/// 线程约定: 下列方法都在主程序 IO 线程被调用 (通用表入口先投递到 IO 线程),
 /// 实现方无需额外加锁; [postToWorkerThread] 例外, 它把工作投递到工作线程池。
 #pragma once
 
@@ -21,7 +21,7 @@
 
 namespace pluginxx {
 
-/// 宿主领域钩子 (纯虚接口部分为必需项; 带默认实现的为可选项)
+/// 主程序业务钩子 (纯虚接口部分为必需项; 带默认实现的为可选项)
 class DomainHooks {
 public:
 
@@ -29,7 +29,7 @@ public:
 
     // ==================== 事件表 ====================
 
-    /// 事件后端; 返回 nullptr 表示宿主不支持事件订阅/发布
+    /// 事件后端; 返回 nullptr 表示主程序不支持事件订阅/发布
     virtual std::shared_ptr<EventSource> eventSource() {
         return nullptr;
     }
@@ -42,13 +42,13 @@ public:
 
     // ==================== 调度表 ====================
 
-    /// 把一段阻塞工作投递到宿主工作线程池
-    /// - `return` false 表示宿主不可用 (offload 以失败终结, 不静默丢工作)
+    /// 把一段阻塞工作投递到主程序工作线程池
+    /// - `return` false 表示主程序不可用 (offload 以失败终结, 不静默丢工作)
     virtual bool postToWorkerThread(std::function<void()> fn) = 0;
 
     // ==================== config 表 ====================
 
-    /// 宿主配置 JSON (`get_config` 的领域部分, 如 dataDir / projectRoot / platform)
+    /// 主程序配置 JSON (`get_config` 的领域部分, 如 dataDir / projectRoot / platform)
     virtual std::string configJson() = 0;
 
     /// 指定工具的提示词配置 JSON (`get_tool_prompt`; 不存在返回空串)

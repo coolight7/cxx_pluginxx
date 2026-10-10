@@ -1,15 +1,14 @@
 # cxx_pluginxx
 
-插件框架内核 (纯 C ABI 基座 + 通用接口表 + 宿主运行时 + 插件 SDK 核心)。
+插件框架内核 (纯 C ABI 基座 + 通用接口表 + 插件运行时 + 插件 SDK 核心)。
 
 ## 定位
 
-- **用途**: 与宿主领域无关的插件框架 —— 动态库装载、生命周期 (create/start/stop/destroy)、
+- **用途**: 与主程序业务无关的插件框架 —— 动态库装载、生命周期 (create/start/stop/destroy)、
   清单与依赖拓扑、接口表查询、协程驱动、取消与卸载 (> 通用接口表实现见下)
-- **宿主领域内容不在此**: agent 侧的工具/权限/钩子/会话/模型/提示词/资源/图,
-  client 侧的 UI/事件/会话/线路/自身信息, 均由宿主自行定义与实现
+- **主程序业务内容不在此**: 各主程序自身的业务工具/权限/钩子/会话/UI/事件/自身信息等, 均由主程序自行定义与实现
 - **依赖**: `cxx_utilxx_base` (取消令牌/日志/JSON)、fmt、Boost (仅头文件, 不链接 Boost 编译库)
-  —— **禁止**依赖 neograph / OpenSSL / SQLite / 任何宿主头文件
+  —— **禁止**依赖 neograph / OpenSSL / SQLite / 任何主程序业务头文件
 
 ## 跨边界 C ABI (不可变契约)
 
@@ -25,8 +24,8 @@
 ```
 include/pluginxx/
   api/    abi.h    纯 C ABI 基座 (导出宏/调用约定/版本/对齐/StringView/String/
-                   Info/统一操作原语/事件订阅前向声明/宿主 vtable/入口符号名/
-                   内置合并描述) —— 与宿主领域无关
+                   Info/统一操作原语/事件订阅前向声明/主程序 vtable/入口符号名/
+                   内置合并描述) —— 与主程序业务无关
           tables.h 通用接口表 (log/json/config/plugins/events/capabilities/
                    scheduler/coroutine_runtime/tasks/cancel)
   kit/    kit.h    插件侧 C++ SDK 通用部分 (header-only): PluginStringView/PluginString、
@@ -35,21 +34,21 @@ include/pluginxx/
                    后台任务 spawn、能力注册 capability、实例上下文基类
                    PluginBaseT<IfacesT>、通用导出宏 AGENTXX_PLUGIN_AGENT_EXPORT
           guard.h  C ABI 边界异常守卫 (logTo/reportCurrentException/guardCall/guardCallVoid)
-  runtime/宿主侧运行时 (runtime/driver/instance_base/manager_base/op_driver)
+  runtime/插件运行时 (runtime/driver/instance_base/manager_base/op_driver)
   host/   loader.h (dlopen/LoadLibrary)、manifest.h (plugin.yaml/名称推导/拓扑排序)、
           abi_util.h (C 串转换/异常兜底/io 线程同步投递)、
           capability_registry.h (能力注册表: 能力名 → 提供者插件 + 启动/取消回调)、
           event_bus.h (事件后端抽象 EventSource + 订阅句柄 PluginxxSubscription)、
-          domain_hooks.h (领域钩子 DomainHooks: 通用表需要宿主数据的入口)、
-          host_core.h (宿主核心 PluginHostCore<InstanceT>: 通用表状态与方法实现)、
+          domain_hooks.h (领域钩子 DomainHooks: 通用表需要主程序数据的入口)、
+          host_core.h (框架核心 PluginHostCore<InstanceT>: 通用表状态与方法实现)、
           tables_impl.h (十张通用表的 vtable 入口 + queryGenericPluginIface<I,M>)、
-          lifecycle.h (宿主生命周期骨架 PluginHostLifecycle<InstanceT>: 装载/启停/
-                   禁用启用/卸载/级联依赖; 宿主经少量接缝注入领域动作)
+          lifecycle.h (框架生命周期骨架 PluginHostLifecycle<InstanceT>: 装载/启停/
+                   禁用启用/卸载/级联依赖; 主程序经少量接缝注入业务动作)
 src/      对应实现 (version.cpp / loader.cpp / manifest.cpp / capability_registry.cpp /
           api_abi_check.c C 兼容与对齐校验)
 ```
 
-## 宿主接入形态
+## 主程序接入形态
 
 ```cpp
 class MyInstance : public pluginxx::PluginInstanceBase {
@@ -74,28 +73,27 @@ protected:
 ```
 
 - **通用表 (定义与实现都在本库)**: log / json / config / plugins / events / scheduler /
-  coroutine_runtime / tasks / cancel / capabilities —— 宿主经 `DomainHooks` 提供领域数据；
+  coroutine_runtime / tasks / cancel / capabilities —— 主程序经 `DomainHooks` 提供业务数据；
 - **生命周期骨架 (在本库)**: 动态库装载与入口校验、create/start 事务、启用与禁用级联、
   stop 事务补齐、inflight 归零等待、destroy 与动态库卸载、失败回滚、关闭超时重试；
-  宿主只提供少量接缝 (见上)，因此新宿主不必重写这套纪律；
-- **领域表 (宿主自己实现)**: agentxx 的 tools/permission/hooks/session/model/prompt/
+  主程序只提供少量接缝 (见上)，因此新接入的主程序不必重写这套纪律；
+- **业务表 (主程序自己实现)**: agentxx 的 tools/permission/hooks/session/model/prompt/
   resources/graph 与 client 侧的 ui/events/session/wire/self 表；
 - `query_interface` 里先调 `pluginxx::queryGenericPluginIface<InstanceT, ManagerT>(iid)`
-  取通用表，未命中再分发宿主的领域表 (agentxx 侧见
-  `agent/lib/src/plugins/plugin_manager_vtable.cpp`)。
+  取通用表，未命中再分发主程序的业务表。
 
 > 已实现: `api/` 两个纯 C 头、`kit/` (插件 SDK 通用部分 + 边界守卫)、
 > `runtime/` (实例状态机/执行 lease/协程驱动/Operation 驱动器/管理器基类)、
-> `host/` (装载/清单/ABI 辅助/能力注册表/事件后端/领域钩子/宿主核心/通用表入口/
+> `host/` (装载/清单/ABI 辅助/能力注册表/事件后端/领域钩子/框架核心/通用表入口/
 > 生命周期骨架) —— agentxx 侧的 `agentxx/plugin/api/plugin_kit.h` 与 `plugin_guard.h`
 > 作为 umbrella 引用它们 + 各自的领域 helper (工具/钩子/图节点/权限/client UI)，
 > 插件源码无需改动; agent 侧 `PluginManager` 与 client 侧 `ClientPluginManager`
 > 都已接入 `PluginHostLifecycle` (client 侧仅"装载"保留自己的实现，因为 dlopen 卸载到
 > 内部线程池、接口协商限制与双端入口探测属 client 特有语义)。
 
-领域表归属 (由宿主定义与实现):
+业务表归属 (由主程序定义与实现):
 
-| 宿主 | 领域表 |
+| 主程序 | 业务表 |
 |---|---|
 | agentxx (agent 侧) | tools / permission / hooks / session / model / prompt / resources / graph |
 | agentxx (client 侧) | client.ui / client.events / client.session / client.wire / client.self |
@@ -114,7 +112,7 @@ target_link_libraries(your_target PRIVATE cxx_pluginxx_static)  # 或 cxx_plugin
 
 - 产物命名: Release `libcxx_pluginxx.so` / `libcxx_pluginxx_static.a`,
   Debug 追加 `d` → `libcxx_pluginxxd.so` / `libcxx_pluginxx_staticd.a`
-- 同一进程内需要单份框架实现 (宿主与插件共享状态) 时用动态变体
+- 同一进程内需要单份框架实现 (主程序与插件共享状态) 时用动态变体
 - **条件依赖只声明库名**: 本库 PUBLIC 依赖 `cxx_utilxx_base`, 其导出接口以库名声明
   条件依赖 (如 `PkgConfig::uring`), 不含库文件路径 —— 具体库由使用方在自己机器上解析:
   须**先**按 `cxx_utilxx_base` 构建开关写
@@ -133,4 +131,4 @@ target_link_libraries(your_target PRIVATE cxx_pluginxx_static)  # 或 cxx_plugin
 - 不使用 CMake 的 `WINDOWS_EXPORT_ALL_SYMBOLS`: 该机制要解析每个 `.obj` 的符号表
   生成 `.def`, 而 `/GL` (LTO) 产物只有编译器中间表示、没有符号表, 二者互斥
 
-插件动态库的导出面由宿主构建侧另行约束 (仅 `agentxx_plugin_*` 入口)。
+插件动态库的导出面由主程序构建侧另行约束。

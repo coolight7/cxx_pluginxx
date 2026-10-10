@@ -1,14 +1,14 @@
-/// pluginxx 插件实例基类与宿主视图控制块 (宿主侧, 与宿主领域无关)
+/// pluginxx 插件实例基类与主程序视图控制块 (主程序侧, 与主程序业务无关)
 ///
 /// 内容:
-/// - [PluginInstanceBase]: 实例公共基类 (元信息/依赖/启用标志/宿主句柄/驱动登记表/
+/// - [PluginInstanceBase]: 实例公共基类 (元信息/依赖/启用标志/主程序句柄/驱动登记表/
 ///   执行 lease/destroy 执行), agent 侧与 client 侧实例各自继承;
 /// - [PluginHostControl]: 交给插件的 `PluginxxHost*` 视图所在的控制块 —— 地址
 ///   永不失效, 实例关闭后只清空实例引用 (tombstone), 因此插件跨卸载持有旧 host 指针
 ///   时各 vtable 入口只会安全失败, 既不访问已释放对象也不误指新实例;
 /// - [resolvePluginHostControl]: 反查插件传入的 host 视图对应控制块;
 /// - [hostMemoryAlloc] / [hostMemoryFree] / [hostMemoryCreateString] /
-///   [hostMemorySetString]: C ABI 跨 CRT 堆内存操作与宿主堆字符串构造;
+///   [hostMemorySetString]: C ABI 跨 CRT 堆内存操作与主程序堆字符串构造;
 /// - [getExecutableDirPath]: 跨平台可执行目录 helper (builtin:// 回退探测用)。
 ///
 /// 线程约定: 实例字段 (注册记录/依赖表) 仅 IO 线程读写; `enabled` 为普通布尔
@@ -63,14 +63,14 @@ class PluginHostControl;
 // =====================================================================
 
 /// 插件实例公共基类 (agent 侧 PluginInstance / client 侧 ClientPluginInstance 继承)
-/// - 持有跨端一致的元信息/依赖/启用标志/执行中计数/宿主句柄
+/// - 持有跨端一致的元信息/依赖/启用标志/执行中计数/主程序句柄
 /// - InflightGuard 为公共 RAII (事件 handler / 命令 execute / 异步 op 入口计数)
 struct PluginInstanceBase {
     std::string name;        ///< 唯一标识 (与对端插件共用命名空间)
     std::string version;     ///< 版本号 (get_info 或默认)
     std::string description; ///< 描述
     std::string path;        ///< 加载的库路径/内置路径
-    /// 插件配置参数 (yaml `plugins` 条目 args; 宿主原样保存, 经 vtable
+    /// 插件配置参数 (yaml `plugins` 条目 args; 主程序原样保存, 经 vtable
     /// get_plugin_args 整体返回给插件, 不解析其字段语义)
     utilxx_base::Json args = utilxx_base::Json::object();
     /// 插件配置文件所在目录或文件路径 (yaml `config`, 归一化为绝对路径)
@@ -79,7 +79,7 @@ struct PluginInstanceBase {
     std::vector<std::string> optionalDepends;     ///< 可选依赖 (未安装仅警告)
     void*                    dlHandle  = nullptr; ///< dlopen/LoadLibrary 句柄
     void*                    pluginCtx = nullptr; ///< entry 输出的插件私有上下文
-    /// 内置插件 (合并编译进宿主二进制) 的 destroy 入口; 动态库插件为 nullptr
+    /// 内置插件 (合并编译进主程序二进制) 的 destroy 入口; 动态库插件为 nullptr
     /// (此时 destroy 由 [destroyPlugin] 经 [pluginDestroySymbol] 向动态库查找)
     PluginxxDestroyFn builtinUnload = nullptr;
     bool                     enabled   = true; ///< 是否启用 (禁用: 注册摘除/命令停用)
@@ -93,7 +93,7 @@ struct PluginInstanceBase {
     /// 同步关闭发现活动 lease 时，等待最后一个 lease 释放后再执行 destroy。
     bool destroyDeferred = false;
     /// 实例生命周期入口 (加载成功的插件必有这两个符号, 见 plugin_api.h):
-    /// - start: 注册事务 (工具/钩子/能力/订阅/自管线程), 在宿主 IO 线程执行;
+    /// - start: 注册事务 (工具/钩子/能力/订阅/自管线程), 在主程序 IO 线程执行;
     /// - stop: 撤销自管资源, destroy 之前必须先完成。
     PluginxxStartFn lifecycleStart = nullptr;
     PluginxxStopFn  lifecycleStop  = nullptr;
@@ -107,7 +107,7 @@ struct PluginInstanceBase {
     /// 两端的入口符号名不同, 因此 [destroyPlugin] 需要它来查找动态库符号。
     virtual const char* pluginDestroySymbol() const noexcept = 0;
 
-    /// 日志前缀 (借用它的宿主实例类可覆写以区分日志来源; 默认无前缀)
+    /// 日志前缀 (借用它的主程序实例类可覆写以区分日志来源; 默认无前缀)
     virtual std::string_view logTag() const noexcept {
         return {};
     }
@@ -117,9 +117,9 @@ struct PluginInstanceBase {
     ///
     /// 语义 (agent / client 两侧一致):
     /// - 已有活动 lease: 置 destroyDeferred 并拒绝销毁 (调用方保留 DSO);
-    /// - create 未成功 (pluginCreated=false): 只退休宿主控制块 (或已销毁则直接返回);
+    /// - create 未成功 (pluginCreated=false): 只退休框架控制块 (或已销毁则直接返回);
     /// - 否则查找 destroy 入口 (内置插件用 [builtinUnload], 动态库插件按
-    ///   [pluginDestroySymbol] 查符号) 并调用, 随后退休宿主控制块 —— 插件上下文
+    ///   [pluginDestroySymbol] 查符号) 并调用, 随后退休框架控制块 —— 插件上下文
     ///   销毁后, 插件持有的旧 host 指针只能安全失败。
     /// - 幂等: 已销毁时直接返回 true。
     ///
@@ -127,7 +127,7 @@ struct PluginInstanceBase {
     /// 执行了 (stop 已补齐、lease 已归零), 再留着句柄只会占住插件文件。
     bool destroyPlugin() noexcept;
 
-    /// 关闭动态库句柄, 释放宿主对插件文件的占用。
+    /// 关闭动态库句柄, 释放主程序对插件文件的占用。
     ///
     /// **只能在插件代码不会再执行时调用**: stop 事务已完成、活动 lease 已归零、
     /// 实例也已从插件表摘除。Windows 上没关掉的句柄会一直映射着插件文件, 插件目录
@@ -145,7 +145,7 @@ struct PluginInstanceBase {
     /// stop 事务仍未执行: 同步关闭路径无法等待该事务，因此必须保留实例、
     /// 上下文与动态库，交由仍运行的异步 owner (unloadAsync/shutdownAsync) 收尾。
     /// - 加载成功的实例 start/stop 都在, `lifecycleStarted` 即"stop 欠着"的判据;
-    /// - start 失败/未 start 的实例无需 stop (宿主回滚已声明注册), 可直接 destroy。
+    /// - start 失败/未 start 的实例无需 stop (主程序回滚已声明注册), 可直接 destroy。
     bool lifecycleStopPending() const noexcept {
         return lifecycleStop != nullptr && lifecycleStarted && !lifecycleStopped;
     }
@@ -154,11 +154,11 @@ struct PluginInstanceBase {
     std::vector<std::shared_ptr<::PluginxxOperationCompletionEndpoint>> completionEndpoints;
     std::vector<std::shared_ptr<::PluginxxOperatorHandle>>              outstandingOps;
 
-    /// ==================== 通用表相关登记 (仅宿主 IO 线程读写) ====================
+    /// ==================== 通用表相关登记 (仅主程序 IO 线程读写) ====================
     ///
-    /// 这些记录由通用表 (事件 / 调度 / 能力) 的实现维护, 与宿主领域无关, 因此直接
-    /// 放在基类: 宿主核心 (见 `pluginxx/host/host_core.h`) 只依赖基类即可完成
-    /// 撤销与清理, 新增宿主无需重复实现同一套登记。
+    /// 这些记录由通用表 (事件 / 调度 / 能力) 的实现维护, 与主程序业务无关, 因此直接
+    /// 放在基类: 框架核心 (见 `pluginxx/host/host_core.h`) 只依赖基类即可完成
+    /// 撤销与清理, 新增主程序无需重复实现同一套登记。
 
     /// 活跃事件订阅 (句柄本体由 [subscriptionHandles] 保活; 撤销时从此表移除)
     std::vector<std::shared_ptr<::PluginxxSubscription>> subscriptions;
@@ -172,11 +172,11 @@ struct PluginInstanceBase {
     /// 驱动请求登记表 (`pluginxx.coroutine_runtime` 的 ticket 句柄)。
     ///
     /// 为什么需要这张表:
-    /// - 插件桥接持有宿主发放的**裸指针**句柄, 它的有效性必须由宿主兜底: 宿主
+    /// - 插件桥接持有主程序发放的**裸指针**句柄, 它的有效性必须由主程序兜底: 主程序
     ///   只把指针当**查表键**使用, 命中才解引用 (`shared_ptr` 保活), 因此即使
-    ///   插件违约传入已收束/无效的句柄, 宿主也只是安全地忽略, 不会解引用悬垂内存;
+    ///   插件违约传入已收束/无效的句柄, 主程序也只是安全地忽略, 不会解引用悬垂内存;
     /// - 关闭超时需要"最后防线": 插件自身没能撤销的排队请求会一直持有实例 lease,
-    ///   必须由宿主撤销 (见 [cancelPendingDrivers])。
+    ///   必须由主程序撤销 (见 [cancelPendingDrivers])。
     ///
     /// 内存有界: 只保留**未收束**请求 + 最近 [kFinishedDriverRetention] 张已收束
     /// 请求 (墓碑)。墓碑窗口保证"刚收束就取消"这类迟到 cancel 能按地址命中并
@@ -230,7 +230,7 @@ struct PluginInstanceBase {
     /// 取消该实例全部**尚未开始**的请求 (关闭超时/最终收尾的安全网)。
     ///
     /// 正常关闭**不依赖**这里: 插件桥接在实例上下文销毁时自行 `cancel_driver`,
-    /// 且 root 的取消收束依赖驱动继续流动 (见 plugin_driver.h 文件头)。宿主只在
+    /// 且 root 的取消收束依赖驱动继续流动 (见 plugin_driver.h 文件头)。主程序只在
     /// 已判定实例关闭失败 (关闭超时、lease 未归零) 时调用它, 避免 lease 永久残留。
     ///
     /// - `return`: 本次实际取消的请求数量 (0 表示没有排队中的请求)
@@ -288,11 +288,11 @@ private:
 
 public:
 
-    /// 由实例创建路径设置，供只拿到裸指针的宿主回调升级 owner。
+    /// 由实例创建路径设置，供只拿到裸指针的主程序回调升级 owner。
     std::weak_ptr<PluginInstanceBase> ownerSelf;
 
     /// 取实例自有的强引用
-    /// - 供只拿到基类指针的宿主代码 (Operation 驱动器 / 完成回调) 升级为派生类型
+    /// - 供只拿到基类指针的主程序代码 (Operation 驱动器 / 完成回调) 升级为派生类型
     /// - `return` 空表示实例已析构，或创建路径未设置自引用
     template<typename InstanceT>
     std::shared_ptr<InstanceT> sharedSelf() const noexcept {
@@ -302,19 +302,19 @@ public:
         return nullptr;
     }
 
-    /// 宿主生命周期控制块 (状态机 + 执行 lease)。实例对象本身只保存业务注册信息；
+    /// 框架生命周期控制块 (状态机 + 执行 lease)。实例对象本身只保存业务注册信息；
     /// 所有跨线程执行都通过 lease 保证 stop/destroy/dlclose 前已经返回。
     std::shared_ptr<pluginxx::InstanceLifetime> lifetime;
 
-    /// 实例所属宿主运行时 (io executor / Operation 表 / 投递通道)。
+    /// 实例所属插件框架运行时 (io executor / Operation 表 / 投递通道)。
     ///
     /// 由管理器在装配 [lifetime] 时一并写入 (见 [PluginManagerBase::makeLifetime]);
     /// 弱引用是因为运行时由管理器持有且比实例长命, 实例不应延长其生命周期。
     /// Operation 驱动器与驱动请求据此拿到 io executor 与线程标识, 无需回查管理器
-    /// 具体类型 (框架内核因此不依赖宿主的管理器类型)。
+    /// 具体类型 (框架内核因此不依赖主程序的管理器类型)。
     std::weak_ptr<PluginRuntime> runtime;
 
-    /// 宿主控制块：交给插件的 `PluginxxHost` 视图保存在控制块内（进程级
+    /// 框架控制块：交给插件的 `PluginxxHost` 视图保存在控制块内（进程级
     /// 稳定地址），插件在实例卸载后继续使用旧 host 指针时只会安全失败。
     /// 见 [PluginHostControl]。
     std::shared_ptr<PluginHostControl> hostControl;
@@ -362,7 +362,7 @@ public:
         ~InflightGuard() = default;
     };
 
-    /// 交给插件的宿主视图（控制块内地址，永不失效）；未装配控制块返回 nullptr。
+    /// 交给插件的主程序视图（控制块内地址，永不失效）；未装配控制块返回 nullptr。
     /// 插件保存该指针跨卸载继续调用时，各 vtable 入口会安全失败。
     const PluginxxHost* hostView() const noexcept;
 
@@ -371,13 +371,13 @@ public:
 };
 
 // =====================================================================
-// 宿主控制块 (交给插件的 host 视图)
+// 框架控制块 (交给插件的 host 视图)
 // =====================================================================
 
-/// 宿主控制块：插件持有的 `const PluginxxHost*` 必须指向进程级稳定地址。
+/// 框架控制块：插件持有的 `const PluginxxHost*` 必须指向进程级稳定地址。
 ///
 /// 背景：插件在 create 时收到 host 指针，可能把它保存在实例字段、工作线程或
-/// 延迟任务里；实例卸载（destroy + dlclose）之后插件仍可能调用宿主 vtable。
+/// 延迟任务里；实例卸载（destroy + dlclose）之后插件仍可能调用主程序 vtable。
 /// 若 host 视图位于 PluginInstance 对象内部，这类迟到调用就是 use-after-free。
 ///
 /// 解决方式：
@@ -408,7 +408,7 @@ inline PluginHostControlRegistry& pluginHostControlRegistry() {
 class PluginHostControl {
 public:
 
-    /// 创建并注册控制块。`vtable` 为本端宿主静态函数表（agent/client 各自一份）。
+    /// 创建并注册控制块。`vtable` 为本端主程序静态函数表（agent/client 各自一份）。
     static std::shared_ptr<PluginHostControl> create(
         const std::shared_ptr<PluginInstanceBase>& instance,
         const PluginxxHostVtable*                   vtable
@@ -598,7 +598,7 @@ inline std::shared_ptr<PluginHostControl> resolvePluginHostControl(const Pluginx
 }
 
 // =====================================================================
-// C ABI 内存操作 + 宿主堆字符串构造 (跨 CRT 堆边界; 两侧 vtable 共用)
+// C ABI 内存操作 + 主程序堆字符串构造 (跨 CRT 堆边界; 两侧 vtable 共用)
 // =====================================================================
 
 inline void* hostMemoryAlloc(uint64_t size) {

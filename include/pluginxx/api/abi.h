@@ -1,17 +1,17 @@
-/// pluginxx 纯 C ABI 基座 (与宿主领域无关的跨边界契约)
+/// pluginxx 纯 C ABI 基座 (与主程序业务无关的跨边界契约)
 ///
 /// 内容:
 /// - 导出符号控制 (`PLUGINXX_EXPORT`) 与调用约定 (`PLUGINXX_CALL`)
 /// - 全局 API 版本、结构体对齐 (8 字节)、定长基础类型约定
 /// - 跨边界字符串类型 (`PluginxxStringView` / `PluginxxString`)
 /// - 统一异步操作原语 (完成通知器 / 回调 / 取消令牌 / 句柄)
-/// - 核心宿主函数表 (`PluginxxHostVtable` / `PluginxxHost`)
+/// - 核心主程序函数表 (`PluginxxHostVtable` / `PluginxxHost`)
 /// - 入口函数指针类型、内置合并编译的描述结构
-///   (入口**符号名**由宿主提供, 见 `pluginxx/api/entry.h`)
+///   (入口**符号名**由主程序提供, 见 `pluginxx/api/entry.h`)
 ///
 /// 契约稳定性: 本头中的 **C 符号名 / 结构体名 / 宏名 / IID 字符串一律冻结**,
 /// 改动即破坏已编译的插件二进制。领域接口表 (工具/权限/钩子/会话/模型/提示词/
-/// 资源/图 等与宿主领域相关的表) 由宿主自行定义; 本头只承载与领域无关的通用部分。
+/// 资源/图 等与主程序业务相关的表) 由主程序自行定义; 本头只承载与领域无关的通用部分。
 #ifndef PLUGINXX_API_ABI_H
 #define PLUGINXX_API_ABI_H
 
@@ -76,9 +76,9 @@ typedef struct PluginxxHost PluginxxHost;
 
 /* ==================== 跨边界堆分配字符串 (具有显式所有权) ==================== */
 
-/// 跨 CRT 堆分配的 UTF-8 字符串 (显式所有权: 由宿主分配, 调用方接管并负责释放)
+/// 跨 CRT 堆分配的 UTF-8 字符串 (显式所有权: 由主程序分配, 调用方接管并负责释放)
 typedef struct PluginxxString {
-    char* data; ///< 指向宿主堆分配的 UTF-8 字节序列 (以 \0 结尾; 空串或 NULL 时可为 NULL)
+    char* data; ///< 指向主程序堆分配的 UTF-8 字节序列 (以 \0 结尾; 空串或 NULL 时可为 NULL)
     uint64_t size; ///< 字节数 (不含结尾 \0; O(1) 访问)
 } PluginxxString;
 
@@ -99,16 +99,16 @@ typedef struct PluginxxInfo {
 #define PLUGINXX_OPERATOR_CANCELLED 1 ///< 已取消 (payload 可为 NULL/空)
 #define PLUGINXX_OPERATOR_FAILED    2 ///< 失败 (payload = 错误信息)
 
-/// 完成通知器 (宿主实现并随 start 下发; 操作终结时被调方须【恰好回调一次】)
+/// 完成通知器 (主程序实现并随 start 下发; 操作终结时被调方须【恰好回调一次】)
 /// - payload: 只读借用字符串视图指针 (可为 NULL/空)
-/// - 线程安全: 可从被调方的任意线程回调, 宿主内部投递回 io 线程唤醒等待协程
+/// - 线程安全: 可从被调方的任意线程回调, 主程序内部投递回 io 线程唤醒等待协程
 typedef struct PluginxxOperatorNotify {
     void(PLUGINXX_CALL*
              done)(void* host_ud, int32_t status, const PluginxxStringView* payload);
     void* host_ud;
 } PluginxxOperatorNotify;
 
-/// 完成回调 (统一形态; 宿主保证在宿主 io 线程派发)
+/// 完成回调 (统一形态; 主程序保证在主程序 io 线程派发)
 /// payload 只读借用指针, 生命周期仅覆盖本次回调
 typedef void(PLUGINXX_CALL* PluginxxOperatorCallback)(
     void*                          ud,
@@ -116,20 +116,20 @@ typedef void(PLUGINXX_CALL* PluginxxOperatorCallback)(
     const PluginxxStringView* payload
 );
 
-/// 异步调用句柄 (仅用于取消; 不可轮询/收尸; 宿主托管生命周期)
+/// 异步调用句柄 (仅用于取消; 不可轮询/收尸; 主程序托管生命周期)
 typedef struct PluginxxOperatorHandle PluginxxOperatorHandle;
 
-/// 单次驱动请求 (宿主托管生命周期; 插件只持有裸指针用于取消)
+/// 单次驱动请求 (主程序托管生命周期; 插件只持有裸指针用于取消)
 ///
 /// 语义 (见 `pluginxx.coroutine_runtime` 接口表):
-/// - 一次 ticket 至多执行一次 drive_once 回调, 且永不内联执行 (宿主异步投递);
+/// - 一次 ticket 至多执行一次 drive_once 回调, 且永不内联执行 (主程序异步投递);
 /// - ticket 持有插件实例的执行 lease, 因此 dlclose 不会越过它;
-/// - 宿主保证 `cancel_driver` 之后该 ticket 不再执行回调。
+/// - 主程序保证 `cancel_driver` 之后该 ticket 不再执行回调。
 typedef struct PluginxxDriver PluginxxDriver;
 
 /// 驱动回调: 插件在此推进本地运行时一个有限步骤
-/// - **不得阻塞、不得等待事件、不得同步调用宿主业务接口**;
-/// - 在宿主 IO 线程执行 (可用 `is_io_thread` 校验);
+/// - **不得阻塞、不得等待事件、不得同步调用主程序业务接口**;
+/// - 在主程序 IO 线程执行 (可用 `is_io_thread` 校验);
 /// - 异常必须由插件自行捕获 (跨越 C ABI 的异常是未定义行为)。
 typedef void(PLUGINXX_CALL* PluginxxDriveOnceFn)(void* user_data);
 
@@ -149,7 +149,7 @@ static inline int32_t pluginxx_cancel_is_requested(const PluginxxCancelToken* to
     return token && token->is_requested ? token->is_requested(token) : 0;
 }
 
-/// 协作式取消请求函数 (【宿主 io 线程调用】, 非阻塞):
+/// 协作式取消请求函数 (【主程序 io 线程调用】, 非阻塞):
 typedef void(PLUGINXX_CALL* PluginxxOperatorCancelFunction)(void* user_data, void* op);
 
 /* ==================== 事件订阅句柄 / 前向声明 ==================== */
@@ -166,7 +166,7 @@ typedef void*(PLUGINXX_CALL* PluginxxCapabilityStartFunction)(
     PluginxxString*               error_out
 );
 
-/* ==================== 核心宿主函数表 ==================== */
+/* ==================== 核心主程序函数表 ==================== */
 
 /// 核心 vtable: 极简正交基 (内存操作 + COM 风格接口表查询)
 typedef struct PluginxxHostVtable {
@@ -182,8 +182,8 @@ typedef struct PluginxxHostVtable {
 } PluginxxHostVtable;
 
 struct PluginxxHost {
-    const PluginxxHostVtable* vtable; ///< 核心函数表 (宿主静态)
-    void* opaque; ///< 宿主内部 (指向插件实例状态, 插件不得使用)
+    const PluginxxHostVtable* vtable; ///< 核心函数表 (主程序静态)
+    void* opaque; ///< 主程序内部 (指向插件实例状态, 插件不得使用)
 };
 
 /* ==================== 插件入口符号 (dlsym) ==================== */
@@ -198,7 +198,7 @@ typedef void(PLUGINXX_CALL* PluginxxDestroyFn)(void* plugin_ctx);
 /// 实例生命周期入口 (必备, 见 plugin_kit.h 的导出宏):
 /// - create 只构造上下文, 不做注册、不起线程;
 /// - start 是注册事务, 在插件所属 IO executor 上执行;
-/// - stop 撤销自管资源, 宿主在 Closing 阶段调用, 完成后才调用 destroy。
+/// - stop 撤销自管资源, 主程序在 Closing 阶段调用, 完成后才调用 destroy。
 typedef void*(PLUGINXX_CALL* PluginxxStartFn)(
     void*                              plugin_ctx,
     const PluginxxOperatorNotify* notify,
@@ -210,14 +210,14 @@ typedef void*(PLUGINXX_CALL* PluginxxStopFn)(
     PluginxxString*               error_out
 );
 
-/* ==================== 插件入口符号名 (由宿主定义, 见 pluginxx/api/entry.h) ==================== */
+/* ==================== 插件入口符号名 (由主程序定义, 见 pluginxx/api/entry.h) ==================== */
 
-/// 内核**不**定义入口符号名常量: 符号名属于宿主命名空间 (agentxx 用
+/// 内核**不**定义入口符号名常量: 符号名属于主程序命名空间 (agentxx 用
 /// `agentxx_plugin_agent_*` / `agentxx_plugin_client_*`, musicxx 用 `musicxx_plugin_*`)。
-/// - 宿主侧: 覆写 `pluginxx::PluginHostLifecycle::entrySymbols()` 交出符号名;
+/// - 主程序侧: 覆写 `pluginxx::PluginHostLifecycle::entrySymbols()` 交出符号名;
 /// - 插件侧: 用 `PLUGINXX_EXPORT_PLUGIN(SymbolPrefix, ...)` (见 kit.h) 生成入口。
 
-/// 内置插件描述 (合并编译进宿主二进制的插件; 静态数组, 进程生命周期有效)
+/// 内置插件描述 (合并编译进主程序二进制的插件; 静态数组, 进程生命周期有效)
 typedef struct PluginxxBuiltinInfo {
     PluginxxStringView name; ///< 插件唯一名 (如 "example_plugin"); NULL = 空表占位
     PluginxxGetInfoFn get_info; ///< 可空 (加载前元信息校验, 与 dlsym 可选符号同语义)
@@ -227,17 +227,17 @@ typedef struct PluginxxBuiltinInfo {
     PluginxxStopFn  stop;  ///< 可空 (关闭事务, destroy 前调用)
 } PluginxxBuiltinInfo;
 
-// 与 PluginxxBuiltinInfo 同步生成于宿主侧的内置插件清单源码
+// 与 PluginxxBuiltinInfo 同步生成于主程序侧的内置插件清单源码
 typedef struct PluginxxBuiltinManifest {
     PluginxxStringView name; ///< 插件名
     PluginxxStringView yaml; ///< plugin.yaml 原文 (UTF-8, 静态只读)
 } PluginxxBuiltinManifest;
 
-/* ==================== 内置插件清单 (宿主提供) ==================== */
+/* ==================== 内置插件清单 (主程序提供) ==================== */
 
-/// 内置插件 (合并编译进宿主二进制的插件) 的描述数组与内嵌清单数组由**宿主**定义,
+/// 内置插件 (合并编译进主程序二进制的插件) 的描述数组与内嵌清单数组由**主程序**定义,
 /// 并在启动早期经 `pluginxx::setBuiltinPluginProvider` 注册给内核
-/// (见 `pluginxx/host/manifest.h`); 内核因此不引用任何宿主导出的符号。
+/// (见 `pluginxx/host/manifest.h`); 内核因此不引用任何主程序导出的符号。
 
 #pragma pack(pop)
 

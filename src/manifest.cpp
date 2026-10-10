@@ -1,6 +1,6 @@
 /// pluginxx 插件清单与名称推导实现 (见 pluginxx/host/manifest.h)
 ///
-/// 原实现位于 libagentxx 的 plugin_common.cpp: 因 agent 侧与 client 侧插件宿主
+/// 原实现位于 libagentxx 的 plugin_common.cpp: 因 agent 侧与 client 侧插件主程序
 /// 共用同一套清单解析/名称推导/入口路径解析, 提取到框架内核, 避免两侧行为漂移。
 #include "pluginxx/host/manifest.h"
 
@@ -199,7 +199,7 @@ bool parseManifestNode(
         }
         // ---- 接口声明段 (require/optional; 见 PluginManifestInterfaces) ----
         // 段缺失/非法项跳过并告警, 不影响 manifest 合法性 (声明是可选增强);
-        // 名称仅做非空校验, 语义 (前缀归属/宿主支持集比对) 由加载路径的
+        // 名称仅做非空校验, 语义 (前缀归属/主程序支持集比对) 由加载路径的
         // checkInterfacesForSide 处理 —— 解析与协商解耦, 第三方前缀天然合法
         if (interfaces) {
             *interfaces   = PluginManifestInterfaces{};
@@ -237,7 +237,7 @@ bool parseManifestNode(
         return false;
     }
     // `entry` 可以缺省: JS 插件缺省用 plugin.js, 动态库插件的入口按平台默认库名与
-    // 目录里唯一的库文件解析 (见 host/loader 与宿主的多目标分支选择)。
+    // 目录里唯一的库文件解析 (见 host/loader 与主程序的多目标分支选择)。
     if (name.empty()) {
         XX_LOGE("Plugin manifest `{}` invalid: name required", logHint);
         return false;

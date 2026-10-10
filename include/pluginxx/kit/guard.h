@@ -1,4 +1,4 @@
-/// 插件侧 C ABI 边界异常处理 (C++ header-only, 与宿主领域无关)
+/// 插件侧 C ABI 边界异常处理 (C++ header-only, 与主程序业务无关)
 ///
 /// 归属: cxx_pluginxx (插件框架内核)。
 ///
@@ -6,11 +6,11 @@
 /// 【非跨边界 ABI】, 第三方插件可不用本头而自行 try/catch。
 ///
 /// 内容:
-/// - [logTo]: 把边界异常经宿主日志接口表输出 (noexcept; 日志缺失时静默丢弃);
+/// - [logTo]: 把边界异常经主程序日志接口表输出 (noexcept; 日志缺失时静默丢弃);
 /// - [reportCurrentException]: 重抛检查当前异常并分类上报;
 /// - [guardCall] / [guardCallVoid]: 有/无返回值的 C ABI 边界守卫 (异常 → 上报 + 回退值)。
 ///
-/// 宿主领域部分 (client 侧日志接口表的重载) 位于宿主仓库: agentxx 侧见
+/// 主程序业务部分 (client 侧日志接口表的重载) 位于主程序仓库: agentxx 侧见
 /// [plugin_guard.h](/agent/lib/include/agentxx/plugin/api/plugin_guard.h), 该头包含本头并把
 /// 通用名引入 `agentxx::plugin`。
 #pragma once
@@ -24,7 +24,7 @@
 
 namespace pluginxx {
 
-/// 栈缓冲日志 (noexcept): "[插件名] exception: msg" 经宿主 log 接口表输出;
+/// 栈缓冲日志 (noexcept): "[插件名] exception: msg" 经主程序 log 接口表输出;
 /// host/logIf 缺失时静默丢弃 (catch 路径不得再失败)
 inline void logTo(
     const PluginxxHost*     host,

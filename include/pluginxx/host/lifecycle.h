@@ -1,28 +1,28 @@
-/// pluginxx 宿主生命周期骨架 (装载 / 启停 / 禁用启用 / 卸载 / 级联依赖)
+/// pluginxx 框架生命周期骨架 (装载 / 启停 / 禁用启用 / 卸载 / 级联依赖)
 ///
-/// 定位: 把"与宿主领域无关"的生命周期逻辑从各宿主的管理器里收敛到一处 ——
+/// 定位: 把"与主程序业务无关"的生命周期逻辑从各主程序的管理器里收敛到一处 ——
 /// 动态库装载与入口符号校验、create/start 事务、启用与禁用级联、stop 事务补齐、
 /// inflight 归零等待、destroy 与动态库卸载、失败回滚与关闭超时重试。
 ///
 /// 三层结构:
 /// - [PluginHostCore] (host_core.h): 通用表 (log/json/config/plugins/events/
 ///   scheduler/coroutine_runtime/tasks/cancel/capabilities) 的状态与方法实现;
-/// - 本类的 [PluginHostLifecycle]: 在宿主核心之上补齐上面那套生命周期骨架;
-/// - 宿主 (agentxx / musicxx): 领域表 + 领域注册 + 领域数据。
+/// - 本类的 [PluginHostLifecycle]: 在框架核心之上补齐上面那套生命周期骨架;
+/// - 主程序 (agentxx / musicxx): 领域表 + 领域注册 + 领域数据。
 ///
-/// 宿主用法:
+/// 主程序用法:
 /// ```cpp
 /// class MyManager : public pluginxx::PluginHostLifecycle<MyInstance>,
 ///                   public std::enable_shared_from_this<MyManager>,
 ///                   public pluginxx::DomainHooks {
 ///     // 1. 构造体内 setDomainHooks(this) (通用表取数);
-///     // 2. 覆写下方"宿主接缝"里的纯虚函数与需要的可选项;
+///     // 2. 覆写下方"主程序接缝"里的纯虚函数与需要的可选项;
 ///     // 3. query_interface 里用 pluginxx::queryGenericPluginIface 装配通用表。
 /// };
 /// ```
 ///
-/// 线程约定: 装载/卸载是协程 (在宿主 IO executor 上运行); 其余方法除标注外
-/// 都只在宿主 IO 线程调用。`disable`/`enable`/`shutdownAll` 为同步入口, 其中的
+/// 线程约定: 装载/卸载是协程 (在主程序 IO executor 上运行); 其余方法除标注外
+/// 都只在主程序 IO 线程调用。`disable`/`enable`/`shutdownAll` 为同步入口, 其中的
 /// stop/start 事务按需投递到 IO 线程执行 (调用方不必在 IO 线程)。
 #pragma once
 
@@ -62,23 +62,23 @@
 
 namespace pluginxx {
 
-/// 插件加载参数 (与宿主配置类型解耦: 宿主把自己的配置字段拷进来)
+/// 插件加载参数 (与主程序配置类型解耦: 主程序把自己的配置字段拷进来)
 ///
-/// 背景: 各宿主的配置类型不同 (agentxx 的 `agent::PluginConfig` 等), 框架内核
+/// 背景: 各主程序的配置类型不同 (agentxx 的 `agent::PluginConfig` 等), 框架内核
 /// 不能引用它们, 因此装载入口只接收这两个真正会用到的字段。
 struct PluginLoadOptions {
-    /// 插件配置参数 (yaml `plugins` 条目 args; 宿主原样保存, 不解析字段语义)
+    /// 插件配置参数 (yaml `plugins` 条目 args; 主程序原样保存, 不解析字段语义)
     utilxx_base::Json args = utilxx_base::Json::object();
     /// 插件配置文件所在目录或文件路径 (yaml `plugins` 条目 config)
     std::string configPath;
 };
 
-/// 宿主生命周期骨架: 装载 / 启停 / 禁用启用 / 卸载 / 级联依赖
+/// 框架生命周期骨架: 装载 / 启停 / 禁用启用 / 卸载 / 级联依赖
 ///
-/// - `InstanceT` 须继承 [PluginInstanceBase], 且由宿主经 [createInstance] 构造;
-/// - 宿主领域动作经"宿主接缝"(纯虚函数与可选覆写)注入, 见各类说明;
+/// - `InstanceT` 须继承 [PluginInstanceBase], 且由主程序经 [createInstance] 构造;
+/// - 主程序业务动作经"主程序接缝"(纯虚函数与可选覆写)注入, 见各类说明;
 /// - 本类提供的行为与 agentxx 既有实现逐条一致 (含失败回滚、关闭超时、
-///   停止后重试、级联依赖), 新宿主无需重复实现。
+///   停止后重试、级联依赖), 新接入的主程序无需重复实现。
 template<typename InstanceT>
 class PluginHostLifecycle : public PluginHostCore<InstanceT> {
 public:
@@ -93,14 +93,14 @@ public:
     // 生命周期 (公开入口)
     // =====================================================================
 
-    /// 加载目录/文件形式的插件 (协程; 在宿主 IO executor 上执行)
+    /// 加载目录/文件形式的插件 (协程; 在主程序 IO executor 上执行)
     ///
     /// - `path` 可为插件目录 (自动解析 `plugin.yaml` 取 entry), 也可直接是动态库路径;
     /// - `options` 为插件参数与配置路径 (可为 nullptr, 等价于空参数);
     /// - `allowClientOnlySkip=true` 时, 缺少本端入口符号按"只有另一端入口"静默跳过
     ///   (INFO 日志), 否则按错误处理;
     /// - `resources`/`interfaces` 为清单解析出的声明段, 由调用方 (通常是
-    ///   [loadPluginAsync]) 传入; 加载收尾时经 [applyDeclaredResources] 交给宿主。
+    ///   [loadPluginAsync]) 传入; 加载收尾时经 [applyDeclaredResources] 交给主程序。
     ///
     /// - `return` 加载成功返回实例; 任一环节失败返回 nullptr (错误记日志, 已做回滚)
     asio::awaitable<InstancePtr> loadNativeAsync(
@@ -117,8 +117,8 @@ public:
             co_return nullptr;
         }
 
-        // 入口符号名由宿主提供 (内核不硬编码任何宿主专名, 见 pluginxx/api/entry.h):
-        // 未提供 create 时无法装载, 直接失败并说明原因 (不去猜宿主专名)。
+        // 入口符号名由主程序提供 (内核不硬编码任何主程序专名, 见 pluginxx/api/entry.h):
+        // 未提供 create 时无法装载, 直接失败并说明原因 (不去猜主程序专名)。
         const PluginEntrySymbols entries = entrySymbols();
         if (!entries.valid() || !entries.lifecyclePaired()) {
             NativeLoader::close(dl);
@@ -228,7 +228,7 @@ public:
         int rc                     = -1;
         try {
             rc = createFn(inst->hostView(), &inst->pluginCtx);
-            // 即使 create 返回失败，只要交付了上下文，destroy 仍是宿主的责任。
+            // 即使 create 返回失败，只要交付了上下文，destroy 仍是主程序的责任。
             inst->pluginCreated = (inst->pluginCtx != nullptr);
         } catch (const std::exception& e) {
             XX_LOGE("{}Plugin `{}` create threw: {}", logTag(), inst->name, e.what());
@@ -269,9 +269,9 @@ public:
         co_return inst;
     }
 
-    /// 加载"合并编译进宿主二进制"的内置插件 (协程)
+    /// 加载"合并编译进主程序二进制"的内置插件 (协程)
     ///
-    /// - 内置插件表由宿主经 `setBuiltinPluginProvider` 注册 (见 manifest.h);
+    /// - 内置插件表由主程序经 `setBuiltinPluginProvider` 注册 (见 manifest.h);
     /// - `name` 为内置注册名, `path` 只作为展示/资源相对路径基准;
     /// - 无动态库句柄, 因此回滚时不关闭句柄。
     asio::awaitable<InstancePtr> loadBuiltinAsync(
@@ -623,7 +623,7 @@ public:
         enableImpl(name, /*userInitiated=*/true);
     }
 
-    /// 摘除实例在宿主侧的**全部**注册 (通用登记 + 领域注册 + 实例专属资源所有权),
+    /// 摘除实例在主程序侧的**全部**注册 (通用登记 + 领域注册 + 实例专属资源所有权),
     /// 但保留实例内的注册记录 (启用时由 start 事务重新声明)。
     void detachInstanceRegistrations(InstanceT* inst) {
         if (!inst) {
@@ -633,10 +633,10 @@ public:
         detachDomainOwnedResources(inst);
     }
 
-    /// 摘除实例的注册 (通用部分) 并回调宿主摘除领域注册
+    /// 摘除实例的注册 (通用部分) 并回调主程序摘除领域注册
     ///
     /// - 通用部分: 取消未终结的 Operation、撤销事件订阅、撤销能力声明;
-    /// - 领域部分经 [detachDomainRegistrations] 交给宿主 (工具/权限/钩子/图/提示词等)。
+    /// - 领域部分经 [detachDomainRegistrations] 交给主程序 (工具/权限/钩子/图/提示词等)。
     void detachAll(InstanceT* inst) {
         if (!inst) {
             return;
@@ -651,7 +651,7 @@ public:
             }
         }
 
-        // 事件订阅登记与能力声明由宿主核心按通用表登记撤销 (内核侧实现)
+        // 事件订阅登记与能力声明由框架核心按通用表登记撤销 (内核侧实现)
         this->revokeInstanceSubscriptions(inst);
         this->unregisterInstanceCapabilities(inst);
 
@@ -670,7 +670,7 @@ public:
         clearDomainRegistrations(inst);
     }
 
-    /// 禁用/启用事务的异步收尾 (仅 IO 线程)，供宿主在需要自行投递时调用:
+    /// 禁用/启用事务的异步收尾 (仅 IO 线程)，供主程序在需要自行投递时调用:
     /// - [stopForDisable]: 调用插件 stop 导出，撤销插件自管资源 (订阅/线程/定时器);
     ///   失败只记录日志并保持 Disabled (可再次 disable/enable 重试)。
     /// - [startForEnable]: 先补齐欠着的 stop，再调用插件 start 重新注册；
@@ -706,7 +706,7 @@ public:
             co_return;
         }
         inst->lifecycleStopped = true;
-        // stop 成功: 插件侧注册已撤销，宿主侧记录同步清空，使下次 start 从干净状态
+        // stop 成功: 插件侧注册已撤销，主程序侧记录同步清空，使下次 start 从干净状态
         // 重新声明，避免同一工具/能力在多次 enable/disable 后重复累积。
         clearPluginOwnedRegistrations(inst.get());
         XX_LOGI("{}Plugin `{}` stopped for disable", logTag(), inst->name);
@@ -813,13 +813,13 @@ public:
 protected:
 
     // =====================================================================
-    // 宿主接缝 (宿主必须实现的纯虚函数)
+    // 主程序接缝 (主程序必须实现的纯虚函数)
     // =====================================================================
 
     /// 管理器自身的强引用 (派生类直接返回 `shared_from_this()`)
     ///
     /// 为什么需要它: 停用/启用事务与空闲收尾是异步的，需要在此期间保活管理器;
-    /// 框架内核不能自己继承 `enable_shared_from_this` —— 与宿主管理器的
+    /// 框架内核不能自己继承 `enable_shared_from_this` —— 与主程序管理器的
     /// `enable_shared_from_this<ManagerT>` 会形成多基类歧义 (`weak_this` 都不被初始化)。
     virtual std::shared_ptr<PluginHostLifecycle<InstanceT>> selfRef() = 0;
 
@@ -829,13 +829,13 @@ protected:
     /// 生命周期控制块 ([InstanceLifetime]) 与交给自己插件的 host 控制块。
     virtual InstancePtr createInstance(std::string name) = 0;
 
-    /// 交给插件的宿主 vtable (进程内稳定静态表; 见 `PluginxxHostVtable`)
+    /// 交给插件的主程序 vtable (进程内稳定静态表; 见 `PluginxxHostVtable`)
     virtual const PluginxxHostVtable* hostVtable() = 0;
 
-    /// 本宿主使用的插件入口符号名 (dlsym/LoadLibrary 查找用)
+    /// 本主程序使用的插件入口符号名 (dlsym/LoadLibrary 查找用)
     ///
-    /// - 符号名属于宿主命名空间, 内核不提供默认值: 未覆写时装载直接失败
-    ///   (错误信息说明宿主未提供入口符号名), 不会静默尝试宿主专名;
+    /// - 符号名属于主程序命名空间, 内核不提供默认值: 未覆写时装载直接失败
+    ///   (错误信息说明主程序未提供入口符号名), 不会静默尝试主程序专名;
     /// - 必须与插件侧导出宏使用的前缀一致 (`PLUGINXX_EXPORT_PLUGIN(SymbolPrefix, ...)`);
     /// - `destroy` 不在此列: 它由实例类的 [InstanceT::pluginDestroySymbol] 给出。
     virtual PluginEntrySymbols entrySymbols() const {
@@ -843,16 +843,16 @@ protected:
     }
 
     // =====================================================================
-    // 宿主接缝 (可选覆写)
+    // 主程序接缝 (可选覆写)
     // =====================================================================
 
-    /// 同进程可能同时存在多个宿主 (如 client + agent), 日志前缀用于区分
+    /// 同进程可能同时存在多个主程序 (如 client + agent), 日志前缀用于区分
     virtual std::string_view logTag() const noexcept {
         return {};
     }
 
     /// 摘除实例的**领域**注册 (工具/权限/钩子/图节点/提示词贡献 等)
-    /// - 调用时机: 禁用与卸载; 只摘除宿主侧生效的注册, 保留实例内的注册记录
+    /// - 调用时机: 禁用与卸载; 只摘除主程序侧生效的注册, 保留实例内的注册记录
     virtual void detachDomainRegistrations(InstanceT* inst) {
         (void)inst;
     }
@@ -887,12 +887,12 @@ protected:
         (void)enabled;
     }
 
-    /// 实例加载完成 (状态置 Ready 之前) 的宿主收尾
+    /// 实例加载完成 (状态置 Ready 之前) 的主程序收尾
     virtual void onInstanceLoaded(InstanceT& inst) {
         (void)inst;
     }
 
-    /// 实例即将从插件表摘除 (卸载收尾) 的宿主收尾
+    /// 实例即将从插件表摘除 (卸载收尾) 的主程序收尾
     virtual void onInstanceUnloaded(InstanceT& inst) {
         (void)inst;
     }
@@ -916,12 +916,12 @@ protected:
         }
     }
 
-    /// 装配实例的通用部分 (宿主的自定义装载路径也应调用它)
+    /// 装配实例的通用部分 (主程序的自定义装载路径也应调用它)
     ///
     /// - 生命周期入口 (start/stop);
     /// - 基类自引用: 通用表实现与完成回调只依赖 `ownerSelf` (不依赖管理器类型);
     /// - 生命周期控制块 (状态机 + 执行 lease); `makeLifetime` 同时写入实例的运行时弱引用;
-    /// - 交给插件的宿主控制块: host 视图必须在进程级稳定地址上, 插件卸载后继续使用
+    /// - 交给插件的框架控制块: host 视图必须在进程级稳定地址上, 插件卸载后继续使用
     ///   旧指针时各 vtable 入口只会安全失败 (tombstone 语义, 见 instance_base.h)。
     void attachInstance(
         const InstancePtr&         inst,
@@ -967,7 +967,7 @@ protected:
 #endif
     }
 
-    /// 插件实例的公共装配 (两种加载路径共用): 元信息/生命周期入口/宿主控制块
+    /// 插件实例的公共装配 (两种加载路径共用): 元信息/生命周期入口/框架控制块
     InstancePtr makeInstance(
         std::string                name,
         const PluginxxInfo*   info,
@@ -989,7 +989,7 @@ protected:
         return inst;
     }
 
-    /// create + start 都成功后的公共收尾: 应用声明式资源、宿主收尾、置 Ready。
+    /// create + start 都成功后的公共收尾: 应用声明式资源、主程序收尾、置 Ready。
     void finishLoad(const InstancePtr& inst, const PluginManifestResources& resources) {
         applyDeclaredResources(*inst, resources);
         onInstanceLoaded(*inst);
@@ -997,7 +997,7 @@ protected:
         this->releasePluginName(inst->name);
     }
 
-    /// 加载失败 / start 失败的统一回滚: 摘除宿主侧注册 → 释放资源 → 销毁插件上下文
+    /// 加载失败 / start 失败的统一回滚: 摘除主程序侧注册 → 释放资源 → 销毁插件上下文
     /// → 移出插件表 → 释放名称预占 (动态库句柄由调用方决定是否关闭)。
     void rollbackLoad(const InstancePtr& inst, bool closeHandle) {
         if (!inst) {
@@ -1195,7 +1195,7 @@ protected:
             enableImpl(dep, /*userInitiated=*/false);
         }
 
-        // 注册由插件 start 事务重新声明: 宿主只负责投递并处理结果 (失败则回到 Disabled)。
+        // 注册由插件 start 事务重新声明: 主程序只负责投递并处理结果 (失败则回到 Disabled)。
         requestStartForEnable(inst);
         XX_LOGI(
             "{}Plugin `{}` enabled ({})",

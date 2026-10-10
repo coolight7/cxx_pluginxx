@@ -1,11 +1,11 @@
-/// pluginxx 通用接口表 (与宿主领域无关的跨边界 C ABI 表)
+/// pluginxx 通用接口表 (与主程序业务无关的跨边界 C ABI 表)
 ///
-/// 收录: 事件 / 能力 / 任务调度 / 协程驱动 / 插件互查 / 宿主配置 / 会话取消状态 /
+/// 收录: 事件 / 能力 / 任务调度 / 协程驱动 / 插件互查 / 主程序配置 / 会话取消状态 /
 /// JSON 辅助 / 日志 / 后台任务。
 ///
 /// 归属判据: **只需要 JSON 载荷与通用资源即可工作** 的表属于通用表 (本头);
-/// 需要宿主领域语义 (工具/权限/钩子/会话/模型/提示词/资源/执行图, 以及 client
-/// 侧 UI/事件/会话/线路) 的表由宿主定义与实现。
+/// 需要主程序业务语义 (工具/权限/钩子/会话/模型/提示词/资源/执行图, 以及 client
+/// 侧 UI/事件/会话/线路) 的表由主程序定义与实现。
 ///
 /// 契约稳定性: 全部 C 名、结构体名、IID 字符串冻结 (见 abi.h 说明)。
 #ifndef PLUGINXX_API_TABLES_H
@@ -130,19 +130,19 @@ typedef struct PluginxxSchedulerIface {
 
 /// 通用协程驱动接口 (与协程库无关)
 ///
-/// 定位: 插件协程与宿主协程在**同一宿主 IO 执行序列**中交错推进的基础设施。
+/// 定位: 插件协程与主程序协程在**同一主程序 IO 执行序列**中交错推进的基础设施。
 /// 核心只有两类动作:
-/// - **driver/pump**: 插件申请宿主异步执行一次有界回调 (push 一个有限步骤);
+/// - **driver/pump**: 插件申请主程序异步执行一次有界回调 (push 一个有限步骤);
 /// - **wake 合并**: 插件本地有新工作时自行合并重复请求, 再申请下一次 ticket。
 ///
-/// 关键约束 (宿主与插件共同遵守):
-/// - `request_driver` **永不内联**回调, 即使调用者就在宿主 IO 线程; 否则 root start /
+/// 关键约束 (主程序与插件共同遵守):
+/// - `request_driver` **永不内联**回调, 即使调用者就在主程序 IO 线程; 否则 root start /
 ///   completion / cancel 会形成意外重入, 并失去交错执行的公平性;
 /// - 一次 ticket 至多执行一次回调, 且回调只推进一个有限步骤 (不阻塞、不等待);
-/// - 宿主不得把插件私有 reactor 的内部等待对象接进自己的执行序列; 插件必须保证
+/// - 主程序不得把插件私有 reactor 的内部等待对象接进自己的执行序列; 插件必须保证
 ///   每个 driver 都对应"已知的、真实存在的可运行工作" (外部完成回调 / 定时器回调 /
 ///   已 post 的 continuation), 不得在无工作时持续申请 ticket (那是隐藏轮询);
-/// - 重复 wake 由插件适配器自行合并 (同一实例同时只登记一次 ticket); 宿主另做
+/// - 重复 wake 由插件适配器自行合并 (同一实例同时只登记一次 ticket); 主程序另做
 ///   ticket 去重与关闭时取消作为最后防线。
 #define PLUGINXX_IFACE_COROUTINE_RUNTIME         "pluginxx.coroutine_runtime"
 #define PLUGINXX_IFACE_COROUTINE_RUNTIME_VERSION 1
@@ -152,9 +152,9 @@ typedef struct PluginxxCoroutineRuntimeIface {
     uint32_t struct_size;
 
     /// 申请一次驱动请求 (**任意线程可调用**, 非阻塞):
-    /// - 成功返回宿主托管的 ticket (宿主只会**异步**调用 drive_once, 每张至多一次);
+    /// - 成功返回主程序托管的 ticket (主程序只会**异步**调用 drive_once, 每张至多一次);
     /// - 失败返回 NULL 并在 error_out 输出原因 (host->alloc 分配; 实例已关闭/已停用,
-    ///   或宿主无可用 IO executor);
+    ///   或主程序无可用 IO executor);
     /// - 失败时调用方必须把受影响的操作以失败/取消终结, 不得静默丢弃。
     PluginxxDriver*(PLUGINXX_CALL* request_driver)(
         const PluginxxHost* host,
@@ -198,7 +198,7 @@ typedef struct PluginxxPluginsIface {
     );
 } PluginxxPluginsIface;
 
-/* ==================== 接口表: 宿主配置 (pluginxx.config) ==================== */
+/* ==================== 接口表: 主程序配置 (pluginxx.config) ==================== */
 
 #define PLUGINXX_IFACE_CONFIG         "pluginxx.config"
 #define PLUGINXX_IFACE_CONFIG_VERSION 1
@@ -207,7 +207,7 @@ typedef struct PluginxxConfigIface {
     int32_t  version; ///< 必须 == PLUGINXX_IFACE_CONFIG_VERSION
     uint32_t struct_size;
 
-    /// 宿主 AgentConfig 关键字段 JSON (io 线程; host->alloc):
+    /// 主程序 AgentConfig 关键字段 JSON (io 线程; host->alloc):
     /// {"dataDir": "...", "projectRoot": "..."(可为空), "platform":
     /// "windows"|"linux"|"macos"|"android"|"ios"}
     int32_t(PLUGINXX_CALL* get_config)(
@@ -219,7 +219,7 @@ typedef struct PluginxxConfigIface {
         const PluginxxHost* host,
         PluginxxString*     out
     );
-    /// 宿主 toolPrompt 配置 (io 线程; host->alloc):
+    /// 主程序 toolPrompt 配置 (io 线程; host->alloc):
     /// {"depict": "...", "args": {"参数名": "参数说明", ...}}
     int32_t(PLUGINXX_CALL* get_tool_prompt)(
         const PluginxxHost*       host,
@@ -237,7 +237,7 @@ typedef struct PluginxxConfigIface {
     /// 本插件配置文件所在目录或文件路径 (yaml `plugins` 条目 config; io 线程;
     /// host->alloc; 未指定返回空串, 空串表示未配置)
     /// - 可指向文件或目录 (由插件自行判断类型并加载)
-    /// - 宿主已归一化为绝对路径 (正斜杠, lexically_normal)
+    /// - 主程序已归一化为绝对路径 (正斜杠, lexically_normal)
     int32_t(PLUGINXX_CALL* get_plugin_config_path)(
         const PluginxxHost* host,
         PluginxxString*     out
@@ -315,21 +315,21 @@ typedef struct PluginxxTasksIface {
     int32_t  version; ///< 必须 == PLUGINXX_IFACE_TASKS_VERSION
     uint32_t struct_size;
 
-    /// 注册后台任务 (io 线程约束, 非 io 线程由宿主投递同步等待)。宿主记录
+    /// 注册后台任务 (io 线程约束, 非 io 线程由主程序投递同步等待)。主程序记录
     /// 句柄 (可取消/跟踪完成/持 inflight), 插件协程最终结束时经 *notify
-    /// 上报 (恰好一次) → 宿主回收句柄。
-    /// - cancel_fn/cancel_ud: 宿主卸载取消时回调 (宿主 io 线程, 协作式):
+    /// 上报 (恰好一次) → 主程序回收句柄。
+    /// - cancel_fn/cancel_ud: 主程序卸载取消时回调 (主程序 io 线程, 协作式):
     ///   唤醒并停止任务; 不可取消可传 NULL
-    /// - notify: 【出参】宿主填写的完成通知器 (PluginxxOperatorNotify 值
-    ///   拷贝); 插件协程结束 (帧销毁后) 经 notify.done 恰好一次上报 → 宿主
-    ///   guard.reset + 回收句柄。以 const 指针形式入参无法回填 —— 宿主只能
+    /// - notify: 【出参】主程序填写的完成通知器 (PluginxxOperatorNotify 值
+    ///   拷贝); 插件协程结束 (帧销毁后) 经 notify.done 恰好一次上报 → 主程序
+    ///   guard.reset + 回收句柄。以 const 指针形式入参无法回填 —— 主程序只能
     ///   自建一个无法告知插件的 notify, 与本表"插件上报完成"语义矛盾, 必须
     ///   为出参
     /// - notify.done 线程属性与既有 ABI 契约一致: 可从【任意线程】回调
-    ///   (宿主 OpCore::onDone 内部原子 CAS + 投递回 io, 线程安全) —— spawn
-    ///   协程内若直接调用宿主回调形接口 (invoke_capability_async 等) 或经
-    ///   自管线程收尾, 上报可能非 io 线程, 宿主必须按任意线程实现
-    /// - 返回宿主托管句柄 (失败返回 NULL 并 *error_out 输出错误, host->alloc)
+    ///   (主程序 OpCore::onDone 内部原子 CAS + 投递回 io, 线程安全) —— spawn
+    ///   协程内若直接调用主程序回调形接口 (invoke_capability_async 等) 或经
+    ///   自管线程收尾, 上报可能非 io 线程, 主程序必须按任意线程实现
+    /// - 返回主程序托管句柄 (失败返回 NULL 并 *error_out 输出错误, host->alloc)
     PluginxxOperatorHandle*(PLUGINXX_CALL* register_task)(
         const PluginxxHost*            host,
         PluginxxOperatorCancelFunction cancel_fn,
@@ -337,8 +337,8 @@ typedef struct PluginxxTasksIface {
         PluginxxOperatorNotify*        notify,
         PluginxxString*                error_out
     );
-    /// 取消任务 (幂等; 仅限 io 线程调用, 或宿主内部经 ioCallSync 投递后调用)
-    /// - 与宿主 detachAll 内部路径一致; 句柄由宿主托管, 跨线程主动取消需经
+    /// 取消任务 (幂等; 仅限 io 线程调用, 或主程序内部经 ioCallSync 投递后调用)
+    /// - 与主程序 detachAll 内部路径一致; 句柄由主程序托管, 跨线程主动取消需经
     ///   scheduler.post_to_io / ioCallSync 回到 io 线程 (与注册类接口线程
     ///   约束一致), 避免 handle->caller 裸指针跨线程反查实例
     void(PLUGINXX_CALL* cancel_task)(PluginxxOperatorHandle* h);

@@ -1,13 +1,13 @@
-/// pluginxx 动态库装载封装 (宿主侧, 与宿主领域无关)
+/// pluginxx 动态库装载封装 (主程序侧, 与主程序业务无关)
 ///
 /// 背景: 插件以动态库形式分发, 装载需要跨平台的 dlopen/LoadLibrary 封装。
-/// 提取到框架内核后 agentxx / musicxx 等宿主共用同一实现, 避免平台细节漂移。
+/// 提取到框架内核后 agentxx / musicxx 等主程序共用同一实现, 避免平台细节漂移。
 ///
 /// 使用约定:
 /// - [NativeLoader::open] 一律使用 **RTLD_NOW | RTLD_LOCAL / LoadLibraryW**:
 ///   立即解析符号 (缺符号立刻失败, 而不是在首次调用时崩溃), 且不把插件符号
 ///   放进全局命名空间 (避免不同插件之间的符号互相遮蔽);
-/// - 卸载必须由宿主在"实例 lease 归零"之后执行: dlclose/FreeLibrary 越过仍可能
+/// - 卸载必须由主程序在"实例 lease 归零"之后执行: dlclose/FreeLibrary 越过仍可能
 ///   执行的插件代码即未定义行为 (见 pluginxx/runtime/runtime.h 的 lease 说明)。
 #ifndef PLUGINXX_HOST_LOADER_H
 #define PLUGINXX_HOST_LOADER_H

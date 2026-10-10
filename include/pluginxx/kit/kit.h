@@ -1,7 +1,7 @@
-/// 插件开发 SDK —— 通用部分 (C++ header-only, 与宿主领域无关)
+/// 插件开发 SDK —— 通用部分 (C++ header-only, 与主程序业务无关)
 ///
 /// 归属: cxx_pluginxx (插件框架内核)。本头只提供**领域无关**的插件侧能力:
-/// - [PluginStringView] / [PluginString]: 跨边界 ABI 字符串便捷工具与宿主堆字符串 RAII
+/// - [PluginStringView] / [PluginString]: 跨边界 ABI 字符串便捷工具与主程序堆字符串 RAII
 /// - [queryInterface] / [PluginIfaceCore]: 通用接口表 (log / json / config / plugins /
 ///   events / capabilities / scheduler / coroutine_runtime / tasks / cancel) 查询
 /// - [Logger] / [pluginLog] / [pluginStrdup] / [ctxGuardLogger] / [jsonEscape]: 实例级
@@ -10,11 +10,11 @@
 /// - [Task] 锚定协程与完成协议; 锚定原语 [sleep] / [yield] / [offload] / [invoke_cap];
 ///   后台协作任务 [spawn]; 能力注册 [capability]
 /// - [ArgReader]: 强类型参数提取器
-/// - [PluginBaseT]: 插件实例上下文基类 (领域表由宿主侧派生基类补齐)
+/// - [PluginBaseT]: 插件实例上下文基类 (领域表由主程序侧派生基类补齐)
 /// - 导出宏 PLUGINXX_EXPORT_PLUGIN / PLUGINXX_EXPORT_PLUGIN_LIFECYCLE
-///   (入口符号前缀由宿主给出; 宿主侧再包一层自己的导出宏)
+///   (入口符号前缀由主程序给出; 主程序侧再包一层自己的导出宏)
 ///
-/// 宿主领域部分 (工具 / 权限 / 钩子 / 图节点 / client UI 等) 位于宿主仓库: agentxx 侧见
+/// 主程序业务部分 (工具 / 权限 / 钩子 / 图节点 / client UI 等) 位于主程序仓库: agentxx 侧见
 /// [plugin_kit.h](/agent/lib/include/agentxx/plugin/api/plugin_kit.h), 该头包含本头并把
 /// 通用名引入 `agentxx::plugin` —— 插件源码只包含它即可, 无需关心本节分层。
 #pragma once
@@ -69,11 +69,11 @@ using JsonView = utilxx_base::JsonView;
  *
  * [pluginxx/api/abi.h](/agent/third_party/cxx_pluginxx/include/pluginxx/api/abi.h) 为纯 C ABI
  * (跨边界契约), 其结构体在 C++ 下仅带最小便捷成员
- * (构造/empty, 不改变布局)。面向宿主/插件 C++ 源码的字符串与接口操作集中
+ * (构造/empty, 不改变布局)。面向主程序/插件 C++ 源码的字符串与接口操作集中
  * 在本命名空间:
  * - PluginStringView: 字符串视图便捷工具 (纯静态函数集合, 不持有状态;
  *   操作/返回跨边界 ABI 类型 PluginxxStringView/PluginxxString)
- * - PluginString: 宿主堆字符串 RAII (接管 PluginxxString 生命周期;
+ * - PluginString: 主程序堆字符串 RAII (接管 PluginxxString 生命周期;
  *   析构自动经 host->vtable->free 释放)
  * - queryInterface<Iface>: 接口表查询模板
  *
@@ -108,7 +108,7 @@ struct PluginStringView {
         return sv == nullptr || sv->data == nullptr || sv->size == 0;
     }
 
-    /// 宿主堆字符串是否为空
+    /// 主程序堆字符串是否为空
     static bool empty(const PluginxxString& s) noexcept {
         return s.data == nullptr || s.size == 0;
     }
@@ -130,7 +130,7 @@ struct PluginStringView {
                                 : std::string_view{};
     }
 
-    /// 宿主堆字符串 → std::string_view (零拷贝; NULL data 视为空串)
+    /// 主程序堆字符串 → std::string_view (零拷贝; NULL data 视为空串)
     static std::string_view str(const PluginxxString& s) noexcept {
         return s.data ? std::string_view{s.data, static_cast<size_t>(s.size)} : std::string_view{};
     }
@@ -141,7 +141,7 @@ struct PluginStringView {
                               : std::string_view{};
     }
 
-    /// 宿主堆字符串 → ABI 视图
+    /// 主程序堆字符串 → ABI 视图
     static PluginxxStringView toSv(const PluginxxString& s) noexcept {
         return PluginxxStringView{s.data, s.size};
     }
@@ -152,7 +152,7 @@ struct PluginStringView {
     }
 };
 
-/// 宿主堆字符串 RAII (析构自动释放; move-only)
+/// 主程序堆字符串 RAII (析构自动释放; move-only)
 class PluginString {
     const PluginxxHost* host_ = nullptr;
     PluginxxString      str_{nullptr, 0};
@@ -190,7 +190,7 @@ public:
         return *this;
     }
 
-    /// 接管宿主出参 (fn 以 PluginxxString* 出参填充后接管所有权)
+    /// 接管主程序出参 (fn 以 PluginxxString* 出参填充后接管所有权)
     template<typename Fn>
     static PluginString acquire(const PluginxxHost* h, Fn&& fn) {
         PluginxxString s{nullptr, 0};
@@ -198,7 +198,7 @@ public:
         return PluginString(h, s);
     }
 
-    /// 经宿主 alloc 拷贝视图 → ABI 宿主串;
+    /// 经主程序 alloc 拷贝视图 → ABI 主程序串;
     /// 返回裸 ABI 串, 调用方负责释放 (PluginString::free / 移入 PluginString RAII))
     static PluginxxString from(const PluginxxHost* h, const PluginxxStringView* sv) {
         PluginxxString res{nullptr, 0};
@@ -228,7 +228,7 @@ public:
         return from(h, &svAbi);
     }
 
-    /// 覆盖写入 ABI 字符串出参: 先释放已有宿主分配, 再经宿主 alloc 写入新内容
+    /// 覆盖写入 ABI 字符串出参: 先释放已有主程序分配, 再经主程序 alloc 写入新内容
     static void set(const PluginxxHost* h, PluginxxString* out, std::string_view sv) noexcept {
         if (!out) {
             return;
@@ -239,17 +239,17 @@ public:
         *out = from(h, sv);
     }
 
-    /// 从 std::string_view 经宿主 alloc 构造 RAII 对象
+    /// 从 std::string_view 经主程序 alloc 构造 RAII 对象
     static PluginString create(const PluginxxHost* h, std::string_view sv) {
         return PluginString(h, from(h, sv));
     }
 
-    /// 从 ABI 视图经宿主 alloc 构造 RAII 对象
+    /// 从 ABI 视图经主程序 alloc 构造 RAII 对象
     static PluginString create(const PluginxxHost* h, const PluginxxStringView& sv) {
         return PluginString(h, from(h, &sv));
     }
 
-    /// 经宿主 alloc 拷贝 C 串 → ABI 宿主串
+    /// 经主程序 alloc 拷贝 C 串 → ABI 主程序串
     static PluginxxString fromCstr(const PluginxxHost* h, const char* s) {
         if (!h || !s) {
             return PluginxxString{nullptr, 0};
@@ -257,12 +257,12 @@ public:
         return from(h, PluginStringView::fromCstr(s));
     }
 
-    /// 从 C 串经宿主 alloc 构造 RAII 对象
+    /// 从 C 串经主程序 alloc 构造 RAII 对象
     static PluginString createCstr(const PluginxxHost* h, const char* s) {
         return PluginString(h, fromCstr(h, s));
     }
 
-    /// 经宿主 alloc 拷贝视图为裸 char* (调用方负责 free)
+    /// 经主程序 alloc 拷贝视图为裸 char* (调用方负责 free)
     static char* strdup(const PluginxxHost* h, const PluginxxStringView* sv) {
         if (!h || !h->vtable || !h->vtable->alloc || !sv || (!sv->data && sv->size == 0)) {
             return nullptr;
@@ -296,7 +296,7 @@ public:
         return strdup(h, PluginStringView::fromCstr(s));
     }
 
-    /// 释放宿主堆串 (幂等并清空)
+    /// 释放主程序堆串 (幂等并清空)
     static void free(const PluginxxHost* h, PluginxxString* s) noexcept {
         if (s && s->data) {
             if (h && h->vtable && h->vtable->free) {
@@ -356,7 +356,7 @@ public:
     }
 };
 
-/// 查询宿主接口表并转型 (IID → 接口表)
+/// 查询主程序接口表并转型 (IID → 接口表)
 template<typename Iface>
 const Iface* validateInterface(const void* raw) noexcept {
     if (!raw) {
@@ -399,10 +399,10 @@ const Iface* queryInterface(const PluginxxHost* host, const char* iid) noexcept 
 
 /* ==================== 通用接口表聚合 ==================== */
 
-/// 通用接口表聚合 (与宿主领域无关的十个表; 成员为 NULL 表示宿主未实现该接口)
+/// 通用接口表聚合 (与主程序业务无关的十个表; 成员为 NULL 表示主程序未实现该接口)
 ///
 /// 领域表 (工具 / 权限 / 钩子 / 会话 / 模型 / 提示词 / 资源 / 图, 以及 client 侧 UI)
-/// 由宿主在自己的聚合体中补充: agentxx 侧的 `AgentIfaces` 是本聚合
+/// 由主程序在自己的聚合体中补充: agentxx 侧的 `AgentIfaces` 是本聚合
 /// 的超集, 可直接作为 [PluginBaseT] 的模板实参。
 struct PluginIfaceCore {
     const PluginxxLogIface*          log          = nullptr; ///< "pluginxx.log"
@@ -417,7 +417,7 @@ struct PluginIfaceCore {
     const PluginxxTasksIface*            tasks            = nullptr; ///< "pluginxx.tasks"
     const PluginxxCancelIface*           cancel           = nullptr; ///< "pluginxx.cancel"
 
-    /// 从宿主查询全部通用接口表 (host 为空时返回全 NULL 聚合)
+    /// 从主程序查询全部通用接口表 (host 为空时返回全 NULL 聚合)
     static PluginIfaceCore query(const PluginxxHost* host) {
         PluginIfaceCore f;
         if (!host || !host->vtable || !host->vtable->query_interface) {
@@ -502,7 +502,7 @@ struct Logger {
  * 插件各处反复手写的三件小事, 统一由 SDK 提供, 插件内可
  * `using pluginxx::xxx;` 引入后按原名调用:
  * - [pluginLog]        经实例日志接口输出 (上下文为空时静默)
- * - [pluginStrdup]     经宿主 alloc 复制 C 串 (C ABI 出参直接赋值用)
+ * - [pluginStrdup]     经主程序 alloc 复制 C 串 (C ABI 出参直接赋值用)
  * - [ctxGuardLogger]   C ABI 边界异常守卫 (`guardCall`/`guardCallVoid`) 的日志闭包
  */
 
@@ -519,14 +519,14 @@ inline void pluginLog(const Ctx* ctx, int32_t level, std::string_view msg) {
     }
 }
 
-/// 实例日志便捷函数 (直接持有宿主与日志接口表、无实例上下文的插件使用)
+/// 实例日志便捷函数 (直接持有主程序与日志接口表、无实例上下文的插件使用)
 ///
 /// - 已格式化的内容原样输出 (不做前缀/截断; 异常上报路径见 [logTo])
-/// - 宿主或日志接口缺失时静默丢弃
+/// - 主程序或日志接口缺失时静默丢弃
 ///
 /// - `args`:
-///     - [host] 宿主句柄 (由插件入口传入, 须非空)
-///     - [logIf] 日志接口表 (经宿主 query_interface 取得)
+///     - [host] 主程序句柄 (由插件入口传入, 须非空)
+///     - [logIf] 日志接口表 (经主程序 query_interface 取得)
 ///     - [level] 日志等级: 0=trace 1=debug 2=info 3=warn 4=error
 ///     - [msg] 日志内容
 inline void pluginLog(
@@ -542,10 +542,10 @@ inline void pluginLog(
     logIf->log(host, level, &sv);
 }
 
-/// 经宿主 alloc 复制 C 串, 供 C ABI 出参 (`char*`) 直接赋值
+/// 经主程序 alloc 复制 C 串, 供 C ABI 出参 (`char*`) 直接赋值
 /// - 包装 [PluginString::strdup], 省去每处手写视图构造
-/// - 与 `pluginStrdup` 语义一致: 宿主或入参为空返回 nullptr
-/// - `return` 宿主堆内存, 调用方负责经宿主 free 释放
+/// - 与 `pluginStrdup` 语义一致: 主程序或入参为空返回 nullptr
+/// - `return` 主程序堆内存, 调用方负责经主程序 free 释放
 inline char* pluginStrdup(const PluginxxHost* host, const char* s) {
     if (!host || !s) {
         return nullptr;
@@ -569,15 +569,15 @@ inline auto ctxGuardLogger(Ctx* ctx) noexcept {
 
 /// 文本 → JSON 字符串字面量 (含首尾双引号), 供手工拼装 JSON 文本的插件使用
 ///
-/// - 优先经宿主 `json_escape` 接口转义 (正确处理引号/反斜杠/控制字符/非 ASCII);
+/// - 优先经主程序 `json_escape` 接口转义 (正确处理引号/反斜杠/控制字符/非 ASCII);
 ///   接口缺失或调用失败时回退为本地转义 (转义 `"` `\` 与 ASCII 控制字符, 其余原样),
 ///   保证结果始终是合法 JSON 字符串字面量
 /// - 常用场景: 把插件侧构造的字符串 (插件名/脚本路径/MCP 地址等) 拼进 JSON 文本
 ///   (如 `fmt::format("{{\"name\":{}}}", jsonEscape(...))`)
 ///
 /// - `args`:
-///     - [host] 宿主句柄
-///     - [jsonIface] 宿主 json 接口表 (agent/client 两侧共用, 可空)
+///     - [host] 主程序句柄
+///     - [jsonIface] 主程序 json 接口表 (agent/client 两侧共用, 可空)
 ///     - [text] 待转义文本 (内容可含任意字节, 含非法 UTF-8 时应先自行修复)
 ///
 /// - `return` 形如 `"..."` 的 JSON 字符串字面量
@@ -593,7 +593,7 @@ inline std::string
             return out;
         }
     }
-    // 回退: 最小化转义 (宿主接口不可用时仍给出合法 JSON 字符串)
+    // 回退: 最小化转义 (主程序接口不可用时仍给出合法 JSON 字符串)
     std::string out;
     out.reserve(text.size() + 2);
     out.push_back('"');
@@ -639,16 +639,16 @@ inline std::string
 
 /* ==================== 协程驱动桥 (PollOneBridge) ====================
  *
- * 定位: 让插件协程与宿主协程在**同一宿主 IO 执行序列**中交错推进的适配层。
+ * 定位: 让插件协程与主程序协程在**同一主程序 IO 执行序列**中交错推进的适配层。
  *
  * 协议 (与协程库无关):
  * - 插件侧适配器把本地协程的推进单位记为"一次有限步骤" (poll_one 一个就绪 handler);
- * - 只要本地有**已知**可运行工作 (新 root 首步 / 宿主回调完成投递的 continuation /
- *   本地 post), 就调用 [wake]; wake 合并重复请求后向宿主申请一次驱动请求;
- * - 宿主把请求异步投递到自己的 IO 线程, 回调里只做一次 `poll_one()`; 完成后若又
- *   有新 wake 才申请下一次请求; 没有新工作时**不再申请**, 因此空闲时不消耗宿主
+ * - 只要本地有**已知**可运行工作 (新 root 首步 / 主程序回调完成投递的 continuation /
+ *   本地 post), 就调用 [wake]; wake 合并重复请求后向主程序申请一次驱动请求;
+ * - 主程序把请求异步投递到自己的 IO 线程, 回调里只做一次 `poll_one()`; 完成后若又
+ *   有新 wake 才申请下一次请求; 没有新工作时**不再申请**, 因此空闲时不消耗主程序
  *   任务队列, 也不自旋;
- * - **绝不在宿主回调栈内直接恢复插件协程**: 宿主回调只复制结果并
+ * - **绝不在主程序回调栈内直接恢复插件协程**: 主程序回调只复制结果并
  *   `postToLocal + wake`, continuation 仍由下一次 driver 推进。
  *
  * 状态机 (三个竞态窗口都必须覆盖: driver 前 / driver 执行中 / driver 返回后):
@@ -662,10 +662,10 @@ inline std::string
  * 这里用"步骤计数 + 显式 wake 标记 + 两个进行中标志 + epoch"组合, 保证任何窗口中的
  * 投递最终都会被推进, 且没有新工作时请求数不再增长。
  *
- * 线程: `wake()` 可从外部完成回调线程调用; `driveOnce()` 在宿主 IO 线程执行;
+ * 线程: `wake()` 可从外部完成回调线程调用; `driveOnce()` 在主程序 IO 线程执行;
  * `stop()` 从 stop/destroy 路径调用。三者用一把**短**临界区互斥线性化 —— 临界区内
- * 不调用插件业务代码、不投递、不等待, 因此既不会与宿主形成死锁, 也不影响
- * "插件状态只在宿主 IO 线程访问"这一无锁前提 (真正的插件代码只在 driveOnce 的
+ * 不调用插件业务代码、不投递、不等待, 因此既不会与主程序形成死锁, 也不影响
+ * "插件状态只在主程序 IO 线程访问"这一无锁前提 (真正的插件代码只在 driveOnce 的
  * `poll_one` 里跑)。
  */
 namespace detail {
@@ -688,11 +688,11 @@ inline void destroyBridgeFrame(void* frame) noexcept {
 /// 根操作在桥接中的仲裁对象: 完成/放弃的 exactly-once 与协程帧的销毁责任。
 ///
 /// 为什么不直接用 promise 里的 notify:
-/// - 根协程的推进由 host driver 触发, 因此"根仍在本地排队"与"宿主拒绝提供驱动"
+/// - 根协程的推进由 host driver 触发, 因此"根仍在本地排队"与"主程序拒绝提供驱动"
 ///   可能并发出现; 本对象用原子 CAS 保证 `notify.done` 至多一次, 并保证 op 句柄
 ///   等资源只释放一次;
-/// - 宿主拒绝再提供驱动 (实例关闭 / 无 IO executor) 时, 根必须被终结为失败, 否则
-///   宿主持有的 Operation 永远不完成、卸载等待必然超时;
+/// - 主程序拒绝再提供驱动 (实例关闭 / 无 IO executor) 时, 根必须被终结为失败, 否则
+///   主程序持有的 Operation 永远不完成、卸载等待必然超时;
 /// - 协程帧的销毁责任跟着本对象的生命周期: 排队中的本地任务 (或桥析构释放队列)
 ///   持有它的强引用, 最后一个引用释放时销毁仍挂起的帧。放弃路径只置标志, 因此
 ///   **不会有跨线程销毁一个仍可能被恢复的协程帧**。
@@ -726,7 +726,7 @@ public:
         return claimed_.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
     }
 
-    /// 向宿主上报终态 (仅在 [claimFinish] 成功后调用, 保证 exactly-once)。
+    /// 向主程序上报终态 (仅在 [claimFinish] 成功后调用, 保证 exactly-once)。
     void notifyHost(int32_t status, std::string_view payload) noexcept {
         if (!notify_.done) {
             return;
@@ -735,15 +735,15 @@ public:
         try {
             notify_.done(notify_.host_ud, status, &sv);
         } catch (...) {
-            // 宿主回调不得抛异常; 即便抛了也已经认领过完成权, 不重复派发。
+            // 主程序回调不得抛异常; 即便抛了也已经认领过完成权, 不重复派发。
         }
     }
 
-    /// 宿主不再提供驱动: 终结为失败 (幂等)。
+    /// 主程序不再提供驱动: 终结为失败 (幂等)。
     ///
-    /// 帧的处置: 不能在这里销毁 —— 该根可能有仍在外部的宿主回调 (例如已排队或正在
+    /// 帧的处置: 不能在这里销毁 —— 该根可能有仍在外部的主程序回调 (例如已排队或正在
     /// 执行的 sleep/offload 完成), 它们随后会尝试恢复本帧; 因此把根交给桥托管
-    /// (`owner_`), 由桥在**销毁时** (此时插件上下文已无任何未完成宿主操作) 统一销毁,
+    /// (`owner_`), 由桥在**销毁时** (此时插件上下文已无任何未完成主程序操作) 统一销毁,
     /// 期间迟到的回调会因 `shouldAdvance()==false` 而安全跳过。
     /// (定义在 [PollOneBridge] 之后: 需要完整的桥类型来登记托管。)
     void abandon(std::string_view reason) noexcept;
@@ -786,7 +786,7 @@ public:
     ///
     /// 调用点都满足"协程已终止或不可能再被恢复":
     /// - [finishIfDone] 的桥接分支 (协程刚结束, 挂在 final_suspend);
-    /// - 桥销毁 / 最后一个引用释放 (此后不存在宿主回调访问该帧)。
+    /// - 桥销毁 / 最后一个引用释放 (此后不存在主程序回调访问该帧)。
     /// op 资源在这里释放, 而不是在 [abandon]: 被放弃的根可能正在 host driver 内
     /// 执行, 其输入 (Request/OpCtl) 仍被协程以引用使用。
     void destroyFrame() noexcept {
@@ -813,7 +813,7 @@ private:
 /// 与 [BridgeRoot] 的区别: `asio::awaitable` 的协程帧由 asio 自己的 completion
 /// handler 持有 (本地 reactor 销毁时统一释放), 因此本对象**不负责销毁帧**, 只负责:
 /// - 终态上报与资源释放的 **exactly-once** 仲裁 (正常完成 vs 桥停止时放弃);
-/// - 被放弃时执行一次类型擦除的清理 (回收 Job 等宿主可见资源)。
+/// - 被放弃时执行一次类型擦除的清理 (回收 Job 等主程序可见资源)。
 ///
 /// (完成/放弃两条路径都可能释放同一个 Job, 因此用一次 CAS 决定谁来做。)
 class PolledRoot : public std::enable_shared_from_this<PolledRoot> {
@@ -839,7 +839,7 @@ public:
         return claimed_.load(std::memory_order_acquire);
     }
 
-    /// 向宿主上报终态 (仅在 [claimFinish] 成功后调用, 保证 exactly-once)。
+    /// 向主程序上报终态 (仅在 [claimFinish] 成功后调用, 保证 exactly-once)。
     void notifyHost(int32_t status, std::string_view payload) noexcept {
         if (!notify_.done) {
             return;
@@ -848,7 +848,7 @@ public:
         try {
             notify_.done(notify_.host_ud, status, &sv);
         } catch (...) {
-            // 宿主回调不得抛异常; 即便抛了也已经认领过完成权, 不重复派发。
+            // 主程序回调不得抛异常; 即便抛了也已经认领过完成权, 不重复派发。
         }
     }
 
@@ -882,12 +882,12 @@ private:
 ///
 /// kit 内部用法:
 /// - 根操作启动: `postToLocal(首步)` + `wake()`, 并用 [addRoot] 登记 [BridgeRoot],
-///   以便宿主拒绝驱动时终结它;
-/// - 宿主回调完成: `postToLocal(continuation)` + `wake()`;
+///   以便主程序拒绝驱动时终结它;
+/// - 主程序回调完成: `postToLocal(continuation)` + `wake()`;
 /// - stop/destroy: [stop] (拒绝新 wake、取消排队请求、停止本地 reactor、终结活跃根)。
 ///
 /// 两类根:
-/// - **事件驱动根** ([BridgeRoot]): 等的都是"宿主可见唤醒源" (宿主回调/宿主计时器),
+/// - **事件驱动根** ([BridgeRoot]): 等的都是"主程序可见唤醒源" (主程序回调/主程序计时器),
 ///   空闲时不自旋;
 /// - **受控轮询根** ([PolledRoot], 声明式 `polled_tool`): 等的是插件本地 reactor 上
 ///   的内核就绪事件 (socket/管道/文件/本地 timer)。`poll_one` 只能"执行已就绪
@@ -899,16 +899,16 @@ public:
 
     using LocalExecutor = asio::io_context::executor_type;
 
-    /// 连续多少次 driver 无进展后提示"等待没有宿主可见的唤醒源"。
+    /// 连续多少次 driver 无进展后提示"等待没有主程序可见的唤醒源"。
     /// 取 8 是为了容忍合理的偶发空转 (同一轮 wake 与已被消费的 continuation 重叠),
     /// 又不至于让真正的私有 reactor 等待被静默掩盖。
     static constexpr int kNoProgressWarnStreak = 8;
 
     /// ---- 受控轮询 (pump) 参数: 只作用于声明式 `polled_tool` 的根 ----
     /// 无进展时的退避量子 (ms): 等待内核就绪期间约 100 次/秒驱动,
-    /// 每次 ≈1 个宿主 post + 1 次 `epoll_wait(0)`, 空闲时不产生任何驱动。
+    /// 每次 ≈1 个主程序 post + 1 次 `epoll_wait(0)`, 空闲时不产生任何驱动。
     static constexpr int64_t kPollIntervalMs = 10;
-    /// 连续"有进展"多少步后强制让出一次 (给宿主其它任务与同实例其它操作机会),
+    /// 连续"有进展"多少步后强制让出一次 (给主程序其它任务与同实例其它操作机会),
     /// 避免插件自循环 (自己给自己 post) 长期独占 IO 线程。
     static constexpr int kPollBurstMax = 256;
     /// 突发上限触发后的让出时长 (ms)。
@@ -930,7 +930,7 @@ public:
 
     ~PollOneBridge() {
         stop();
-        // 桥销毁 = 插件上下文销毁的最后边界: 此时不会再有宿主回调访问插件帧
+        // 桥销毁 = 插件上下文销毁的最后边界: 此时不会再有主程序回调访问插件帧
         // (实例 lease 已归零), 可以安全销毁被放弃仍挂起的根。
         std::vector<std::shared_ptr<BridgeRoot>> abandoned;
         {
@@ -1026,7 +1026,7 @@ public:
         return polledRoots_.load(std::memory_order_acquire) > 0;
     }
 
-    /// 当前线程是否宿主 IO 线程 (仅诊断; 不得据此内联执行 driver 回调)。
+    /// 当前线程是否主程序 IO 线程 (仅诊断; 不得据此内联执行 driver 回调)。
     bool onHostIoThread() const noexcept {
         if (!host_ || !runtime_ || !runtime_->is_io_thread) {
             return false;
@@ -1057,10 +1057,10 @@ public:
         });
     }
 
-    /// 登记一个根 (**桥持有强引用**; 宿主拒绝驱动时统一终结)。
+    /// 登记一个根 (**桥持有强引用**; 主程序拒绝驱动时统一终结)。
     ///
     /// 为什么必须持有强引用: 挂起中的根除了"下一次恢复任务"之外没有任何持有者 ——
-    /// 排队任务一旦执行完就会释放它, 若桥不持有, 帧会被立刻销毁, 之后到达的宿主
+    /// 排队任务一旦执行完就会释放它, 若桥不持有, 帧会被立刻销毁, 之后到达的主程序
     /// 回调就会访问已释放的协程帧。根对象因此由桥保活到 [removeRoot] (正常完成)
     /// 或桥销毁 (放弃路径)。
     void addRoot(const std::shared_ptr<BridgeRoot>& root) {
@@ -1129,7 +1129,7 @@ public:
         cancelSchedulerOp(waitOp);
     }
 
-    /// 宿主拒绝再提供驱动 / 桥停止时, 终结全部未结束的受控轮询根 (幂等)。
+    /// 主程序拒绝再提供驱动 / 桥停止时, 终结全部未结束的受控轮询根 (幂等)。
     ///
     /// 帧不在这里销毁 (由 asio 随本地 reactor 释放); 这里只负责:
     /// - 每个根按 FAILED 上报一次 (`claimFinish` 仲裁, 与正常完成路径互斥);
@@ -1152,10 +1152,10 @@ public:
         }
     }
 
-    /// 本地已有可运行工作 (新 root 首步 / 宿主回调 continuation / 本地 post 之后)。
+    /// 本地已有可运行工作 (新 root 首步 / 主程序回调 continuation / 本地 post 之后)。
     ///
     /// 幂等且可合并: 同一实例同时最多登记一次请求; 没有新工作时**不会**继续申请,
-    /// 因此空闲时不消耗宿主任务队列, 也不自旋。
+    /// 因此空闲时不消耗主程序任务队列, 也不自旋。
     void wake() noexcept {
         bool needRequest = false;
         {
@@ -1175,7 +1175,7 @@ public:
     /// - 拒绝新的 wake 与请求申请;
     /// - 取消**尚未开始**的请求 (正在执行的回调不打断, 由插件自己的 root 收束协议收尾);
     /// - 停止本地 reactor 并释放 work guard: 之后即便有迟到请求也不会再执行插件代码;
-    /// - 活跃根统一终结为失败 (宿主不会再有驱动来推进它们); 本地排队的 continuation
+    /// - 活跃根统一终结为失败 (主程序不会再有驱动来推进它们); 本地排队的 continuation
     ///   随桥析构释放, 其持有的帧由 [BridgeRoot] 的引用释放路径销毁。
     void stop() noexcept {
         PluginxxDriver*         toCancel = nullptr;
@@ -1206,7 +1206,7 @@ public:
         failAllPolledRoots("plugin coroutine bridge stopped");
     }
 
-    /// 托管一个被放弃的根: 帧必须活到桥销毁 (之后不会再有宿主回调访问它)。
+    /// 托管一个被放弃的根: 帧必须活到桥销毁 (之后不会再有主程序回调访问它)。
     /// 由 [BridgeRoot::abandon] 调用 (任意线程)。
     void retainAbandonedRoot(const std::shared_ptr<BridgeRoot>& root) {
         if (!root) {
@@ -1216,7 +1216,7 @@ public:
         abandonedRoots_.push_back(root);
     }
 
-    /// 宿主拒绝再提供驱动 (实例关闭/无 executor) 时, 终结全部活跃根。
+    /// 主程序拒绝再提供驱动 (实例关闭/无 executor) 时, 终结全部活跃根。
     ///
     /// 顺序很关键: 先从 `roots_` 摘下 (桥不再持有), 再逐个 [BridgeRoot::abandon] ——
     /// abandon 会把根登记进 `abandonedRoots_`, 帧因此活到桥销毁为止。
@@ -1247,7 +1247,7 @@ public:
         std::fputc('\n', stderr);
     }
 
-    /// 经宿主日志接口表输出 (缺失时退回 stderr); 不保存跨实例状态。
+    /// 经主程序日志接口表输出 (缺失时退回 stderr); 不保存跨实例状态。
     static void
         logToHost(const PluginxxHost* host, int32_t level, std::string_view message) noexcept {
         if (!host || !host->vtable || !host->vtable->query_interface) {
@@ -1290,7 +1290,7 @@ private:
         return true;
     }
 
-    /// 向宿主申请请求 (可在任意线程执行; 宿主保证异步投递回调, 且每张至多一次)。
+    /// 向主程序申请请求 (可在任意线程执行; 主程序保证异步投递回调, 且每张至多一次)。
     void requestDriverNow() noexcept {
         uint64_t epoch = 0;
         {
@@ -1350,12 +1350,12 @@ private:
         self->driveOnce();
     }
 
-    /// host driver 回调 (宿主 IO 线程): 严格推进**一个**有限步骤。
+    /// host driver 回调 (主程序 IO 线程): 严格推进**一个**有限步骤。
     void driveOnce() noexcept {
         {
             std::lock_guard lock(mutex_);
             if (stopping_) {
-                // 停止后到达的迟到请求: 不执行任何插件代码 (请求由宿主自行收束)。
+                // 停止后到达的迟到请求: 不执行任何插件代码 (请求由主程序自行收束)。
                 driverQueued_ = false;
                 driver_       = nullptr;
                 pendingEpoch_ = 0;
@@ -1375,8 +1375,8 @@ private:
 
         std::size_t progressed = 0;
         try {
-            // 严格只调用一次: 一个 driver 对应一个局部 continuation, 宿主与插件任务
-            // 因此自然轮换, 单个插件无法长时间独占宿主 executor。
+            // 严格只调用一次: 一个 driver 对应一个局部 continuation, 主程序与插件任务
+            // 因此自然轮换, 单个插件无法长时间独占主程序 executor。
             progressed = localIo_.poll_one();
         } catch (const std::exception& e) {
             logError(fmt::format("plugin local runtime step threw: {}", e.what()));
@@ -1434,7 +1434,7 @@ private:
         }
     }
 
-    /// 下一轮驱动的决策 (调用方持 [mutex_]; 不在此处调用宿主接口)。
+    /// 下一轮驱动的决策 (调用方持 [mutex_]; 不在此处调用主程序接口)。
     enum class PumpDecision {
         Stop,      ///< 不轮询: 无未结束的 polled 操作, 或已停止
         Immediate, ///< 有进展: 立即申请下一次请求 (不等退避)
@@ -1447,7 +1447,7 @@ private:
     /// - 本轮 `poll_one` 执行到了 handler (有进展) 且未达突发上限: 立即续票,
     ///   等待中的网络/子进程/文件就能在就绪的下一个瞬间被处理 (最坏延迟 = 退避量子);
     /// - 否则: 安排一次退避 (无进展 = `kPollIntervalMs`; 达到突发上限 = 让出
-    ///   `kPollBurstYieldMs` 给宿主与同实例其它操作), 已有已排定的退避时不重复安排。
+    ///   `kPollBurstYieldMs` 给主程序与同实例其它操作), 已有已排定的退避时不重复安排。
     PumpDecision pumpNextLocked(std::size_t progressed, int64_t& backoffMs) noexcept {
         backoffMs = 0;
         if (stopping_ || polledRoots_.load(std::memory_order_acquire) == 0) {
@@ -1476,11 +1476,11 @@ private:
         return PumpDecision::Backoff;
     }
 
-    /// 安排一次"退避后驱动" (宿主计时器适配; 只能在宿主 IO 线程调用)。
+    /// 安排一次"退避后驱动" (主程序计时器适配; 只能在主程序 IO 线程调用)。
     ///
     /// - 到期回调 [pumpWaitDone] 只做"请求下一次请求", 不恢复插件协程;
-    /// - 必须在 [mutex_] 之外调用宿主 `sleep` (回调可能同步到达);
-    /// - 宿主计时器不可用时无法退避: 记一次错误并终结未结束的 polled 根,
+    /// - 必须在 [mutex_] 之外调用主程序 `sleep` (回调可能同步到达);
+    /// - 主程序计时器不可用时无法退避: 记一次错误并终结未结束的 polled 根,
     ///   避免"根永远不被推进"这类静默悬挂。
     void schedulePumpWait(int64_t ms) noexcept {
         if (!sched_ || !sched_->sleep) {
@@ -1559,7 +1559,7 @@ private:
         return op;
     }
 
-    /// 取消一个宿主调度句柄 (幂等; 已收束的句柄由宿主按空操作处理)。
+    /// 取消一个主程序调度句柄 (幂等; 已收束的句柄由主程序按空操作处理)。
     void cancelSchedulerOp(PluginxxOperatorHandle* op) noexcept {
         if (op && sched_ && sched_->op_cancel) {
             sched_->op_cancel(op);
@@ -1573,7 +1573,7 @@ private:
     asio::executor_work_guard<asio::io_context::executor_type> work_;
     const PluginxxHost*                                        host_    = nullptr;
     const PluginxxCoroutineRuntimeIface*                       runtime_ = nullptr;
-    /// 宿主计时器/卸载接口表 (`scheduler.sleep` 用于受控轮询的退避量子,
+    /// 主程序计时器/卸载接口表 (`scheduler.sleep` 用于受控轮询的退避量子,
     /// `op_cancel` 用于取消已排定的退避); 缺失时为 nullptr。
     const PluginxxSchedulerIface* sched_ = nullptr;
 
@@ -1609,7 +1609,7 @@ private:
     mutable std::mutex rootsMutex_;
     /// 活跃根 (桥持有强引用; 见 [addRoot] 说明)。
     std::vector<std::shared_ptr<BridgeRoot>> roots_;
-    /// 被放弃 (宿主拒绝驱动/桥停止) 的根: 保活到桥销毁, 期间迟到回调只会安全跳过。
+    /// 被放弃 (主程序拒绝驱动/桥停止) 的根: 保活到桥销毁, 期间迟到回调只会安全跳过。
     std::vector<std::shared_ptr<BridgeRoot>> abandonedRoots_;
     /// 未结束的受控轮询根 (与 `polledRoots_` 计数一致)。
     std::vector<std::shared_ptr<PolledRoot>> polledRootList_;
@@ -1689,7 +1689,7 @@ public:
             }
         }
 
-        // 若该 key 之前已由宿主下发过取消，锁外直接同步执行回调
+        // 若该 key 之前已由主程序下发过取消，锁外直接同步执行回调
         if (alreadyCancelled) {
             std::lock_guard<std::recursive_mutex> elock(entry->mu);
             if (entry->cb) {
@@ -1818,7 +1818,7 @@ public:
     }
 
     /// 查询指定 key 是否已被标记取消
-    /// - 纯内存无跨线程调用，避免向宿主 IO 线程高频查询
+    /// - 纯内存无跨线程调用，避免向主程序 IO 线程高频查询
     bool isCancelled(std::string_view key) const {
         if (key.empty()) {
             return false;
@@ -2180,7 +2180,7 @@ inline void finishIfDone(std::coroutine_handle<Promise> h) {
 
     if (auto bridgeRoot = root.lock()) {
         // 桥接根: 完成/放弃的仲裁与帧销毁都收敛在 [BridgeRoot] 上。
-        // - 先认领完成权: 宿主可能在放弃路径 (failAllRoots) 已上报过 FAILED,
+        // - 先认领完成权: 主程序可能在放弃路径 (failAllRoots) 已上报过 FAILED,
         //   此时这里不得重复上报;
         // - 再销毁帧 (幂等): 排队中的本地任务之后不会再恢复一个已销毁的帧;
         // - 最后释放 op 句柄等资源 (与 notify 一样恰好一次)。
@@ -2188,7 +2188,7 @@ inline void finishIfDone(std::coroutine_handle<Promise> h) {
         // destroyFrame 同时释放 op 侧资源 (幂等); 协程已挂在 final_suspend, 销毁安全。
         bridgeRoot->destroyFrame();
         if (!claimed) {
-            return; // 宿主已在放弃路径上报过终态, 不重复上报
+            return; // 主程序已在放弃路径上报过终态, 不重复上报
         }
         bridgeRoot->notifyHost(status, payload);
         return;
@@ -2225,10 +2225,10 @@ inline void advanceRootOnce(std::coroutine_handle<Promise> h) noexcept {
 }
 
 /// 恢复插件协程的统一入口: 先 `postToLocal` 再 `wake`, continuation 由**下一次
-/// host driver** 的 `poll_one` 执行 —— 因此绝不会从宿主回调栈内重入插件协程,
-/// 也不会占用宿主 IO 线程做插件工作 (只投递一个小闭包)。
+/// host driver** 的 `poll_one` 执行 —— 因此绝不会从主程序回调栈内重入插件协程,
+/// 也不会占用主程序 IO 线程做插件工作 (只投递一个小闭包)。
 ///
-/// 被放弃的根 (宿主拒绝驱动) 不再恢复: 直接返回, 帧由引用释放路径销毁。
+/// 被放弃的根 (主程序拒绝驱动) 不再恢复: 直接返回, 帧由引用释放路径销毁。
 template<typename Promise>
 inline void resumePluginCoroutine(
     detail::PollOneBridge*         bridge,
@@ -2253,7 +2253,7 @@ inline void resumePluginCoroutine(
 
 /// 启动一个桥接根协程 (plugin.md 6.2):
 /// - 首步经本地执行器排队, 由**下一次 host driver** 执行; `execute_start` 因此不会
-///   在宿主 IO 线程上同步跑插件业务代码 (也不会有 completion 重入);
+///   在主程序 IO 线程上同步跑插件业务代码 (也不会有 completion 重入);
 /// - 帧的销毁责任交给 [BridgeRoot]: 排队中的本地任务持强引用, 最后一个引用释放
 ///   时销毁仍挂起的帧;
 /// - `cleanup` 在"根终结恰好一次"时执行 (释放 op 句柄 / 注销根登记)。
@@ -2299,7 +2299,7 @@ inline std::shared_ptr<detail::BridgeRoot> startBridgedRoot(
 /* ==================== 根操作 Request 与完成守卫 ====================
  *
  * tool / hook / capability / graph / spawn 这些"根操作"共享同一套协议：
- * 宿主把 args/session/call_id/method 以**只读借用视图**传入 start，插件必须在
+ * 主程序把 args/session/call_id/method 以**只读借用视图**传入 start，插件必须在
  * 本次调用内复制需要跨挂起保留的数据；接受之后必须 exactly-once 完成。
  * 下面两个类型把这套协议集中在一处，避免每个 helper 各写一遍。
  */
@@ -2418,7 +2418,7 @@ struct RootRequest {
 /// - 业务代码显式调用 ok()/failed()/cancelled() 表示完成；
 /// - 作用域结束时仍未完成（提前 return 等）时析构补一次 FAILED，绝不留下
 ///   "已接受但永远不 done"的操作；
-/// - 重复完成只记录，不重复回调宿主。
+/// - 重复完成只记录，不重复回调主程序。
 ///
 /// 异步路径（Task）由 `PromiseBase` 的 notify_/cancelFlag_ 在同一处收束，
 /// 语义与这里的同步路径一致。
@@ -2449,7 +2449,7 @@ public:
             auto sv = PluginStringView::from(payload.data(), payload.size());
             notify_.done(notify_.host_ud, status, &sv);
         } catch (...) {
-            // 宿主回调不得抛异常；即便抛了也已经置位，不重复派发。
+            // 主程序回调不得抛异常；即便抛了也已经置位，不重复派发。
         }
         return true;
     }
@@ -2799,7 +2799,7 @@ inline void spawnTaskImpl(Ctx& ctx, Fn&& fn) {
             }
 
             // 任务首步由 host driver 推进, 因此 spawn 不会在调用方栈里同步跑任务体
-            // (调用方可能正处在宿主 start/注册事务中)。桥停止时会经 [BridgeRoot]
+            // (调用方可能正处在主程序 start/注册事务中)。桥停止时会经 [BridgeRoot]
             // 把任务上报为失败, 帧也随之销毁。
             detail::startBridgedRoot(ctx.bridge(), hostNotify, h, [recWeak] {
                 if (auto recSp = recWeak.lock()) {
@@ -2810,7 +2810,7 @@ inline void spawnTaskImpl(Ctx& ctx, Fn&& fn) {
     };
     rec->starter = starter;
     ctx.spawns_.push_back(rec);
-    // 首步仍在宿主 IO 线程排队执行 (与既有语义一致: spawn 不在 start 调用栈内跑任务体)
+    // 首步仍在主程序 IO 线程排队执行 (与既有语义一致: spawn 不在 start 调用栈内跑任务体)
     auto*      raw    = rec.get();
     const auto status = ctx.iface.scheduler->post_to_io(
         ctx.host,
@@ -2841,12 +2841,12 @@ inline void spawn(Ctx& ctx, Fn&& fn) {
 
 /// 插件实例上下文基类 (通用部分; header-only)
 ///
-/// - 持有宿主句柄、通用接口表聚合、实例级 [Logger] 与 [CancelRegistry];
-/// - 提供与宿主领域无关的常用操作: config / workDir / argsJson / configPath /
+/// - 持有主程序句柄、通用接口表聚合、实例级 [Logger] 与 [CancelRegistry];
+/// - 提供与主程序业务无关的常用操作: config / workDir / argsJson / configPath /
 ///   language / setLanguage / sessionCancelled / jsonEscape / jsonGetString /
-///   宿主堆字符串 (strdup / createString / createPluginString) / 后台任务 spawn;
-/// - 协程驱动桥 (见 [bridge]) 让插件协程与宿主协程在同一 IO 执行序列中交错推进;
-/// - 领域能力由宿主侧派生基类补齐: 派生类既可在 `IfacesT` 中带领域表, 也可覆写
+///   主程序堆字符串 (strdup / createString / createPluginString) / 后台任务 spawn;
+/// - 协程驱动桥 (见 [bridge]) 让插件协程与主程序协程在同一 IO 执行序列中交错推进;
+/// - 领域能力由主程序侧派生基类补齐: 派生类既可在 `IfacesT` 中带领域表, 也可覆写
 ///   [onHostReady] 挂钩领域初始化 (见 agentxx 侧的 `PluginBase`)。
 template<typename IfacesT>
 class PluginBaseT {
@@ -2875,7 +2875,7 @@ public:
     }
 
     /// 本实例的协程驱动桥 (延迟创建; 每实例一份, 无进程级可变状态)。
-    /// - 线程: 只应在宿主 IO 线程调用 (与实例状态同一串行上下文)
+    /// - 线程: 只应在主程序 IO 线程调用 (与实例状态同一串行上下文)
     detail::PollOneBridge& bridge() const {
         if (!bridge_) {
             bridge_ = std::make_unique<detail::PollOneBridge>(
@@ -2902,7 +2902,7 @@ public:
         log.logIface = iface.log;
         log.logFn    = (iface.log && iface.log->log) ? iface.log->log : nullptr;
 
-        // 领域挂钩: 由宿主侧派生基类补齐 (agentxx 侧在此订阅会话轮次开始事件)
+        // 领域挂钩: 由主程序侧派生基类补齐 (agentxx 侧在此订阅会话轮次开始事件)
         onHostReady();
     }
 
@@ -2988,7 +2988,7 @@ public:
     }
 
     /// 会话是否已取消 (优化版: 优先本地无抖动查询)
-    /// - 宿主下发 cancel 时已通过 execute_cancel 写入 cancelRegistry
+    /// - 主程序下发 cancel 时已通过 execute_cancel 写入 cancelRegistry
     /// - 故本地为 true 时必然已取消，直接返回 true，避免任何跨线程通信
     bool sessionCancelled(PluginxxStringView tid) const {
         if (!tid.data || tid.size == 0) {
@@ -3040,7 +3040,7 @@ public:
         return PluginString::create(host, sv);
     }
 
-    /// 字符串 → JSON 字符串字面量 (经宿主 pluginxx.json 接口表; 含引号包裹与转义)
+    /// 字符串 → JSON 字符串字面量 (经主程序 pluginxx.json 接口表; 含引号包裹与转义)
     std::string jsonEscape(PluginxxStringView s) const {
         if (!host || !iface.json || !iface.json->json_escape || (!s.data && s.size == 0)) {
             return "\"\"";
@@ -3067,7 +3067,7 @@ public:
         return jsonEscape(std::string_view{s});
     }
 
-    /// 从 JSON 中提取 key 的字符串值 (经宿主 json 接口表; 不存在返回空)
+    /// 从 JSON 中提取 key 的字符串值 (经主程序 json 接口表; 不存在返回空)
     std::string jsonGetString(std::string_view json, std::string_view key) const {
         if (!host || !iface.json || !iface.json->json_get_string) {
             return {};
@@ -3127,7 +3127,7 @@ public:
     }
 
     /// 启动后台协作任务 (完成协议见 [detail::spawnTaskImpl])
-    /// - 任务协程以本实例引用接收 OpCtl; 宿主取消/实例析构时由 [stopSpawns] 收束
+    /// - 任务协程以本实例引用接收 OpCtl; 主程序取消/实例析构时由 [stopSpawns] 收束
     template<typename Self, typename Fn>
     void spawn(this Self& self, Fn&& fn) {
         detail::spawnTaskImpl(self, std::forward<Fn>(fn));
@@ -3135,7 +3135,7 @@ public:
 
 protected:
 
-    /// 领域挂钩: [init] 末尾调用, 由宿主侧派生基类补齐领域初始化
+    /// 领域挂钩: [init] 末尾调用, 由主程序侧派生基类补齐领域初始化
     /// (agentxx 侧在此订阅会话轮次开始事件, 用于重置会话级取消登记)
     virtual void onHostReady() {}
 
@@ -3154,7 +3154,7 @@ namespace detail {
 struct SleepAwaiter {
     const PluginxxHost*           host;
     const PluginxxSchedulerIface* sched;
-    /// 协程驱动桥 (宿主支持时为非空): 完成回调经它投递 continuation 并唤醒 driver。
+    /// 协程驱动桥 (主程序支持时为非空): 完成回调经它投递 continuation 并唤醒 driver。
     PollOneBridge*          bridge = nullptr;
     int64_t                 ms;
     void*                   coroAddr  = nullptr;
@@ -3194,7 +3194,7 @@ struct SleepAwaiter {
                         std::runtime_error(message.empty() ? "sleep failed" : std::string(message))
                     ));
                 }
-                // 桥接路径不在宿主回调栈内恢复协程 (见 [resumePluginCoroutine])。
+                // 桥接路径不在主程序回调栈内恢复协程 (见 [resumePluginCoroutine])。
                 resumePluginCoroutine(self->bridge, handle);
             },
             this,
@@ -3223,7 +3223,7 @@ struct SleepAwaiter {
 struct YieldAwaiter {
     const PluginxxHost* host;
     /// 协程驱动桥: "让出" = 投递到本地执行器 + 唤醒 driver, 由下一次请求推进,
-    /// 因此宿主与插件任务按轮次交替。
+    /// 因此主程序与插件任务按轮次交替。
     PollOneBridge* bridge = nullptr;
 
     bool await_ready() noexcept {
@@ -3246,7 +3246,7 @@ struct OffloadAwaiter {
     const PluginxxHost*           host;
     const PluginxxSchedulerIface* sched;
     WorkFn                        work;
-    /// 协程驱动桥。**注意**: offload 的工作体本身仍运行在宿主工作线程池
+    /// 协程驱动桥。**注意**: offload 的工作体本身仍运行在主程序工作线程池
     /// (显式声明的例外), 只有"完成后的恢复"经桥回到 driver 序列。
     PollOneBridge*     bridge = nullptr;
     std::exception_ptr exPtr  = nullptr;
@@ -3294,7 +3294,7 @@ struct OffloadAwaiter {
                 auto  handle = std::coroutine_handle<Promise>::from_address(self->coroAddr_);
                 auto& prom   = handle.promise();
                 prom.clear_outstanding();
-                // 桥接路径: 恢复走 driver 序列 (不在宿主完成回调栈内重入插件协程)。
+                // 桥接路径: 恢复走 driver 序列 (不在主程序完成回调栈内重入插件协程)。
                 resumePluginCoroutine(self->bridge, handle);
             },
             this,
@@ -3416,7 +3416,7 @@ struct InvokeCapAwaiter {
                 auto handle = std::coroutine_handle<Promise>::from_address(s->coroAddr);
                 handle.promise().clear_outstanding();
 
-                // 桥接路径不在宿主回调栈内恢复插件协程 (见 [resumePluginCoroutine])。
+                // 桥接路径不在主程序回调栈内恢复插件协程 (见 [resumePluginCoroutine])。
                 resumePluginCoroutine(s->bridge, handle);
             },
             holder,
@@ -3469,22 +3469,22 @@ struct InvokeCapAwaiter {
 
 } // namespace detail
 
-/// 宿主计时器适配 (非轮询): 计时器到期时宿主回调 adapter, adapter 把 continuation
+/// 主程序计时器适配 (非轮询): 计时器到期时主程序回调 adapter, adapter 把 continuation
 /// 投递到本地执行器并 [detail::PollOneBridge::wake]; continuation 由下一次 driver
-/// 推进, 因此既不需要额外线程, 也不占用宿主 IO 线程执行插件工作。
+/// 推进, 因此既不需要额外线程, 也不占用主程序 IO 线程执行插件工作。
 template<typename Ctx>
 inline detail::SleepAwaiter sleep(const Ctx& ctx, int64_t ms) noexcept {
     return detail::SleepAwaiter{ctx.host, ctx.iface.scheduler, &ctx.bridge(), ms};
 }
 
 /// 让出一轮 (等价于"下一位"): 有桥时投递 continuation + 唤醒 driver,
-/// 由下一次请求推进; 无桥时沿用宿主 post_to_io。
+/// 由下一次请求推进; 无桥时沿用主程序 post_to_io。
 template<typename Ctx>
 inline detail::YieldAwaiter yield(const Ctx& ctx) noexcept {
     return detail::YieldAwaiter{ctx.host, &ctx.bridge()};
 }
 
-/// 阻塞工作委托 (宿主工作线程池): **显式例外**, 工作体本身不在 driver 序列里运行;
+/// 阻塞工作委托 (主程序工作线程池): **显式例外**, 工作体本身不在 driver 序列里运行;
 /// 完成后的恢复仍回到 driver 序列 (见 [detail::OffloadAwaiter])。
 template<typename Ctx, typename WorkFn>
 inline auto offload(const Ctx& ctx, WorkFn&& work) {
@@ -3579,7 +3579,7 @@ inline void capability(Ctx& ctx, std::string_view capName, CapFn&& fn) {
                     return nullptr;
                 }
                 // 能力入参纳入拥有型 Request：业务只读到 Request 拥有的
-                // method/args（F13），不再依赖宿主借用缓冲区。
+                // method/args（F13），不再依赖主程序借用缓冲区。
                 auto request
                     = detail::RootRequest::forCapability(shim->ctx->host, method, args_json);
 
@@ -3621,7 +3621,7 @@ inline void capability(Ctx& ctx, std::string_view capName, CapFn&& fn) {
                     return nullptr;
                 } else {
                     /// Task<T> 能力：由 promise 在协程结束后收束完成通知，
-                    /// 返回 Job 作为宿主可取消的 provider 句柄。
+                    /// 返回 Job 作为主程序可取消的 provider 句柄。
                     auto* job = new CapJob{
                         shim,
                         std::make_shared<std::atomic<bool>>(false),
@@ -3761,7 +3761,7 @@ inline PluginxxString invoke_capability_blocking(
 namespace detail {
 
 /// 生命周期入口公共守卫 (导出宏内部使用):
-/// 捕获跨 C ABI 的异常并写入 `err` (宿主回滚依据), 统一返回 NULL 表示"本次事务未同步成功"。
+/// 捕获跨 C ABI 的异常并写入 `err` (主程序回滚依据), 统一返回 NULL 表示"本次事务未同步成功"。
 template<typename Fn>
 inline void* callLifecycleEntry(
     const PluginxxHost*           host,
@@ -3800,7 +3800,7 @@ inline void autoStopSpawns(Ctx* ctx) noexcept {
 
 } // namespace detail
 
-/// create 阶段异常上报 (上下文可能尚未构造成功, 直接经宿主日志接口输出)
+/// create 阶段异常上报 (上下文可能尚未构造成功, 直接经主程序日志接口输出)
 inline void logCreateFailure(
     const PluginxxHost* host,
     std::string_view    plugin,
@@ -3821,7 +3821,7 @@ inline void logCreateFailure(
 
 /// 入口符号名拼接: `PLUGINXX_ENTRY_SYMBOL(musicxx_plugin_, create)` → `musicxx_plugin_create`
 ///
-/// 符号前缀由宿主给出 (内核不含任何宿主专名); 宿主在自己的 SDK 头里用它包出对插件作者
+/// 符号前缀由主程序给出 (内核不含任何主程序专名); 主程序在自己的 SDK 头里用它包出对插件作者
 /// 友好的导出宏 (agentxx 的 `AGENTXX_PLUGIN_AGENT_EXPORT`、musicxx 的 `MUSICXX_PLUGIN_EXPORT`)。
 #define PLUGINXX_ENTRY_SYMBOL_JOIN__(Prefix, Suffix) Prefix##Suffix
 #define PLUGINXX_ENTRY_SYMBOL_JOIN_(Prefix, Suffix)  PLUGINXX_ENTRY_SYMBOL_JOIN__(Prefix, Suffix)
@@ -3829,17 +3829,17 @@ inline void logCreateFailure(
 
 /// 插件入口导出 (生成 `<SymbolPrefix>get_info/create/start/stop/destroy` 五个符号)。
 ///
-/// `SymbolPrefix` 是宿主命名空间前缀, 例如 agentxx 的 `agentxx_plugin_agent_`、
-/// musicxx 的 `musicxx_plugin_`; 运行时宿主必须经 `entrySymbols()` 交出同一批符号名
+/// `SymbolPrefix` 是主程序命名空间前缀, 例如 agentxx 的 `agentxx_plugin_agent_`、
+/// musicxx 的 `musicxx_plugin_`; 运行时主程序必须经 `entrySymbols()` 交出同一批符号名
 /// (见 `pluginxx/api/entry.h`), 两侧不一致时装载失败。
 ///
-/// 宿主按以下顺序调用, 插件必须遵守 (见 docs/zh-cn/design/plugins.md):
+/// 主程序按以下顺序调用, 插件必须遵守 (见 docs/zh-cn/design/plugins.md):
 /// - `create`: 只构造上下文 (`new CtxType` + `init(host)`), 不注册任何工具/钩子/能力/
 ///   订阅, 不启动线程;
-/// - `start`: **注册事务**, 在宿主 IO 线程执行; 同步完成时 `notify->done(OK)` 后返回 NULL,
-///   失败时返回 NULL 并写出 `error_out` (宿主回滚本次注册并撤销实例);
-/// - `stop`: 撤销自管资源 (线程/定时器/订阅), 可重复调用; 完成后宿主才调用 destroy;
-/// - `destroy`: 只释放本地对象, 不调用宿主接口、不创建异步工作。
+/// - `start`: **注册事务**, 在主程序 IO 线程执行; 同步完成时 `notify->done(OK)` 后返回 NULL,
+///   失败时返回 NULL 并写出 `error_out` (主程序回滚本次注册并撤销实例);
+/// - `stop`: 撤销自管资源 (线程/定时器/订阅), 可重复调用; 完成后主程序才调用 destroy;
+/// - `destroy`: 只释放本地对象, 不调用主程序接口、不创建异步工作。
 ///
 /// `StartFn` / `StopFn` 形如
 /// `void*(CtxType&, const PluginxxOperatorNotify*, PluginxxString* error_out)`。

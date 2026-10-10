@@ -1,17 +1,17 @@
-/// pluginxx 宿主核心 (通用表的状态与方法实现, 与宿主领域无关)
+/// pluginxx 框架核心 (通用表的状态与方法实现, 与主程序业务无关)
 ///
 /// 定位: 把**通用表** (log / json / config / plugins / events / capabilities /
-/// scheduler / coroutine_runtime / tasks / cancel) 的实现从各宿主的管理器里收敛到
-/// 一处, 宿主只需:
+/// scheduler / coroutine_runtime / tasks / cancel) 的实现从各主程序的管理器里收敛到
+/// 一处, 主程序只需:
 /// 1. 管理器继承本类 (`class MyManager : public pluginxx::PluginHostCore<MyInstance>`);
 /// 2. 实现 [DomainHooks] 并调用 [PluginHostCore::setDomainHooks];
 /// 3. 用 `pluginxx/host/tables_impl.h` 的 `queryGenericPluginIface` 装配 vtable 的
-///    `query_interface` (通用表由内核提供, 领域表由宿主自己提供)。
+///    `query_interface` (通用表由内核提供, 领域表由主程序自己提供)。
 ///
-/// 归属判据: 通用 = 与"会话/模型/工具/提示词/图"无关的表; 需要宿主语义的数据一律
-/// 经 [DomainHooks] 取, 因此本头不包含任何宿主类型。
+/// 归属判据: 通用 = 与"会话/模型/工具/提示词/图"无关的表; 需要主程序语义的数据一律
+/// 经 [DomainHooks] 取, 因此本头不包含任何主程序类型。
 ///
-/// 线程约定: 除明确标注的方法外, 全部方法**只在宿主 IO 线程调用** (ABI 入口由
+/// 线程约定: 除明确标注的方法外, 全部方法**只在主程序 IO 线程调用** (ABI 入口由
 /// `tables_impl.h` 的 trampoline 先投递到 IO 线程); 实例的登记表 (订阅/能力/睡眠
 /// 句柄) 因此无需额外加锁。
 #pragma once
@@ -56,7 +56,7 @@ inline PluginxxStringView abiView(std::string_view sv) noexcept {
     return PluginxxStringView{sv.data(), static_cast<uint64_t>(sv.size())};
 }
 
-/// 写 C ABI 出参错误串 (宿主堆内存; 插件经 host->free 释放)
+/// 写 C ABI 出参错误串 (主程序堆内存; 插件经 host->free 释放)
 inline void setErrorString(PluginxxString* out, std::string_view msg) noexcept {
     if (!out) {
         return;
@@ -78,10 +78,10 @@ inline void upsertEntry(std::vector<Entry>& entries, const Key& key, Entry&& ent
 
 } // namespace detail
 
-/// 宿主核心: 通用表的状态与实现
+/// 框架核心: 通用表的状态与实现
 ///
 /// - `InstanceT` 须继承 [pluginxx::PluginInstanceBase] (通用表的实例登记表在基类上);
-/// - 派生宿主负责领域部分: 领域表的 vtable 入口、加载/卸载/启停事务、领域注册表。
+/// - 派生主程序负责领域部分: 领域表的 vtable 入口、加载/卸载/启停事务、领域注册表。
 template<typename InstanceT>
 class PluginHostCore : public PluginManagerBase<InstanceT> {
 public:
@@ -93,7 +93,7 @@ public:
         Base(std::move(ex)) {}
 
     /// 注入领域钩子
-    /// - 宿主管理器实现 [DomainHooks] 后在构造函数体内调用
+    /// - 主程序管理器实现 [DomainHooks] 后在构造函数体内调用
     ///   (`this->setDomainHooks(this)`), 必须在任何通用表入口被调用之前完成
     void setDomainHooks(DomainHooks* hooks) noexcept {
         hooks_ = hooks;
@@ -103,7 +103,7 @@ public:
         return hooks_;
     }
 
-    /// 能力注册表 (宿主其它代码可直接查询)
+    /// 能力注册表 (主程序其它代码可直接查询)
     std::shared_ptr<CapabilityRegistry> capabilities() const {
         return capabilities_;
     }
@@ -196,7 +196,7 @@ public:
     }
 
     /// 撤销实例声明的全部能力 (**IO 线程**; 保留实例内的登记记录, 供启用事务重新声明)
-    /// - 卸载 / 禁用路径调用; 登记记录由宿主在 stop 成功后一并清空
+    /// - 卸载 / 禁用路径调用; 登记记录由主程序在 stop 成功后一并清空
     void unregisterInstanceCapabilities(InstanceT* inst) {
         if (!inst) {
             return;
@@ -279,9 +279,9 @@ public:
 
     /// 订阅事件 (**IO 线程**)
     /// - `topic` 经 [DomainHooks::qualifyEventTopic] 补齐命名空间;
-    /// - 事件回调在宿主事件线程执行, 每次回调都在实例执行 lease 保护下调用插件
+    /// - 事件回调在主程序事件线程执行, 每次回调都在实例执行 lease 保护下调用插件
     ///   (因此卸载的 idle 等待覆盖它);
-    /// - 实例正在关闭/已禁用, 或宿主无事件后端时返回 nullptr。
+    /// - 实例正在关闭/已禁用, 或主程序无事件后端时返回 nullptr。
     PluginxxSubscription* subscribe(
         InstanceT*               inst,
         std::string_view         topic,
@@ -477,10 +477,10 @@ public:
         }
     }
 
-    /// 阻塞工作委托到宿主工作线程池 (**IO 线程**)
+    /// 阻塞工作委托到主程序工作线程池 (**IO 线程**)
     /// - 工作体本身在工作线程执行 (显式例外), 完成通知经 OpCore 回到 IO 线程;
     /// - `work` 收到的取消令牌只在本次工作调用期间有效 (插件不得保存);
-    /// - 宿主无工作线程时立即以失败终结 (不静默丢工作)。
+    /// - 主程序无工作线程时立即以失败终结 (不静默丢工作)。
     PluginxxOperatorHandle* offload(
         InstanceT* inst,
         void*(PLUGINXX_CALL* work)(
@@ -595,10 +595,10 @@ public:
     // =====================================================================
 
     /// 托管一个后台任务 (**IO 线程**)
-    /// - `cancel_fn`/`cancel_ud`: 卸载取消时宿主回调 (IO 线程, 协作式);
+    /// - `cancel_fn`/`cancel_ud`: 卸载取消时主程序回调 (IO 线程, 协作式);
     /// - `notify`: 【出参】插件协程结束 (帧销毁后) 经 `notify.done` 恰好一次上报;
-    /// - 返回宿主托管句柄 (失败 NULL + error_out); 句柄仅用于 `cancel_task`,
-    ///   宿主在任务 done 后自动回收。
+    /// - 返回主程序托管句柄 (失败 NULL + error_out); 句柄仅用于 `cancel_task`,
+    ///   主程序在任务 done 后自动回收。
     PluginxxOperatorHandle* registerTask(
         InstanceT*                          inst,
         PluginxxOperatorCancelFunction cancel_fn,

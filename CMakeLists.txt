@@ -1,10 +1,10 @@
-# ===== cxx_pluginxx: 插件框架内核 (纯 C ABI 基座 + 通用接口表 + 宿主运行时 + SDK) =====
+# ===== cxx_pluginxx: 插件框架内核 (纯 C ABI 基座 + 通用接口表 + 插件框架运行时 + SDK) =====
 #
-# 定位: 与宿主领域无关的插件框架, 供各宿主复用:
+# 定位: 与主程序业务无关的插件框架, 供各主程序复用:
 #   - include/pluginxx/api/     纯 C ABI (跨边界契约, 与领域无关的部分)
 #   - include/pluginxx/kit/     插件侧 C++ SDK (header-only)
-#   - include/pluginxx/runtime/ 宿主侧运行时 (header-only)
-#   - include/pluginxx/host/    宿主侧通用实现 (装载/清单/注册簿记/通用表装配)
+#   - include/pluginxx/runtime/ 插件运行时 (header-only)
+#   - include/pluginxx/host/    主程序侧通用实现 (装载/清单/注册簿记/通用表装配)
 # 依赖: cxx_utilxx_base (取消令牌/日志/JSON 等) + fmt + Boost (仅头文件)
 #       **禁止**依赖 neograph / OpenSSL / SQLite 等重依赖与 Boost 编译库
 # 产物 (命名规则: Release 无后缀, Debug 文件名追加 d):
@@ -12,7 +12,7 @@
 #   Debug:   libcxx_pluginxxd.so       libcxx_pluginxx_staticd.a
 #
 # 使用 (处理方; 顺序: 先查找条件依赖, 再 find_package 本库):
-#   if (XX_LINUX_IO_URING_SUPPORTED)   # 依赖库 cxx_utilxx_base 声明该依赖 (宿主开关)
+#   if (XX_LINUX_IO_URING_SUPPORTED)   # 依赖库 cxx_utilxx_base 声明该依赖 (主程序开关)
 #     find_package(PkgConfig REQUIRED)
 #     pkg_check_modules(uring REQUIRED IMPORTED_TARGET liburing)
 #   endif ()

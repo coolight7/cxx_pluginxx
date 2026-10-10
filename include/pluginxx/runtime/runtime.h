@@ -1,11 +1,11 @@
-/// pluginxx 宿主运行时 (实例状态机 / 执行 lease / 投递通道)
+/// pluginxx 插件框架运行时 (实例状态机 / 执行 lease / 投递通道)
 ///
-/// 定位: 与宿主领域无关的插件框架内核运行时, 供 agentxx / musicxx 等宿主复用。
-/// 所有类型仅供宿主内部使用, 不属于 C ABI。
+/// 定位: 与主程序业务无关的插件框架内核运行时, 供 agentxx / musicxx 等主程序复用。
+/// 所有类型仅供主程序内部使用, 不属于 C ABI。
 ///
 /// 内容:
 /// - [PluginRuntime]: 不捕获 manager 裸指针的公共运行时状态 (io executor / 操作表 /
-///   待重放动作队列), 由宿主管理器持有;
+///   待重放动作队列), 由主程序管理器持有;
 /// - [InstanceLifetime] / [InstanceLease]: 实例状态机与执行 lease (关闭等待覆盖
 ///   所有已进入插件代码的执行);
 /// - [enqueueRuntimeAction] / [replayRuntimeActions]: 经 runtime 投递动作, 并在
@@ -191,7 +191,7 @@ public:
         idleCleanupRegistered_ = false;
     }
 
-    /// `lifecycle`: 仅 IO 线程用于宿主显式 start/stop 调用；不得供新业务操作使用。
+    /// `lifecycle`: 仅 IO 线程用于主程序显式 start/stop 调用；不得供新业务操作使用。
     bool tryAcquire(bool lifecycle = false) noexcept {
         auto count = leases_.load(std::memory_order_acquire);
         for (;;) {

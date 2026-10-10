@@ -1,12 +1,12 @@
-/// pluginxx 宿主侧协程驱动请求 (pluginxx.coroutine_runtime 接口表的实现载体)
+/// pluginxx 主程序侧协程驱动请求 (pluginxx.coroutine_runtime 接口表的实现载体)
 ///
-/// 背景: 插件协程要与宿主协程在同一宿主 IO 执行序列中交错推进, 但插件可以用任意
-/// 协程库/事件循环, 宿主也绝不能把插件私有 reactor 接进自己的执行序列。因此两端
+/// 背景: 插件协程要与主程序协程在同一主程序 IO 执行序列中交错推进, 但插件可以用任意
+/// 协程库/事件循环, 主程序也绝不能把插件私有 reactor 接进自己的执行序列。因此两端
 /// 只经两类动作协作 (见 docs/zh-cn/design/plugins.md):
-/// - **driver/pump**: 插件申请宿主异步执行一次有界回调 (`PluginxxDriveOnceFn`);
+/// - **driver/pump**: 插件申请主程序异步执行一次有界回调 (`PluginxxDriveOnceFn`);
 /// - **wake 合并**: 插件侧适配器自行合并重复唤醒, 再申请下一次 ticket。
 ///
-/// 本文件是"driver"这一侧的宿主实现:
+/// 本文件是"driver"这一侧的主程序实现:
 /// - 一次 ticket 至多执行一次回调, 且**永不内联** (即使申请者就在 IO 线程, 也经
 ///   `enqueueRuntimeAction` 异步投递), 避免 root start/completion/cancel 重入;
 /// - 回调排队与执行期间持有实例执行 lease, 因此实例关闭/卸载的 idle 等待必然
@@ -55,7 +55,7 @@ struct PluginxxDriver : std::enable_shared_from_this<PluginxxDriver> {
 
     /// 创建请求 (不自动排队; 调用方负责 `schedule()`)。
     ///
-    /// - `runtime`: 宿主运行时 (提供 IO executor 与投递通道)
+    /// - `runtime`: 插件框架运行时 (提供 IO executor 与投递通道)
     /// - `lifetime`: 实例生命周期控制块; 空指针或实例已 Closed 时创建失败
     /// - `drive`: 插件回调 (C ABI 函数指针), `ud` 为其 user_data
     /// - `return`: 失败返回 nullptr (实例已关闭 / 参数缺失)
@@ -86,7 +86,7 @@ struct PluginxxDriver : std::enable_shared_from_this<PluginxxDriver> {
 
     /// 按地址校验并取消请求 (**任意线程可调用**; 无效/已收束句柄安全忽略)。
     ///
-    /// 为什么不能直接解引用: `cancel_driver` 的 ABI 形态不含 host 参数, 宿主无法
+    /// 为什么不能直接解引用: `cancel_driver` 的 ABI 形态不含 host 参数, 主程序无法
     /// 从实例反查合法句柄, 因此用一个**进程级地址注册表**兜底 —— 先按地址查表,
     /// 命中才经 weak_ptr 升级为强引用并调用 cancel; 未命中 (伪造/过期指针) 只记录
     /// 日志, 绝不解引用。表内只存 weak_ptr 且请求收束时按地址摘除, 因此内存有界,
@@ -154,7 +154,7 @@ struct PluginxxDriver : std::enable_shared_from_this<PluginxxDriver> {
                 "Plugin driver `{}` could not be queued: runtime IO executor unavailable",
                 label_
             );
-            // 入队失败等价于"宿主不再提供驱动": 立刻收束请求 (释放 lease)。
+            // 入队失败等价于"主程序不再提供驱动": 立刻收束请求 (释放 lease)。
             uint32_t expected = kIdle;
             if (state_.compare_exchange_strong(
                     expected,
@@ -186,7 +186,7 @@ private:
 
     PluginxxDriver() = default;
 
-    /// 请求地址注册表 (仅宿主内部; 与 PluginHostControl 的进程级注册表同思路)。
+    /// 请求地址注册表 (仅主程序内部; 与 PluginHostControl 的进程级注册表同思路)。
     /// 只做"地址校验 + 生命周期升级", 不携带任何跨实例业务状态, 因此不违反多实例约定。
     struct HandleRegistry {
         std::mutex                                                               mutex;
@@ -239,13 +239,13 @@ private:
                 static_cast<uint32_t>(State::Running),
                 std::memory_order_acq_rel
             )) {
-            // 已被取消 (Finished): 宿主承诺不再执行回调。
+            // 已被取消 (Finished): 主程序承诺不再执行回调。
             return;
         }
         try {
             drive_(userData_);
         } catch (const std::exception& e) {
-            // 跨 C ABI 抛异常是插件违约; 宿主兜底记账, 不让异常逃出 IO 线程。
+            // 跨 C ABI 抛异常是插件违约; 主程序兜底记账, 不让异常逃出 IO 线程。
             XX_LOGE("Plugin driver `{}` callback threw: {}", label_, e.what());
         } catch (...) {
             XX_LOGE("Plugin driver `{}` callback threw unknown exception", label_);

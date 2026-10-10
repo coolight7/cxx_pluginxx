@@ -1,4 +1,4 @@
-/// pluginxx 宿主侧 ABI 辅助 (跨边界字符串转换 / 异常兜底 / io 线程同步投递)
+/// pluginxx 主程序侧 ABI 辅助 (跨边界字符串转换 / 异常兜底 / io 线程同步投递)
 ///
 /// 内容:
 /// - [svToSv] / [svToStr] / [strToSv] / [pluginStringView2std]: C ABI 字符串视图与
@@ -6,7 +6,7 @@
 /// - [guardVtableCall] / [guardVtableCallVoid]: C ABI 边界异常兜底 —— vtable 函数
 ///   内部不得让 C++ 异常逃逸 (跨边界 UB), 统一捕获转日志并按失败返回值返回;
 /// - [ioCallSync] / [ioCallSyncVoid] / [ioCallSyncKeep] / [ioCallSyncVoidKeep]:
-///   跨线程投递到宿主 io 线程并同步等待结果 (duck typing: Mgr 须提供
+///   跨线程投递到主程序 io 线程并同步等待结果 (duck typing: Mgr 须提供
 ///   `isIoThread()` / `postToIo()`)。
 ///
 /// 线程约定: 本头内非模板函数均可在任意线程调用 (纯函数); 模板函数按调用方
@@ -131,7 +131,7 @@ inline void guardVtableCallVoid(Fn&& fn) noexcept {
 /// ==================== io 线程同步投递 ====================
 
 /// 在 io 线程执行并同步等待结果 (调用方为 io 线程时直接执行)
-/// - 供 vtable 的 io 线程约束操作跨线程调用 (JS 线程/宿主线程池) 使用;
+/// - 供 vtable 的 io 线程约束操作跨线程调用 (JS 线程/主程序线程池) 使用;
 ///   调用方线程阻塞等待, io 线程为事件循环 (挂起而非忙等), 无死锁风险
 /// - Mgr 须提供 isIoThread()/postToIo(); T 为第一个显式模板参数, Mgr 推导
 template<typename T, typename Mgr>

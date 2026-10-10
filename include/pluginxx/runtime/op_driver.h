@@ -1,11 +1,11 @@
-/// pluginxx 插件统一 Operation 驱动器 (宿主内部, 非 ABI)
+/// pluginxx 插件统一 Operation 驱动器 (主程序内部, 非 ABI)
 ///
-/// 职责: 把"插件启动一个异步操作 → 宿主记账 → 完成/取消 → 唤醒等待者"这条链路
+/// 职责: 把"插件启动一个异步操作 → 主程序记账 → 完成/取消 → 唤醒等待者"这条链路
 /// 收敛到一处, 使工具/钩子/能力/图节点/后台任务与生命周期入口共用同一套完成协议。
 ///
 /// 完成协议要点 (与 ABI 契约一致):
 /// - 插件必须**恰好回调一次** `notify.done`; 同步返回且不 done 视为拒绝;
-/// - 完成通知可从任意线程发出, 由本驱动器投递回宿主 IO 线程提交终态;
+/// - 完成通知可从任意线程发出, 由本驱动器投递回主程序 IO 线程提交终态;
 /// - 取消是协作式的: `cancel()` 只请求取消, 真正的终态仍由插件 done 决定;
 /// - 每个 Operation 持有 provider/caller 实例的执行 lease, 因此卸载的 idle 等待
 ///   必然覆盖它, `dlclose` 不会越过仍在执行的插件代码。
@@ -65,9 +65,9 @@ struct PluginxxOperationCompletionEndpoint {
     }
 };
 
-/// 宿主托管的异步操作句柄 (C ABI 不透明类型; 插件只持有裸指针用于取消)
+/// 主程序托管的异步操作句柄 (C ABI 不透明类型; 插件只持有裸指针用于取消)
 ///
-/// 内存由宿主托管: 调用方 (插件) 不得释放, 也不得在操作终结后继续使用。
+/// 内存由主程序托管: 调用方 (插件) 不得释放, 也不得在操作终结后继续使用。
 /// 参数校验走进程内表 (见 [pluginxx::cancelPluginOperation]), 伪造/过期指针只被
 /// 安全忽略。
 struct PluginxxOperatorHandle : std::enable_shared_from_this<PluginxxOperatorHandle> {
@@ -154,7 +154,7 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
         try {
             std::lock_guard runtimeLock(core->runtime_->operationsMutex);
             core->runtime_->operations.emplace(core->id_, core);
-            // ABI 句柄是调用方可持有的裸指针；活动索引移除后仍保留宿主
+            // ABI 句柄是调用方可持有的裸指针；活动索引移除后仍保留主程序
             // tombstone，迟到 cancel 只会观察 completed，不访问已释放对象。
             provider->operatorHandles.push_back(core->handle_);
             provider->outstandingOps.push_back(core->handle_);
@@ -215,7 +215,7 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
         callbackUd_ = ud;
     }
 
-    /// 宿主已接受的 post/sleep/offload 可复用这个完成处理器。
+    /// 主程序已接受的 post/sleep/offload 可复用这个完成处理器。
     /// closure 仅在 IO 线程执行，并且在双方 lease 释放前销毁。
     void setCompletionHandler(std::function<void(int32_t, std::string_view)> handler) {
         completionHandler_ = std::move(handler);
@@ -267,7 +267,7 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
         return true;
     }
 
-    /// register_task 与宿主 scheduler 的异步执行没有 provider start 返回值。
+    /// register_task 与主程序 scheduler 的异步执行没有 provider start 返回值。
     void accept(std::function<void()> cancel = {}) {
         drive_.cancel = [cancel = std::move(cancel)](void*) {
             if (cancel) {
@@ -364,7 +364,7 @@ public:
         releaseRecords();
     }
 
-    /// notify 的 host_ud 只指向宿主拥有的完成端点；Operation 已回收时，
+    /// notify 的 host_ud 只指向主程序拥有的完成端点；Operation 已回收时，
     /// 迟到 done 只记录并丢弃，不访问已经失效的插件操作状态。
     static void PLUGINXX_CALL
         onEndpointDone(void* ud, int32_t status, const PluginxxStringView* payload) noexcept {
@@ -473,7 +473,7 @@ private:
         } catch (...) {
             XX_LOGW("Plugin operation `{}` completion callback threw unknown exception", label_);
         }
-        /// 外部 callback 违约抛异常不能跳过宿主完成处理器（例如 sleep 索引清理）。
+        /// 外部 callback 违约抛异常不能跳过主程序完成处理器（例如 sleep 索引清理）。
         try {
             if (completionHandler_) {
                 completionHandler_(completion_.status, completion_.payload);
@@ -610,9 +610,9 @@ inline std::string PluginRuntime::pendingOperationSummary() const {
 }
 
 /// 等待一次插件操作的工具参数
-/// - `inst` 为宿主的插件实例 (须继承 [pluginxx::PluginInstanceBase] 且已装配
+/// - `inst` 为主程序的插件实例 (须继承 [pluginxx::PluginInstanceBase] 且已装配
 ///   [pluginxx::PluginInstanceBase::runtime]);
-/// - `cancelToken` 使用统一取消抽象 [utilxx::CancelTokenPtr]: 宿主的取消源
+/// - `cancelToken` 使用统一取消抽象 [utilxx::CancelTokenPtr]: 主程序的取消源
 ///   (如图引擎取消令牌) 经适配器转换后传入。
 struct PluginOpAwaitArgs {
     std::shared_ptr<PluginInstanceBase> inst;

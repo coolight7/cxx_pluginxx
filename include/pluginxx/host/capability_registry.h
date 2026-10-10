@@ -1,14 +1,14 @@
-/// 插件能力注册表 (宿主侧, 与宿主领域无关)
+/// 插件能力注册表 (主程序侧, 与主程序业务无关)
 ///
 /// 归属: cxx_pluginxx (插件框架内核)。
 ///
 /// 定位: 插件能力的**声明册** —— 记录"能力名 → 提供者插件 + 启动/取消回调 + 回调上下文"。
 /// 能力本身是"带 JSON 载荷的 RPC"(见 pluginxx/api/tables.h 的 capabilities 表), 不携带
-/// 宿主领域语义, 因此注册表放在内核, agentxx / musicxx 等宿主共用。
+/// 主程序业务语义, 因此注册表放在内核, agentxx / musicxx 等主程序共用。
 ///
-/// 线程约定: 仅宿主 IO 线程读写 (与插件注册事务同一串行上下文)。
+/// 线程约定: 仅主程序 IO 线程读写 (与插件注册事务同一串行上下文)。
 ///
-/// - 相关: 能力调用与插件归属校验见宿主侧 `PluginManager::invokeCapabilityAsync`
+/// - 相关: 能力调用与插件归属校验见主程序侧 `PluginManager::invokeCapabilityAsync`
 #pragma once
 
 #include "pluginxx/api/tables.h"
