@@ -1,14 +1,14 @@
-/// pluginxx 框架生命周期骨架 (装载 / 启停 / 禁用启用 / 卸载 / 级联依赖)
+/// pluginxx 框架生命周期骨架 (加载 / 启停 / 禁用启用 / 卸载 / 级联依赖)
 ///
 /// 定位: 把"与主程序业务无关"的生命周期逻辑从各主程序的管理器里收敛到一处 ——
-/// 动态库装载与入口符号校验、create/start 事务、启用与禁用级联、stop 事务补齐、
+/// 动态库加载与入口符号校验、create/start 事务、启用与禁用级联、stop 事务补齐、
 /// inflight 归零等待、destroy 与动态库卸载、失败回滚与关闭超时重试。
 ///
 /// 三层结构:
 /// - [PluginHostCore] (host_core.h): 通用表 (log/json/config/plugins/events/
 ///   scheduler/coroutine_runtime/tasks/cancel/capabilities) 的状态与方法实现;
 /// - 本类的 [PluginHostLifecycle]: 在框架核心之上补齐上面那套生命周期骨架;
-/// - 主程序 (agentxx / musicxx): 领域表 + 领域注册 + 领域数据。
+/// - 主程序 (agentxx / musicxx): 业务表 + 业务注册 + 业务数据。
 ///
 /// 主程序用法:
 /// ```cpp
@@ -16,12 +16,12 @@
 ///                   public std::enable_shared_from_this<MyManager>,
 ///                   public pluginxx::DomainHooks {
 ///     // 1. 构造体内 setDomainHooks(this) (通用表取数);
-///     // 2. 覆写下方"主程序接缝"里的纯虚函数与需要的可选项;
+///     // 2. 覆写下方"主程序扩展点"里的纯虚函数与需要的可选项;
 ///     // 3. query_interface 里用 pluginxx::queryGenericPluginIface 装配通用表。
 /// };
 /// ```
 ///
-/// 线程约定: 装载/卸载是协程 (在主程序 IO executor 上运行); 其余方法除标注外
+/// 线程约定: 加载/卸载是协程 (在主程序 IO executor 上运行); 其余方法除标注外
 /// 都只在主程序 IO 线程调用。`disable`/`enable`/`shutdownAll` 为同步入口, 其中的
 /// stop/start 事务按需投递到 IO 线程执行 (调用方不必在 IO 线程)。
 #pragma once
@@ -64,8 +64,8 @@ namespace pluginxx {
 
 /// 插件加载参数 (与主程序配置类型解耦: 主程序把自己的配置字段拷进来)
 ///
-/// 背景: 各主程序的配置类型不同 (agentxx 的 `agent::PluginConfig` 等), 框架内核
-/// 不能引用它们, 因此装载入口只接收这两个真正会用到的字段。
+/// 背景: 各主程序的配置类型不同 (agentxx 的 `agent::PluginConfig` 等), 插件框架
+/// 不能引用它们, 因此加加载口只接收这两个真正会用到的字段。
 struct PluginLoadOptions {
     /// 插件配置参数 (yaml `plugins` 条目 args; 主程序原样保存, 不解析字段语义)
     utilxx_base::Json args = utilxx_base::Json::object();
@@ -73,10 +73,10 @@ struct PluginLoadOptions {
     std::string configPath;
 };
 
-/// 框架生命周期骨架: 装载 / 启停 / 禁用启用 / 卸载 / 级联依赖
+/// 框架生命周期骨架: 加载 / 启停 / 禁用启用 / 卸载 / 级联依赖
 ///
 /// - `InstanceT` 须继承 [PluginInstanceBase], 且由主程序经 [createInstance] 构造;
-/// - 主程序业务动作经"主程序接缝"(纯虚函数与可选覆写)注入, 见各类说明;
+/// - 主程序业务动作经"主程序扩展点"(纯虚函数与可选覆写)注入, 见各类说明;
 /// - 本类提供的行为与 agentxx 既有实现逐条一致 (含失败回滚、关闭超时、
 ///   停止后重试、级联依赖), 新接入的主程序无需重复实现。
 template<typename InstanceT>
@@ -117,8 +117,8 @@ public:
             co_return nullptr;
         }
 
-        // 入口符号名由主程序提供 (内核不硬编码任何主程序专名, 见 pluginxx/api/entry.h):
-        // 未提供 create 时无法装载, 直接失败并说明原因 (不去猜主程序专名)。
+        // 入口符号名由主程序提供 (插件框架不硬编码任何主程序专名, 见 pluginxx/api/entry.h):
+        // 未提供 create 时无法加载, 直接失败并说明原因 (不去猜主程序专名)。
         const PluginEntrySymbols entries = entrySymbols();
         if (!entries.valid() || !entries.lifecyclePaired()) {
             NativeLoader::close(dl);
@@ -373,7 +373,7 @@ public:
     /// 按路径加载插件 (协程): 支持目录 (读 `plugin.yaml`, 取依赖与资源声明)、
     /// `builtin://<name>` 内置简写、以及直接指向动态库的路径。
     ///
-    /// - 依赖检查先于装载: 必选依赖未加载直接失败, 可选依赖仅警告;
+    /// - 依赖检查先于加载: 必选依赖未加载直接失败, 可选依赖仅警告;
     /// - `builtin://` 且内置表未命中时回退为可执行目录/工作目录下的同名目录插件;
     /// - `allowMissingEntry=true` 时缺少本端入口符号按静默跳过处理 (另一端的插件)。
     asio::awaitable<InstancePtr> loadPluginAsync(
@@ -625,7 +625,7 @@ public:
         enableImpl(name, /*userInitiated=*/true);
     }
 
-    /// 摘除实例在主程序侧的**全部**注册 (通用登记 + 领域注册 + 实例专属资源所有权),
+    /// 摘除实例在主程序侧的**全部**注册 (通用登记 + 业务注册 + 实例专属资源所有权),
     /// 但保留实例内的注册记录 (启用时由 start 事务重新声明)。
     void detachInstanceRegistrations(InstanceT* inst) {
         if (!inst) {
@@ -635,10 +635,10 @@ public:
         detachDomainOwnedResources(inst);
     }
 
-    /// 摘除实例的注册 (通用部分) 并回调主程序摘除领域注册
+    /// 摘除实例的注册 (通用部分) 并回调主程序摘除业务注册
     ///
     /// - 通用部分: 取消未终结的 Operation、撤销事件订阅、撤销能力声明;
-    /// - 领域部分经 [detachDomainRegistrations] 交给主程序 (工具/权限/钩子/图/提示词等)。
+    /// - 业务部分经 [detachDomainRegistrations] 交给主程序 (工具/权限/钩子/图/提示词等)。
     void detachAll(InstanceT* inst) {
         if (!inst) {
             return;
@@ -653,7 +653,7 @@ public:
             }
         }
 
-        // 事件订阅登记与能力声明由框架核心按通用表登记撤销 (内核侧实现)
+        // 事件订阅登记与能力声明由框架核心按通用表登记撤销 (插件框架侧实现)
         this->revokeInstanceSubscriptions(inst);
         this->unregisterInstanceCapabilities(inst);
 
@@ -815,17 +815,17 @@ public:
 protected:
 
     // =====================================================================
-    // 主程序接缝 (主程序必须实现的纯虚函数)
+    // 主程序扩展点 (主程序必须实现的纯虚函数)
     // =====================================================================
 
     /// 管理器自身的强引用 (派生类直接返回 `shared_from_this()`)
     ///
     /// 为什么需要它: 停用/启用事务与空闲收尾是异步的，需要在此期间保活管理器;
-    /// 框架内核不能自己继承 `enable_shared_from_this` —— 与主程序管理器的
+    /// 插件框架不能自己继承 `enable_shared_from_this` —— 与主程序管理器的
     /// `enable_shared_from_this<ManagerT>` 会形成多基类歧义 (`weak_this` 都不被初始化)。
     virtual std::shared_ptr<PluginHostLifecycle<InstanceT>> selfRef() = 0;
 
-    /// 生成领域实例对象 (只做 `make_shared<MyInstance>(name)` 与领域自引用设置)
+    /// 生成业务实例对象 (只做 `make_shared<MyInstance>(name)` 与业务自引用设置)
     ///
     /// 基类随后会补齐: 基类自引用 (`ownerSelf`)、版本/描述/路径、生命周期入口、
     /// 生命周期控制块 ([InstanceLifetime]) 与交给自己插件的 host 控制块。
@@ -836,7 +836,7 @@ protected:
 
     /// 本主程序使用的插件入口符号名 (dlsym/LoadLibrary 查找用)
     ///
-    /// - 符号名属于主程序命名空间, 内核不提供默认值: 未覆写时装载直接失败
+    /// - 符号名属于主程序命名空间, 插件框架不提供默认值: 未覆写时加载直接失败
     ///   (错误信息说明主程序未提供入口符号名), 不会静默尝试主程序专名;
     /// - 必须与插件侧导出宏使用的前缀一致 (`PLUGINXX_EXPORT_PLUGIN(SymbolPrefix, ...)`);
     /// - `destroy` 不在此列: 它由实例类的 [InstanceT::pluginDestroySymbol] 给出。
@@ -845,7 +845,7 @@ protected:
     }
 
     // =====================================================================
-    // 主程序接缝 (可选覆写)
+    // 主程序扩展点 (可选覆写)
     // =====================================================================
 
     /// 同进程可能同时存在多个主程序 (如 client + agent), 日志前缀用于区分
@@ -853,7 +853,7 @@ protected:
         return {};
     }
 
-    /// 摘除实例的**领域**注册 (工具/权限/钩子/图节点/提示词贡献 等)
+    /// 摘除实例的**业务**注册 (工具/权限/钩子/图节点/提示词贡献 等)
     /// - 调用时机: 禁用与卸载; 只摘除主程序侧生效的注册, 保留实例内的注册记录
     virtual void detachDomainRegistrations(InstanceT* inst) {
         (void)inst;
@@ -865,7 +865,7 @@ protected:
         (void)inst;
     }
 
-    /// 清空"由插件 start 事务重新声明"的**领域**注册记录 (工具名/权限/hook/图)
+    /// 清空"由插件 start 事务重新声明"的**业务**注册记录 (工具名/权限/hook/图)
     /// - 调用时机: stop 成功后; 使下次 start 从干净状态重新声明
     virtual void clearDomainRegistrations(InstanceT* inst) {
         (void)inst;
@@ -910,7 +910,7 @@ protected:
     // 内部实现
     // =====================================================================
 
-    /// 装载选项落到实例字段 (args / configPath)
+    /// 加载选项落到实例字段 (args / configPath)
     void applyLoadOptions(InstanceT& inst, const PluginLoadOptions* options) {
         if (options) {
             inst.args       = options->args;
@@ -918,7 +918,7 @@ protected:
         }
     }
 
-    /// 装配实例的通用部分 (主程序的自定义装载路径也应调用它)
+    /// 装配实例的通用部分 (主程序的自定义加载路径也应调用它)
     ///
     /// - 生命周期入口 (start/stop);
     /// - 基类自引用: 通用表实现与完成回调只依赖 `ownerSelf` (不依赖管理器类型);

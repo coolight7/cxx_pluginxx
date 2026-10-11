@@ -1,7 +1,7 @@
-/// pluginxx 动态库装载封装 (主程序侧, 与主程序业务无关)
+/// pluginxx 动态库加载封装 (主程序侧, 与主程序业务无关)
 ///
-/// 背景: 插件以动态库形式分发, 装载需要跨平台的 dlopen/LoadLibrary 封装。
-/// 提取到框架内核后 agentxx / musicxx 等主程序共用同一实现, 避免平台细节漂移。
+/// 背景: 插件以动态库形式分发, 加载需要跨平台的 dlopen/LoadLibrary 封装。
+/// 提取到插件框架后 agentxx / musicxx 等主程序共用同一实现, 避免平台细节漂移。
 ///
 /// 使用约定:
 /// - [NativeLoader::open] 一律使用 **RTLD_NOW | RTLD_LOCAL / LoadLibraryW**:
@@ -18,7 +18,7 @@
 
 namespace pluginxx {
 
-/// 动态库装载/符号查找/卸载 (跨平台: dlopen / LoadLibraryW)
+/// 动态库加载/符号查找/卸载 (跨平台: dlopen / LoadLibraryW)
 struct PLUGINXX_API NativeLoader {
     /// 打开动态库; 失败返回 nullptr 并在 err 输出原因
     static void* open(const std::string& path, std::string& err);

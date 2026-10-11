@@ -142,7 +142,7 @@ public:
     }
 
     /// 是否仍有未安全关闭的实例 (stop 未完成 / lease 未归零 / destroy 未执行)。
-    /// 用于 owner 在停止 executor、销毁 agent 或进程退出前自检关闭链路是否走完。
+    /// 用于 owner 在停止 executor、销毁 agent 或进程退出前自检关闭流程是否走完。
     bool hasPendingClose() const {
         for (const auto& [name, inst] : plugins_) {
             (void)name;
@@ -355,7 +355,7 @@ protected:
     /// 一并写入实例 ([PluginInstanceBase::runtime])。
     ///
     /// 运行时经弱引用登记, 使 Operation 驱动器与驱动请求无需回查管理器类型即可
-    /// 拿到 io executor 与线程标识 (框架内核因此不依赖主程序的管理器具体类型)。
+    /// 拿到 io executor 与线程标识 (插件框架因此不依赖主程序的管理器具体类型)。
     std::shared_ptr<pluginxx::InstanceLifetime>
         makeLifetime(const std::shared_ptr<PluginInstanceBase>& inst) {
         if (inst) {

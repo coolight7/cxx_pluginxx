@@ -1,7 +1,7 @@
 /// pluginxx 插件清单与名称推导实现 (见 pluginxx/host/manifest.h)
 ///
 /// 原实现位于 libagentxx 的 plugin_common.cpp: 因 agent 侧与 client 侧插件主程序
-/// 共用同一套清单解析/名称推导/入口路径解析, 提取到框架内核, 避免两侧行为漂移。
+/// 共用同一套清单解析/名称推导/入口路径解析, 提取到插件框架, 避免两侧行为漂移。
 #include "pluginxx/host/manifest.h"
 
 #include "pluginxx/api/abi.h"

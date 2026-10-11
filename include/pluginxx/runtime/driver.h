@@ -1,4 +1,4 @@
-/// pluginxx 主程序侧协程驱动请求 (pluginxx.coroutine_runtime 接口表的实现载体)
+/// pluginxx 主程序侧协程驱动请求 (pluginxx.coroutine_runtime 接口表的实现)
 ///
 /// 背景: 插件协程要与主程序协程在同一主程序 IO 执行序列中交错推进, 但插件可以用任意
 /// 协程库/事件循环, 主程序也绝不能把插件私有 reactor 接进自己的执行序列。因此两端

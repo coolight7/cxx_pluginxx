@@ -44,7 +44,7 @@ inline std::string parseBuiltinName(std::string_view p) {
 /// 内置插件清单提供者: 由"把插件合并编译进自身二进制"的主程序注册
 ///
 /// 背景: 内置插件表由主程序经 `configure_file` 生成 (见 agentxx 的
-/// `plugins/builtin_plugins.cpp.in`), 其符号不属于框架内核。框架内核因此不直接
+/// `plugins/builtin_plugins.cpp.in`), 其符号不属于插件框架。插件框架因此不直接
 /// 引用主程序符号, 改由主程序在启动早期把提供者注册进来; 未注册时视为"无内置插件"
 /// (返回 0 项), 纯动态库主程序无需注册。
 struct BuiltinPluginProvider {

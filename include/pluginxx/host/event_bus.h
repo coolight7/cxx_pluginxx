@@ -60,7 +60,7 @@ public:
 
 /// 事件订阅句柄的实现体 (C ABI 不透明句柄 `PluginxxSubscription*` 的实际类型)。
 ///
-/// 归属 cxx_pluginxx: 事件表是通用表, 句柄字段因此只依赖内核类型。
+/// 归属 cxx_pluginxx: 事件表是通用表, 句柄字段因此只依赖插件框架类型。
 struct PluginxxSubscription {
     /// 事件后端 (被本句柄持有, 保证撤销动作执行时后端仍然有效)
     std::shared_ptr<pluginxx::EventSource> source;

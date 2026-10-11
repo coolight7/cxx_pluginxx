@@ -311,7 +311,7 @@ public:
     /// 由管理器在装配 [lifetime] 时一并写入 (见 [PluginManagerBase::makeLifetime]);
     /// 弱引用是因为运行时由管理器持有且比实例长命, 实例不应延长其生命周期。
     /// Operation 驱动器与驱动请求据此拿到 io executor 与线程标识, 无需回查管理器
-    /// 具体类型 (框架内核因此不依赖主程序的管理器类型)。
+    /// 具体类型 (插件框架因此不依赖主程序的管理器类型)。
     std::weak_ptr<PluginRuntime> runtime;
 
     /// 框架控制块：交给插件的 `PluginxxHost` 视图保存在控制块内（进程级

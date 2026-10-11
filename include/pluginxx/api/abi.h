@@ -1,4 +1,4 @@
-/// pluginxx 纯 C ABI 基座 (与主程序业务无关的跨边界契约)
+/// pluginxx 纯 C ABI 契约 (插件框架的跨边界部分; 与主程序业务无关)
 ///
 /// 内容:
 /// - 导出符号控制 (`PLUGINXX_EXPORT`) 与调用约定 (`PLUGINXX_CALL`)
@@ -10,8 +10,8 @@
 ///   (入口**符号名**由主程序提供, 见 `pluginxx/api/entry.h`)
 ///
 /// 契约稳定性: 本头中的 **C 符号名 / 结构体名 / 宏名 / IID 字符串一律冻结**,
-/// 改动即破坏已编译的插件二进制。领域接口表 (工具/权限/钩子/会话/模型/提示词/
-/// 资源/图 等与主程序业务相关的表) 由主程序自行定义; 本头只承载与领域无关的通用部分。
+/// 改动即破坏已编译的插件二进制。业务接口表 (工具/权限/钩子/会话/模型/提示词/
+/// 资源/图 等与主程序业务相关的表) 由主程序自行定义; 本头只包含与业务无关的通用部分。
 #ifndef PLUGINXX_API_ABI_H
 #define PLUGINXX_API_ABI_H
 
@@ -212,7 +212,7 @@ typedef void*(PLUGINXX_CALL* PluginxxStopFn)(
 
 /* ==================== 插件入口符号名 (由主程序定义, 见 pluginxx/api/entry.h) ==================== */
 
-/// 内核**不**定义入口符号名常量: 符号名属于主程序命名空间 (agentxx 用
+/// 插件框架**不**定义入口符号名常量: 符号名属于主程序命名空间 (agentxx 用
 /// `agentxx_plugin_agent_*` / `agentxx_plugin_client_*`, musicxx 用 `musicxx_plugin_*`)。
 /// - 主程序侧: 覆写 `pluginxx::PluginHostLifecycle::entrySymbols()` 交出符号名;
 /// - 插件侧: 用 `PLUGINXX_EXPORT_PLUGIN(SymbolPrefix, ...)` (见 kit.h) 生成入口。
@@ -236,8 +236,8 @@ typedef struct PluginxxBuiltinManifest {
 /* ==================== 内置插件清单 (主程序提供) ==================== */
 
 /// 内置插件 (合并编译进主程序二进制的插件) 的描述数组与内嵌清单数组由**主程序**定义,
-/// 并在启动早期经 `pluginxx::setBuiltinPluginProvider` 注册给内核
-/// (见 `pluginxx/host/manifest.h`); 内核因此不引用任何主程序导出的符号。
+/// 并在启动早期经 `pluginxx::setBuiltinPluginProvider` 注册给插件框架
+/// (见 `pluginxx/host/manifest.h`); 插件框架因此不引用任何主程序导出的符号。
 
 #pragma pack(pop)
 

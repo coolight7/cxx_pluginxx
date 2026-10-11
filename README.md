@@ -1,11 +1,11 @@
 # cxx_pluginxx
 
-插件框架内核 (纯 C ABI 基座 + 通用接口表 + 插件运行时 + 插件 SDK 核心)。
+插件框架 (纯 C ABI 契约 + 通用接口表 + 插件运行时 + 插件 SDK 核心)。
 
 ## 定位
 
-- **用途**: 与主程序业务无关的插件框架 —— 动态库装载、生命周期 (create/start/stop/destroy)、
-  清单与依赖拓扑、接口表查询、协程驱动、取消与卸载 (> 通用接口表实现见下)
+- **用途**: 与主程序业务无关的插件框架 —— 动态库加载、生命周期 (create/start/stop/destroy)、
+  清单与依赖顺序、接口表查询、协程驱动、取消与卸载 (> 通用接口表实现见下)
 - **主程序业务内容不在此**: 各主程序自身的业务工具/权限/钩子/会话/UI/事件/自身信息等, 均由主程序自行定义与实现
 - **依赖**: `cxx_utilxx_base` (取消令牌/日志/JSON)、fmt、Boost (仅头文件, 不链接 Boost 编译库)
   —— **禁止**依赖 neograph / OpenSSL / SQLite / 任何主程序业务头文件
@@ -23,7 +23,7 @@
 
 ```
 include/pluginxx/
-  api/    abi.h    纯 C ABI 基座 (导出宏/调用约定/版本/对齐/StringView/String/
+  api/    abi.h    纯 C ABI 契约 (导出宏/调用约定/版本/对齐/StringView/String/
                    Info/统一操作原语/事件订阅前向声明/主程序 vtable/入口符号名/
                    内置合并描述) —— 与主程序业务无关
           tables.h 通用接口表 (log/json/config/plugins/events/capabilities/
@@ -39,11 +39,11 @@ include/pluginxx/
           abi_util.h (C 串转换/异常兜底/io 线程同步投递)、
           capability_registry.h (能力注册表: 能力名 → 提供者插件 + 启动/取消回调)、
           event_bus.h (事件后端抽象 EventSource + 订阅句柄 PluginxxSubscription)、
-          domain_hooks.h (领域钩子 DomainHooks: 通用表需要主程序数据的入口)、
+          domain_hooks.h (业务数据入口 DomainHooks: 通用表需要主程序数据的入口)、
           host_core.h (框架核心 PluginHostCore<InstanceT>: 通用表状态与方法实现)、
           tables_impl.h (十张通用表的 vtable 入口 + queryGenericPluginIface<I,M>)、
-          lifecycle.h (框架生命周期骨架 PluginHostLifecycle<InstanceT>: 装载/启停/
-                   禁用启用/卸载/级联依赖; 主程序经少量接缝注入业务动作)
+          lifecycle.h (框架生命周期骨架 PluginHostLifecycle<InstanceT>: 加载/启停/
+                   禁用启用/卸载/级联依赖; 主程序经少量扩展点注入业务动作)
 src/      对应实现 (version.cpp / loader.cpp / manifest.cpp / capability_registry.cpp /
           api_abi_check.c C 兼容与对齐校验)
 ```
@@ -62,21 +62,21 @@ public:
     MyManager(asio::any_io_executor ex) : PluginHostLifecycle<MyInstance>(ex) { setDomainHooks(this); }
     // DomainHooks: 事件后端 / 工作线程池 / 配置 JSON / 语言 / 会话工作目录 / 取消状态 / 插件清单
 protected:
-    // 生命周期接缝 (纯虚): 管理器自引用 / 生成领域实例 / 交给自己插件的 vtable
+    // 生命周期扩展点 (纯虚): 管理器自引用 / 生成业务实例 / 交给自己插件的 vtable
     std::shared_ptr<pluginxx::PluginHostLifecycle<MyInstance>> selfRef() override;
     std::shared_ptr<MyInstance> createInstance(std::string name) override;
     const PluginxxHostVtable*    hostVtable() override;
-    // 生命周期接缝 (可选): 领域注册摘除与清空 / 清单资源应用与释放 / 启停状态通知 /
-    // 装载卸载收尾 / 卸载级联定义 / 日志前缀
+    // 生命周期扩展点 (可选): 业务注册摘除与清空 / 清单资源应用与释放 / 启停状态通知 /
+    // 加载卸载收尾 / 卸载级联定义 / 日志前缀
     void detachDomainRegistrations(MyInstance* inst) override;
 };
 ```
 
 - **通用表 (定义与实现都在本库)**: log / json / config / plugins / events / scheduler /
   coroutine_runtime / tasks / cancel / capabilities —— 主程序经 `DomainHooks` 提供业务数据；
-- **生命周期骨架 (在本库)**: 动态库装载与入口校验、create/start 事务、启用与禁用级联、
+- **生命周期骨架 (在本库)**: 动态库加载与入口校验、create/start 事务、启用与禁用级联、
   stop 事务补齐、inflight 归零等待、destroy 与动态库卸载、失败回滚、关闭超时重试；
-  主程序只提供少量接缝 (见上)，因此新接入的主程序不必重写这套纪律；
+  主程序只提供少量扩展点 (见上)，因此新接入的主程序不必重写这套纪律；
 - **业务表 (主程序自己实现)**: agentxx 的 tools/permission/hooks/session/model/prompt/
   resources/graph 与 client 侧的 ui/events/session/wire/self 表；
 - `query_interface` 里先调 `pluginxx::queryGenericPluginIface<InstanceT, ManagerT>(iid)`
@@ -84,11 +84,11 @@ protected:
 
 > 已实现: `api/` 两个纯 C 头、`kit/` (插件 SDK 通用部分 + 边界守卫)、
 > `runtime/` (实例状态机/执行 lease/协程驱动/Operation 驱动器/管理器基类)、
-> `host/` (装载/清单/ABI 辅助/能力注册表/事件后端/领域钩子/框架核心/通用表入口/
+> `host/` (加载/清单/ABI 辅助/能力注册表/事件后端/业务数据入口/框架核心/通用表入口/
 > 生命周期骨架) —— agentxx 侧的 `agentxx/plugin/api/plugin_kit.h` 与 `plugin_guard.h`
-> 作为 umbrella 引用它们 + 各自的领域 helper (工具/钩子/图节点/权限/client UI)，
+> 作为 umbrella 引用它们 + 各自的业务 helper (工具/钩子/图节点/权限/client UI)，
 > 插件源码无需改动; agent 侧 `PluginManager` 与 client 侧 `ClientPluginManager`
-> 都已接入 `PluginHostLifecycle` (client 侧仅"装载"保留自己的实现，因为 dlopen 卸载到
+> 都已接入 `PluginHostLifecycle` (client 侧仅"加载"保留自己的实现，因为 dlopen 卸载到
 > 内部线程池、接口协商限制与双端入口探测属 client 特有语义)。
 
 业务表归属 (由主程序定义与实现):

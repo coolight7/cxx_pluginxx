@@ -7,7 +7,7 @@
 ///     ...
 ///     if (n == "__vtable") return &hostVtable();
 ///     if (const void* t = pluginxx::queryGenericPluginIface<MyInstance, MyManager>(n)) return t;
-///     // 领域表 (tools / permission / hooks / session / model / prompt / resources / graph)
+///     // 业务表 (tools / permission / hooks / session / model / prompt / resources / graph)
 ///     ...
 /// }
 /// ```
@@ -15,7 +15,7 @@
 /// 覆盖 10 张通用表: log / json / config / plugins / events / scheduler /
 /// coroutine_runtime / tasks / cancel / capabilities。入口体只做三件事:
 /// 解析框架控制块 (取实例/管理器 + admission lease) → 投递到 IO 线程 → 调用
-/// [PluginHostCore] 的同名方法; 领域数据一律由 [DomainHooks] 提供。
+/// [PluginHostCore] 的同名方法; 业务数据一律由 [DomainHooks] 提供。
 ///
 /// 线程约定: 入口可在任意线程调用 (内部投递并同步等待); 表结构体首次查询时构造,
 /// 之后只读, 因此可安全被多个插件线程并发查询。
@@ -974,7 +974,7 @@ struct GenericTableEntries {
     }
 };
 
-/// 按 IID 查询**通用表** (未命中返回 nullptr, 主程序继续查自己的领域表)
+/// 按 IID 查询**通用表** (未命中返回 nullptr, 主程序继续查自己的业务表)
 /// - 覆盖 10 张通用表; IID 为编译期常量字符串, 比较用 string_view (不构造临时串)
 template<typename InstanceT, typename ManagerT>
 const void* queryGenericPluginIface(std::string_view iid) {

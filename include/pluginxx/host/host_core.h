@@ -6,7 +6,7 @@
 /// 1. 管理器继承本类 (`class MyManager : public pluginxx::PluginHostCore<MyInstance>`);
 /// 2. 实现 [DomainHooks] 并调用 [PluginHostCore::setDomainHooks];
 /// 3. 用 `pluginxx/host/tables_impl.h` 的 `queryGenericPluginIface` 装配 vtable 的
-///    `query_interface` (通用表由内核提供, 领域表由主程序自己提供)。
+///    `query_interface` (通用表由插件框架提供, 业务表由主程序自己提供)。
 ///
 /// 归属判据: 通用 = 与"会话/模型/工具/提示词/图"无关的表; 需要主程序语义的数据一律
 /// 经 [DomainHooks] 取, 因此本头不包含任何主程序类型。
@@ -81,7 +81,7 @@ inline void upsertEntry(std::vector<Entry>& entries, const Key& key, Entry&& ent
 /// 框架核心: 通用表的状态与实现
 ///
 /// - `InstanceT` 须继承 [pluginxx::PluginInstanceBase] (通用表的实例登记表在基类上);
-/// - 派生主程序负责领域部分: 领域表的 vtable 入口、加载/卸载/启停事务、领域注册表。
+/// - 派生主程序负责业务部分: 业务表的 vtable 入口、加载/卸载/启停事务、业务注册表。
 template<typename InstanceT>
 class PluginHostCore : public PluginManagerBase<InstanceT> {
 public:
@@ -92,7 +92,7 @@ public:
     explicit PluginHostCore(asio::any_io_executor ex = {}) :
         Base(std::move(ex)) {}
 
-    /// 注入领域钩子
+    /// 注入业务数据入口
     /// - 主程序管理器实现 [DomainHooks] 后在构造函数体内调用
     ///   (`this->setDomainHooks(this)`), 必须在任何通用表入口被调用之前完成
     void setDomainHooks(DomainHooks* hooks) noexcept {

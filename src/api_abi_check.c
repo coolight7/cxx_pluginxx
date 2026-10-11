@@ -22,12 +22,12 @@ _Static_assert(
     "PluginxxStringView::size 必须是 8 字节定长类型"
 );
 
-/* 入口符号名由宿主提供 (内核不定义宿主专名, 见 pluginxx/api/entry.h):
-   这里不再校验具体符号名, 改为在 C++ 侧校验宿主接缝 (entrySymbols) 的语义 */
+/* 入口符号名由主程序提供 (内核不定义主程序专名, 见 pluginxx/api/entry.h):
+   这里不再校验具体符号名, 改为在 C++ 侧校验主程序扩展点 (entrySymbols) 的语义 */
 
 const char* pluginxx_api_abi_probe(void);
 
-/// 返回宿主日志表的 IID (证明通用表声明在本 TU 可见且可用于 C)
+/// 返回主程序日志表的 IID (证明通用表声明在本 TU 可见且可用于 C)
 const char* pluginxx_api_abi_probe(void) {
     return PLUGINXX_IFACE_LOG;
 }

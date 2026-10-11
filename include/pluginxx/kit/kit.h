@@ -1,6 +1,6 @@
 /// 插件开发 SDK —— 通用部分 (C++ header-only, 与主程序业务无关)
 ///
-/// 归属: cxx_pluginxx (插件框架内核)。本头只提供**领域无关**的插件侧能力:
+/// 归属: cxx_pluginxx (插件框架)。本头只提供**业务无关**的插件侧能力:
 /// - [PluginStringView] / [PluginString]: 跨边界 ABI 字符串便捷工具与主程序堆字符串 RAII
 /// - [queryInterface] / [PluginIfaceCore]: 通用接口表 (log / json / config / plugins /
 ///   events / capabilities / scheduler / coroutine_runtime / tasks / cancel) 查询
@@ -10,7 +10,7 @@
 /// - [Task] 锚定协程与完成协议; 锚定原语 [sleep] / [yield] / [offload] / [invoke_cap];
 ///   后台协作任务 [spawn]; 能力注册 [capability]
 /// - [ArgReader]: 强类型参数提取器
-/// - [PluginBaseT]: 插件实例上下文基类 (领域表由主程序侧派生基类补齐)
+/// - [PluginBaseT]: 插件实例上下文基类 (业务表由主程序侧派生基类补齐)
 /// - 导出宏 PLUGINXX_EXPORT_PLUGIN / PLUGINXX_EXPORT_PLUGIN_LIFECYCLE
 ///   (入口符号前缀由主程序给出; 主程序侧再包一层自己的导出宏)
 ///
@@ -409,7 +409,7 @@ const Iface* queryInterface(const PluginxxHost* host, const char* iid) noexcept 
 
 /// 通用接口表聚合 (与主程序业务无关的十个表; 成员为 NULL 表示主程序未实现该接口)
 ///
-/// 领域表 (工具 / 权限 / 钩子 / 会话 / 模型 / 提示词 / 资源 / 图, 以及 client 侧 UI)
+/// 业务表 (工具 / 权限 / 钩子 / 会话 / 模型 / 提示词 / 资源 / 图, 以及 client 侧 UI)
 /// 由主程序在自己的聚合体中补充: agentxx 侧的 `AgentIfaces` 是本聚合
 /// 的超集, 可直接作为 [PluginBaseT] 的模板实参。
 struct PluginIfaceCore {
@@ -913,7 +913,7 @@ public:
     static constexpr int kNoProgressWarnStreak = 8;
 
     /// ---- 受控轮询 (pump) 参数: 只作用于声明式 `polled_tool` 的根 ----
-    /// 无进展时的退避量子 (ms): 等待内核就绪期间约 100 次/秒驱动,
+    /// 无进展时的退避量子 (ms): 等待插件框架就绪期间约 100 次/秒驱动,
     /// 每次 ≈1 个主程序 post + 1 次 `epoll_wait(0)`, 空闲时不产生任何驱动。
     static constexpr int64_t kPollIntervalMs = 10;
     /// 连续"有进展"多少步后强制让出一次 (给主程序其它任务与同实例其它操作机会),
@@ -1392,7 +1392,7 @@ private:
             logError("plugin local runtime step threw unknown exception");
         }
 
-        // 受控轮询期间"本轮无进展"是常态 (等待内核就绪 / 退避), 不算异常; 因此
+        // 受控轮询期间"本轮无进展"是常态 (等待插件框架就绪 / 退避), 不算异常; 因此
         // 警告只在"既没有 polled 操作在轮询、又持续空转且仍有活跃根"时出现 ——
         // 那正是"插件依赖私有 reactor 却没有声明 polled"的误用信号。
         const bool pumping = polledRoots_.load(std::memory_order_acquire) > 0;
@@ -2854,8 +2854,8 @@ inline void spawn(Ctx& ctx, Fn&& fn) {
 ///   language / setLanguage / sessionCancelled / jsonEscape / jsonGetString /
 ///   主程序堆字符串 (strdup / createString / createPluginString) / 后台任务 spawn;
 /// - 协程驱动桥 (见 [bridge]) 让插件协程与主程序协程在同一 IO 执行序列中交错推进;
-/// - 领域能力由主程序侧派生基类补齐: 派生类既可在 `IfacesT` 中带领域表, 也可覆写
-///   [onHostReady] 挂钩领域初始化 (见 agentxx 侧的 `PluginBase`)。
+/// - 业务能力由主程序侧派生基类补齐: 派生类既可在 `IfacesT` 中带业务表, 也可覆写
+///   [onHostReady] 挂钩业务初始化 (见 agentxx 侧的 `PluginBase`)。
 template<typename IfacesT>
 class PluginBaseT {
 public:
@@ -2910,7 +2910,7 @@ public:
         log.logIface = iface.log;
         log.logFn    = (iface.log && iface.log->log) ? iface.log->log : nullptr;
 
-        // 领域挂钩: 由主程序侧派生基类补齐 (agentxx 侧在此订阅会话轮次开始事件)
+        // 业务挂钩: 由主程序侧派生基类补齐 (agentxx 侧在此订阅会话轮次开始事件)
         onHostReady();
     }
 
@@ -3143,7 +3143,7 @@ public:
 
 protected:
 
-    /// 领域挂钩: [init] 末尾调用, 由主程序侧派生基类补齐领域初始化
+    /// 业务挂钩: [init] 末尾调用, 由主程序侧派生基类补齐业务初始化
     /// (agentxx 侧在此订阅会话轮次开始事件, 用于重置会话级取消登记)
     virtual void onHostReady() {}
 
@@ -3829,7 +3829,7 @@ inline void logCreateFailure(
 
 /// 入口符号名拼接: `PLUGINXX_ENTRY_SYMBOL(musicxx_plugin_, create)` → `musicxx_plugin_create`
 ///
-/// 符号前缀由主程序给出 (内核不含任何主程序专名); 主程序在自己的 SDK 头里用它包出对插件作者
+/// 符号前缀由主程序给出 (插件框架不含任何主程序专名); 主程序在自己的 SDK 头里用它包出对插件作者
 /// 友好的导出宏 (agentxx 的 `AGENTXX_PLUGIN_AGENT_EXPORT`、musicxx 的 `MUSICXX_PLUGIN_EXPORT`)。
 #define PLUGINXX_ENTRY_SYMBOL_JOIN__(Prefix, Suffix) Prefix##Suffix
 #define PLUGINXX_ENTRY_SYMBOL_JOIN_(Prefix, Suffix)  PLUGINXX_ENTRY_SYMBOL_JOIN__(Prefix, Suffix)
@@ -3839,7 +3839,7 @@ inline void logCreateFailure(
 ///
 /// `SymbolPrefix` 是主程序命名空间前缀, 例如 agentxx 的 `agentxx_plugin_agent_`、
 /// musicxx 的 `musicxx_plugin_`; 运行时主程序必须经 `entrySymbols()` 交出同一批符号名
-/// (见 `pluginxx/api/entry.h`), 两侧不一致时装载失败。
+/// (见 `pluginxx/api/entry.h`), 两侧不一致时加载失败。
 ///
 /// 主程序按以下顺序调用, 插件必须遵守 (见 docs/zh-cn/design/plugins.md):
 /// - `create`: 只构造上下文 (`new CtxType` + `init(host)`), 不注册任何工具/钩子/能力/

@@ -1,4 +1,4 @@
-/// pluginxx 动态库装载封装实现 (见 pluginxx/host/loader.h)
+/// pluginxx 动态库加载封装实现 (见 pluginxx/host/loader.h)
 #include "pluginxx/host/loader.h"
 
 #include "fmt/format.h"

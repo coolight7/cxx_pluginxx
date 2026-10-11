@@ -1,4 +1,4 @@
-/// pluginxx 主程序业务钩子 (通用表实现的取数入口)
+/// pluginxx 主程序业务数据入口 (通用表实现的取数入口)
 ///
 /// 定位: 通用表 (**与会话/模型/工具/提示词/图无关**的表) 的实现位于 cxx_pluginxx,
 /// 但其中少数入口需要主程序数据 (配置内容 / 语言 / 会话工作目录 / 会话取消状态 /
@@ -21,7 +21,7 @@
 
 namespace pluginxx {
 
-/// 主程序业务钩子 (纯虚接口部分为必需项; 带默认实现的为可选项)
+/// 主程序业务数据入口 (纯虚接口部分为必需项; 带默认实现的为可选项)
 class DomainHooks {
 public:
 
@@ -48,7 +48,7 @@ public:
 
     // ==================== config 表 ====================
 
-    /// 主程序配置 JSON (`get_config` 的领域部分, 如 dataDir / projectRoot / platform)
+    /// 主程序配置 JSON (`get_config` 的业务部分, 如 dataDir / projectRoot / platform)
     virtual std::string configJson() = 0;
 
     /// 指定工具的提示词配置 JSON (`get_tool_prompt`; 不存在返回空串)
