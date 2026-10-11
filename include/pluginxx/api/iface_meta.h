@@ -37,17 +37,23 @@ struct IfaceMeta {
     static constexpr uint32_t baseline_size = static_cast<uint32_t>(sizeof(Iface));
 };
 
-/// 某个成员在结构体中的结束偏移 (成员偏移 + 成员大小)
+/// 取某个成员的结束偏移 (成员偏移 + 成员大小)
 ///
 /// 实现说明: `offsetof` 只接受成员名字, 拿不到"成员指针"这类模板参数, 因此这里用
 /// 一个值初始化的探针对象取两个地址相减。不在常量表达式里求值 (取地址不是常量表达式),
 /// 调用点无需关心; 每次只构造一个零初始化的表对象 (几十到几百字节), 调用频率极低。
-template<auto Member, typename Spec>
-inline uint32_t memberEndOffset() noexcept {
+template<typename Spec, typename M>
+inline uint32_t memberEndOf(M Spec::* member) noexcept {
     const Spec  probe{};
     const char* base  = reinterpret_cast<const char*>(&probe);
-    const char* field = reinterpret_cast<const char*>(&(probe.*Member));
-    return static_cast<uint32_t>(field - base) + static_cast<uint32_t>(sizeof(probe.*Member));
+    const char* field = reinterpret_cast<const char*>(&(probe.*member));
+    return static_cast<uint32_t>(field - base) + static_cast<uint32_t>(sizeof(probe.*member));
+}
+
+/// [memberEndOf] 的模板参数形态 (`Spec` 由调用点显式给出)
+template<auto Member, typename Spec>
+inline uint32_t memberEndOffset() noexcept {
+    return memberEndOf(Member);
 }
 
 /// 追加成员可用性: 对方给的表长是否覆盖该成员
