@@ -22,7 +22,7 @@ _Static_assert(
     "PluginxxStringView::size 必须是 8 字节定长类型"
 );
 
-/* 入口符号名由主程序提供 (内核不定义主程序专名, 见 pluginxx/api/entry.h):
+/* 入口符号名由主程序提供 (插件框架不定义主程序专名, 见 pluginxx/api/entry.h):
    这里不再校验具体符号名, 改为在 C++ 侧校验主程序扩展点 (entrySymbols) 的语义 */
 
 const char* pluginxx_api_abi_probe(void);
