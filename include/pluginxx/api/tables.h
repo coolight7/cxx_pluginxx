@@ -8,6 +8,32 @@
 /// 侧 UI/事件/会话/线路) 的表由主程序定义与实现。
 ///
 /// 契约稳定性: 全部 C 名、结构体名、IID 字符串冻结 (见 abi.h 说明)。
+///
+/// ════════════════════════════════════════════════════════════════════
+/// 接口表的版本与布局规则 (本头每张表都适用)
+/// ════════════════════════════════════════════════════════════════════
+/// 每张表四项齐全 (缺一不可):
+/// - **IID** (`PLUGINXX_IFACE_<名>`): `query_interface` 的键; 换契约 = 换 IID;
+/// - **`version`** 字段 + `_VERSION`: 本头描述的完整布局与语义级别; 追加成员或
+///   语义变化时 +1; 纯注释变化不动;
+/// - **`_MIN_VERSION`**: 本头编写的代码能与之协同工作的最低表版本; 只有"同一 IID
+///   内不再兼容旧布局/旧语义"时才 +1 (会拒掉老主程序, 优先换 IID);
+/// - **`_BASELINE_SIZE`**: 表头之后**所有提供本表的主程序都应具备**的字节数;
+///   重置时 = `sizeof(表)`, 以后追加成员时保持不变 (值改为第一个追加成员的偏移)。
+///
+/// 判定规则:
+/// - 整表可用 = IID 命中 且 `version >= _MIN_VERSION` 且 `struct_size >= _BASELINE_SIZE`;
+/// - 某成员可用 = 整表可用 且 (基线以内的成员自动可用; 追加段成员用
+///   `pluginxx::ifaceHas<&表::成员>(t)` 判定, 见 `pluginxx/api/iface_meta.h`)。
+///
+/// 改动规则:
+/// - **成员只能追加在表尾**; 追加时 `_VERSION` +1、`_BASELINE_SIZE` 不变、调用点改用
+///   `ifaceHas`; 语义变化 (布局不变) 时 `_VERSION` +1 并按需用 `ifaceHasVersion` 判定;
+/// - **禁止**重排成员、改成员签名、删除成员 (结构体大小可能不变, 闸门挡不住, 会静默
+///   调到隔壁函数) —— 要改就换新 IID;
+/// - 用 `_MIN_VERSION` 表达"我加了新成员"是错的 (那等于把老主程序全部判死)。
+///
+/// 本表的当前状态: 全部为 v1 (本次一次性重置, 基线 = 完整布局, 还没有任何追加段)。
 #ifndef PLUGINXX_API_TABLES_H
 #define PLUGINXX_API_TABLES_H
 
@@ -22,11 +48,14 @@ extern "C" {
 
 /* ==================== 接口表: 事件 (pluginxx.events) ==================== */
 
-#define PLUGINXX_IFACE_EVENTS         "pluginxx.events"
-#define PLUGINXX_IFACE_EVENTS_VERSION 1
+#define PLUGINXX_IFACE_EVENTS             "pluginxx.events"
+#define PLUGINXX_IFACE_EVENTS_VERSION     1
+#define PLUGINXX_IFACE_EVENTS_MIN_VERSION 1
+/* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
+#define PLUGINXX_IFACE_EVENTS_BASELINE_SIZE sizeof(PluginxxEventsIface)
 
 typedef struct PluginxxEventsIface {
-    int32_t  version; ///< 必须 == PLUGINXX_IFACE_EVENTS_VERSION
+    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_EVENTS_VERSION
     uint32_t struct_size;
 
     PluginxxSubscription*(PLUGINXX_CALL* subscribe)(
@@ -45,11 +74,17 @@ typedef struct PluginxxEventsIface {
 
 /* ==================== 接口表: 能力 (pluginxx.capabilities) ==================== */
 
-#define PLUGINXX_IFACE_CAPABILITIES         "pluginxx.capabilities"
-#define PLUGINXX_IFACE_CAPABILITIES_VERSION 1
+#define PLUGINXX_IFACE_CAPABILITIES             "pluginxx.capabilities"
+#define PLUGINXX_IFACE_CAPABILITIES_VERSION     1
+#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 1
+/* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
+#define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE sizeof(PluginxxCapabilitiesIface)
 
+/// 成员顺序即契约 (含历史上插在中间的 register_capability_ex): 重排成员不会改变
+/// 结构体大小, `version` 与 `struct_size` 都拦不住旧调用方的静默错调 —— 禁止再动,
+/// 改签名/顺序请换 IID。
 typedef struct PluginxxCapabilitiesIface {
-    int32_t  version; ///< 必须 == PLUGINXX_IFACE_CAPABILITIES_VERSION
+    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_CAPABILITIES_VERSION
     uint32_t struct_size;
 
     int32_t(PLUGINXX_CALL* register_capability)(
@@ -86,11 +121,14 @@ typedef struct PluginxxCapabilitiesIface {
 
 /* ==================== 接口表: 任务调度 (pluginxx.scheduler) ==================== */
 
-#define PLUGINXX_IFACE_SCHEDULER         "pluginxx.scheduler"
-#define PLUGINXX_IFACE_SCHEDULER_VERSION 1
+#define PLUGINXX_IFACE_SCHEDULER             "pluginxx.scheduler"
+#define PLUGINXX_IFACE_SCHEDULER_VERSION     1
+#define PLUGINXX_IFACE_SCHEDULER_MIN_VERSION 1
+/* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
+#define PLUGINXX_IFACE_SCHEDULER_BASELINE_SIZE sizeof(PluginxxSchedulerIface)
 
 typedef struct PluginxxSchedulerIface {
-    int32_t  version; ///< 必须 == PLUGINXX_IFACE_SCHEDULER_VERSION
+    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_SCHEDULER_VERSION
     uint32_t struct_size;
 
     int32_t(PLUGINXX_CALL* is_io_thread)(const PluginxxHost* host);
@@ -144,11 +182,14 @@ typedef struct PluginxxSchedulerIface {
 ///   已 post 的 continuation), 不得在无工作时持续申请 ticket (那是隐藏轮询);
 /// - 重复 wake 由插件适配器自行合并 (同一实例同时只登记一次 ticket); 主程序另做
 ///   ticket 去重与关闭时取消作为最后防线。
-#define PLUGINXX_IFACE_COROUTINE_RUNTIME         "pluginxx.coroutine_runtime"
-#define PLUGINXX_IFACE_COROUTINE_RUNTIME_VERSION 1
+#define PLUGINXX_IFACE_COROUTINE_RUNTIME             "pluginxx.coroutine_runtime"
+#define PLUGINXX_IFACE_COROUTINE_RUNTIME_VERSION     1
+#define PLUGINXX_IFACE_COROUTINE_RUNTIME_MIN_VERSION 1
+/* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
+#define PLUGINXX_IFACE_COROUTINE_RUNTIME_BASELINE_SIZE sizeof(PluginxxCoroutineRuntimeIface)
 
 typedef struct PluginxxCoroutineRuntimeIface {
-    int32_t  version; ///< 必须 == PLUGINXX_IFACE_COROUTINE_RUNTIME_VERSION
+    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_COROUTINE_RUNTIME_VERSION
     uint32_t struct_size;
 
     /// 申请一次驱动请求 (**任意线程可调用**, 非阻塞):
@@ -176,11 +217,14 @@ typedef struct PluginxxCoroutineRuntimeIface {
 
 /* ==================== 接口表: 插件互查 (pluginxx.plugins) ==================== */
 
-#define PLUGINXX_IFACE_PLUGINS         "pluginxx.plugins"
-#define PLUGINXX_IFACE_PLUGINS_VERSION 1
+#define PLUGINXX_IFACE_PLUGINS             "pluginxx.plugins"
+#define PLUGINXX_IFACE_PLUGINS_VERSION     1
+#define PLUGINXX_IFACE_PLUGINS_MIN_VERSION 1
+/* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
+#define PLUGINXX_IFACE_PLUGINS_BASELINE_SIZE sizeof(PluginxxPluginsIface)
 
 typedef struct PluginxxPluginsIface {
-    int32_t  version; ///< 必须 == PLUGINXX_IFACE_PLUGINS_VERSION
+    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_PLUGINS_VERSION
     uint32_t struct_size;
 
     int32_t(PLUGINXX_CALL* list_plugins)(
@@ -200,11 +244,14 @@ typedef struct PluginxxPluginsIface {
 
 /* ==================== 接口表: 主程序配置 (pluginxx.config) ==================== */
 
-#define PLUGINXX_IFACE_CONFIG         "pluginxx.config"
-#define PLUGINXX_IFACE_CONFIG_VERSION 1
+#define PLUGINXX_IFACE_CONFIG             "pluginxx.config"
+#define PLUGINXX_IFACE_CONFIG_VERSION     1
+#define PLUGINXX_IFACE_CONFIG_MIN_VERSION 1
+/* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
+#define PLUGINXX_IFACE_CONFIG_BASELINE_SIZE sizeof(PluginxxConfigIface)
 
 typedef struct PluginxxConfigIface {
-    int32_t  version; ///< 必须 == PLUGINXX_IFACE_CONFIG_VERSION
+    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_CONFIG_VERSION
     uint32_t struct_size;
 
     /// 主程序 AgentConfig 关键字段 JSON (io 线程; host->alloc):
@@ -257,11 +304,14 @@ typedef struct PluginxxConfigIface {
 
 /* ==================== 接口表: 会话取消状态 (pluginxx.cancel) ==================== */
 
-#define PLUGINXX_IFACE_CANCEL         "pluginxx.cancel"
-#define PLUGINXX_IFACE_CANCEL_VERSION 1
+#define PLUGINXX_IFACE_CANCEL             "pluginxx.cancel"
+#define PLUGINXX_IFACE_CANCEL_VERSION     1
+#define PLUGINXX_IFACE_CANCEL_MIN_VERSION 1
+/* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
+#define PLUGINXX_IFACE_CANCEL_BASELINE_SIZE sizeof(PluginxxCancelIface)
 
 typedef struct PluginxxCancelIface {
-    int32_t  version; ///< 必须 == PLUGINXX_IFACE_CANCEL_VERSION
+    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_CANCEL_VERSION
     uint32_t struct_size;
     /// 查询会话当前轮次是否已取消 (advisory 定位; 权威通知始终是 cancel 回调)
 
@@ -273,11 +323,14 @@ typedef struct PluginxxCancelIface {
 
 /* ==================== 接口表: JSON 辅助 (pluginxx.json) ==================== */
 
-#define PLUGINXX_IFACE_JSON         "pluginxx.json"
-#define PLUGINXX_IFACE_JSON_VERSION 1
+#define PLUGINXX_IFACE_JSON             "pluginxx.json"
+#define PLUGINXX_IFACE_JSON_VERSION     1
+#define PLUGINXX_IFACE_JSON_MIN_VERSION 1
+/* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
+#define PLUGINXX_IFACE_JSON_BASELINE_SIZE sizeof(PluginxxJsonIface)
 
 typedef struct PluginxxJsonIface {
-    int32_t  version; ///< 必须 == PLUGINXX_IFACE_JSON_VERSION
+    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_JSON_VERSION
     uint32_t struct_size;
 
     int32_t(PLUGINXX_CALL* json_get_string)(
@@ -295,11 +348,14 @@ typedef struct PluginxxJsonIface {
 
 /* ==================== 接口表: 日志 (pluginxx.log) ==================== */
 
-#define PLUGINXX_IFACE_LOG         "pluginxx.log"
-#define PLUGINXX_IFACE_LOG_VERSION 1
+#define PLUGINXX_IFACE_LOG             "pluginxx.log"
+#define PLUGINXX_IFACE_LOG_VERSION     1
+#define PLUGINXX_IFACE_LOG_MIN_VERSION 1
+/* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
+#define PLUGINXX_IFACE_LOG_BASELINE_SIZE sizeof(PluginxxLogIface)
 
 typedef struct PluginxxLogIface {
-    int32_t  version; ///< 必须 == PLUGINXX_IFACE_LOG_VERSION
+    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_LOG_VERSION
     uint32_t struct_size;
 
     void(PLUGINXX_CALL*
@@ -308,11 +364,14 @@ typedef struct PluginxxLogIface {
 
 /* ==================== 接口表: 后台任务 (pluginxx.tasks) ==================== */
 
-#define PLUGINXX_IFACE_TASKS         "pluginxx.tasks"
-#define PLUGINXX_IFACE_TASKS_VERSION 1
+#define PLUGINXX_IFACE_TASKS             "pluginxx.tasks"
+#define PLUGINXX_IFACE_TASKS_VERSION     1
+#define PLUGINXX_IFACE_TASKS_MIN_VERSION 1
+/* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
+#define PLUGINXX_IFACE_TASKS_BASELINE_SIZE sizeof(PluginxxTasksIface)
 
 typedef struct PluginxxTasksIface {
-    int32_t  version; ///< 必须 == PLUGINXX_IFACE_TASKS_VERSION
+    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_TASKS_VERSION
     uint32_t struct_size;
 
     /// 注册后台任务 (io 线程约束, 非 io 线程由主程序投递同步等待)。主程序记录

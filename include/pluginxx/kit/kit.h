@@ -27,6 +27,7 @@
 #include "fmt/format.h"
 #include "fmt/ranges.h"
 #include "pluginxx/api/abi.h"
+#include "pluginxx/api/iface_meta.h"
 #include "pluginxx/api/tables.h"
 #include "utilxx_base/container_util.h"
 #include "utilxx_base/json.h"
@@ -357,15 +358,22 @@ public:
 };
 
 /// 查询主程序接口表并转型 (IID → 接口表)
+///
+/// 判定规则 (每张表用自己的常量, 不再与字面量比较):
+/// - `version >= IfaceMeta<Iface>::min_version` (语义级别兼容);
+/// - `struct_size >= IfaceMeta<Iface>::baseline_size` (基线字节数够)。
+///
+/// 注意: **表可用不等于全部成员可用**。基线以内的成员由上面两条门槛保证; 表尾追加的
+/// 成员必须用 `pluginxx::ifaceHas<&表::成员>(t)` 判定 (只判空指针会读到相邻内存,
+/// 见 `pluginxx/api/iface_meta.h`)。
 template<typename Iface>
 const Iface* validateInterface(const void* raw) noexcept {
     if (!raw) {
         return nullptr;
     }
     const auto* iface = static_cast<const Iface*>(raw);
-    // 接口表契约: 用准确的 version 与完整的字节大小标识自己;
-    // 版本不匹配或表长度不足的表一律视为不可用。
-    if (iface->version != 1 || iface->struct_size < sizeof(Iface)) {
+    if (iface->version < IfaceMeta<Iface>::min_version
+        || iface->struct_size < IfaceMeta<Iface>::baseline_size) {
         return nullptr;
     }
     return iface;
