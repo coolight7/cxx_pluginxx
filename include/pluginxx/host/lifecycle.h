@@ -298,13 +298,15 @@ public:
         }
 
         const PluginxxInfo* info = entry->get_info ? entry->get_info() : nullptr;
-        if (info && info->api_version != PLUGINXX_API_VERSION) {
+        // 判据与动态库插件一致: 只拒绝"低于最低支持版本"; 更高的声明不拒绝
+        // (插件可能用了当前框架没有的能力, 由插件自己读 PLUGINXX_API_VERSION 决定降级)
+        if (info && info->api_version < PLUGINXX_MIN_API_VERSION) {
             XX_LOGE(
-                "{}Builtin plugin `{}` API version mismatch (got {}, host requires {})",
+                "{}Builtin plugin `{}` API version below minimum (got {}, framework requires >= {})",
                 logTag(),
                 name,
                 info->api_version,
-                PLUGINXX_API_VERSION
+                PLUGINXX_MIN_API_VERSION
             );
             co_return nullptr;
         }
