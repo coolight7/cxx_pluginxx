@@ -4,7 +4,7 @@
 #   - include/pluginxx/api/     纯 C ABI (跨边界契约, 与领域无关的部分)
 #   - include/pluginxx/kit/     插件侧 C++ SDK (header-only)
 #   - include/pluginxx/runtime/ 插件运行时 (header-only)
-#   - include/pluginxx/host/    主程序侧通用实现 (装载/清单/注册簿记/通用表装配)
+#   - include/pluginxx/host/    主程序侧通用实现 (装载/清单/注册簿记/通用表加载)
 # 依赖: cxx_utilxx_base (取消令牌/日志/JSON 等) + fmt + Boost (仅头文件)
 #       **禁止**依赖 neograph / OpenSSL / SQLite 等重依赖与 Boost 编译库
 # 产物 (命名规则: Release 无后缀, Debug 文件名追加 d):

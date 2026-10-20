@@ -5,7 +5,7 @@
 /// 一处, 主程序只需:
 /// 1. 管理器继承本类 (`class MyManager : public pluginxx::PluginHostCore<MyInstance>`);
 /// 2. 实现 [DomainHooks] 并调用 [PluginHostCore::setDomainHooks];
-/// 3. 用 `pluginxx/host/tables_impl.h` 的 `queryGenericPluginIface` 装配 vtable 的
+/// 3. 用 `pluginxx/host/tables_impl.h` 的 `queryGenericPluginIface` 加载 vtable 的
 ///    `query_interface` (通用表由插件框架提供, 业务表由主程序自己提供)。
 ///
 /// 归属判据: 通用 = 与"会话/模型/工具/提示词/图"无关的表; 需要主程序语义的数据一律
@@ -16,6 +16,8 @@
 /// 句柄) 因此无需额外加锁。
 #pragma once
 
+#include "asio/post.hpp"
+#include "asio/steady_timer.hpp"
 #include "pluginxx/host/abi_util.h"
 #include "pluginxx/host/capability_registry.h"
 #include "pluginxx/host/domain_hooks.h"
@@ -23,8 +25,6 @@
 #include "pluginxx/runtime/manager_base.h"
 #include "pluginxx/runtime/op_driver.h"
 #include "utilxx_base/log.h"
-#include "asio/post.hpp"
-#include "asio/steady_timer.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -68,9 +68,13 @@ inline void setErrorString(PluginxxString* out, std::string_view msg) noexcept {
 template<typename Entry, typename Key>
 inline void upsertEntry(std::vector<Entry>& entries, const Key& key, Entry&& entry) {
     entries.erase(
-        std::remove_if(entries.begin(), entries.end(), [&key](const Entry& existing) {
-            return existing.name == key;
-        }),
+        std::remove_if(
+            entries.begin(),
+            entries.end(),
+            [&key](const Entry& existing) {
+                return existing.name == key;
+            }
+        ),
         entries.end()
     );
     entries.push_back(std::forward<Entry>(entry));
@@ -138,11 +142,11 @@ public:
 
     /// 声明带启动回调的能力 (**IO 线程**)
     int registerCapabilityEx(
-        InstanceT*                           inst,
-        std::string_view                     capability,
+        InstanceT*                      inst,
+        std::string_view                capability,
         PluginxxCapabilityStartFunction start,
         PluginxxOperatorCancelFunction  cancel,
-        void*                                ctx
+        void*                           ctx
     ) {
         if (!inst || capability.empty() || !start) {
             return -1;
@@ -220,13 +224,13 @@ public:
     /// - 完成通知经 [OpCore] 恒在 IO 线程发布 (即使插件同步 done);
     /// - 真正拒绝 (能力不存在/提供者不可用) 返回 NULL 并写 `error_out`, 此时不调用 `cb`。
     PluginxxOperatorHandle* invokeCapabilityAsync(
-        InstanceT*                     caller,
-        std::string_view               capability,
-        std::string_view               method,
-        std::string_view               argsJson,
-        PluginxxOperatorCallback  cb,
-        void*                          ud,
-        PluginxxString*           error_out
+        InstanceT*               caller,
+        std::string_view         capability,
+        std::string_view         method,
+        std::string_view         argsJson,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
     ) {
         std::shared_ptr<OpCore> core;
         try {
@@ -239,7 +243,9 @@ public:
             auto              provider = entry ? this->find(entry->provider) : nullptr;
             if (!entry || !entry->start || !provider || !provider->enabled
                 || (provider->lifetime && !provider->lifetime->acceptsOperations())) {
-                throw std::runtime_error("invoke_capability_async: capability not available: " + cap);
+                throw std::runtime_error(
+                    "invoke_capability_async: capability not available: " + cap
+                );
             }
             const auto binding = *entry;
             OpDrive    drive;
@@ -283,8 +289,8 @@ public:
     ///   (因此卸载的 idle 等待覆盖它);
     /// - 实例正在关闭/已禁用, 或主程序无事件后端时返回 nullptr。
     PluginxxSubscription* subscribe(
-        InstanceT*               inst,
-        std::string_view         topic,
+        InstanceT*       inst,
+        std::string_view topic,
         void(PLUGINXX_CALL* handler)(const PluginxxStringView* event_json, void* ud),
         void* ud
     ) {
@@ -309,33 +315,34 @@ public:
         sub->handler = handler;
         sub->ud      = ud;
 
-        const size_t subId = source->subscribe(
-            sub->topic,
-            [sub](std::string_view data) {
-                if (!sub->alive.load(std::memory_order_acquire) || !sub->handler) {
-                    return;
-                }
-                auto inst = sub->inst.lock();
-                if (!inst || !inst->enabled || !inst->lifetime
-                    || !inst->lifetime->acceptsOperations()) {
-                    return;
-                }
-                PluginInstanceBase::InflightGuard guard(inst);
-                if (!guard || !sub->alive.load(std::memory_order_acquire)) {
-                    return;
-                }
-                try {
-                    const auto view = detail::abiView(data);
-                    sub->handler(&view, sub->ud);
-                } catch (const std::exception& e) {
-                    XX_LOGW("Plugin `{}` event handler threw: {}", inst->name, e.what());
-                } catch (...) {
-                    XX_LOGW("Plugin `{}` event handler threw unknown exception", inst->name);
-                }
+        const size_t subId = source->subscribe(sub->topic, [sub](std::string_view data) {
+            if (!sub->alive.load(std::memory_order_acquire) || !sub->handler) {
+                return;
             }
-        );
+            auto inst = sub->inst.lock();
+            if (!inst || !inst->enabled || !inst->lifetime
+                || !inst->lifetime->acceptsOperations()) {
+                return;
+            }
+            PluginInstanceBase::InflightGuard guard(inst);
+            if (!guard || !sub->alive.load(std::memory_order_acquire)) {
+                return;
+            }
+            try {
+                const auto view = detail::abiView(data);
+                sub->handler(&view, sub->ud);
+            } catch (const std::exception& e) {
+                XX_LOGW("Plugin `{}` event handler threw: {}", inst->name, e.what());
+            } catch (...) {
+                XX_LOGW("Plugin `{}` event handler threw unknown exception", inst->name);
+            }
+        });
         if (subId == 0) {
-            XX_LOGW("Plugin `{}` subscribe failed: event source rejected topic `{}`", inst->name, sub->topic);
+            XX_LOGW(
+                "Plugin `{}` subscribe failed: event source rejected topic `{}`",
+                inst->name,
+                sub->topic
+            );
             return nullptr;
         }
         sub->subscriptionId = subId;
@@ -378,8 +385,9 @@ public:
         if (!source) {
             return -1;
         }
-        const std::string fullTopic = hooks_ ? hooks_->qualifyEventTopic(topic) : std::string{topic};
-        const std::string payload   = eventJson.empty() ? std::string{"{}"} : std::string{eventJson};
+        const std::string fullTopic
+            = hooks_ ? hooks_->qualifyEventTopic(topic) : std::string{topic};
+        const std::string payload = eventJson.empty() ? std::string{"{}"} : std::string{eventJson};
         return source->publish(fullTopic, payload);
     }
 
@@ -416,14 +424,17 @@ public:
 
     /// 定时器睡眠 (**IO 线程**); 完成/取消/失败都经完成回调恰好一次上报
     PluginxxOperatorHandle* sleep(
-        InstanceT*                    inst,
-        int64_t                       ms,
+        InstanceT*               inst,
+        int64_t                  ms,
         PluginxxOperatorCallback cb,
-        void*                         ud,
+        void*                    ud,
         PluginxxString*          error_out
     ) {
         if (!inst || !cb || !this->isIoThread()) {
-            detail::setErrorString(error_out, "scheduler sleep: invalid instance, callback, or thread");
+            detail::setErrorString(
+                error_out,
+                "scheduler sleep: invalid instance, callback, or thread"
+            );
             return nullptr;
         }
         if (ms < 0) {
@@ -483,18 +494,11 @@ public:
     /// - 主程序无工作线程时立即以失败终结 (不静默丢工作)。
     PluginxxOperatorHandle* offload(
         InstanceT* inst,
-        void*(PLUGINXX_CALL* work)(
-            void*                           ud,
-            const PluginxxCancelToken* token,
-            PluginxxString*            error_out
-        ),
-        void(PLUGINXX_CALL* done)(
-            void*                          ud,
-            int32_t                        status,
-            void*                          result,
-            const PluginxxStringView* error
-        ),
-        void*                ud,
+        void*(PLUGINXX_CALL*
+                  work)(void* ud, const PluginxxCancelToken* token, PluginxxString* error_out),
+        void(PLUGINXX_CALL*
+                 done)(void* ud, int32_t status, void* result, const PluginxxStringView* error),
+        void*           ud,
         PluginxxString* error_out
     ) {
         if (!inst || !work || !this->isIoThread()) {
@@ -537,9 +541,9 @@ public:
             const bool queued = [&]() {
                 if (!hooks_ || !hooks_->postToWorkerThread([core, result, cancelState, work, ud]() {
                         PluginxxCancelToken token{&isOffloadCancelled, cancelState.get()};
-                        PluginxxString    workError{};
-                        int32_t                status = PLUGINXX_OPERATOR_OK;
-                        std::string            error;
+                        PluginxxString      workError{};
+                        int32_t             status = PLUGINXX_OPERATOR_OK;
+                        std::string         error;
                         try {
                             result->value = work(ud, &token, &workError);
                             if (workError.data) {
@@ -600,9 +604,9 @@ public:
     /// - 返回主程序托管句柄 (失败 NULL + error_out); 句柄仅用于 `cancel_task`,
     ///   主程序在任务 done 后自动回收。
     PluginxxOperatorHandle* registerTask(
-        InstanceT*                          inst,
+        InstanceT*                     inst,
         PluginxxOperatorCancelFunction cancel_fn,
-        void*                               cancel_ud,
+        void*                          cancel_ud,
         PluginxxOperatorNotify*        notify,
         PluginxxString*                error_out
     ) {
@@ -612,8 +616,7 @@ public:
         std::shared_ptr<OpCore> core;
         try {
             if (!inst || !notify || !this->isIoThread() || !this->acceptsRegistration(inst)) {
-                throw std::runtime_error(
-                    "register_task: missing instance/notify or wrong IO thread"
+                throw std::runtime_error("register_task: missing instance/notify or wrong IO thread"
                 );
             }
             core = OpCore::create(
@@ -650,7 +653,7 @@ protected:
         return state && state->requested.load(std::memory_order_acquire) ? 1 : 0;
     }
 
-    DomainHooks*                        hooks_ = nullptr;
+    DomainHooks*                        hooks_        = nullptr;
     std::shared_ptr<CapabilityRegistry> capabilities_ = std::make_shared<CapabilityRegistry>();
 };
 

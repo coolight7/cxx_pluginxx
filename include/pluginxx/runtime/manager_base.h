@@ -18,12 +18,12 @@
 /// 线程约定: 插件表仅 io 线程读写; `ioThreadId_` 与 inflight 计数为原子 (跨线程读写)。
 #pragma once
 
-#include "pluginxx/runtime/instance_base.h"
-#include "utilxx_base/container_util.h"
-#include "utilxx_base/log.h"
 #include "asio/any_io_executor.hpp"
 #include "asio/awaitable.hpp"
 #include "asio/post.hpp"
+#include "pluginxx/runtime/instance_base.h"
+#include "utilxx_base/container_util.h"
+#include "utilxx_base/log.h"
 
 #include <algorithm>
 #include <chrono>
@@ -209,7 +209,7 @@ public:
     /// vtable 入口在调用方线程已取到 admission lease，但请求可能排在 IO 线程
     /// 队列里、等真正执行时实例已经进入 Closing/Disabled。此时注册必须被拒绝，
     /// 否则会在撤销注册之后又留下工具/hook/能力等残留。
-    /// - 未装配 lifetime 的测试伪实例按"允许"处理；
+    /// - 未加载 lifetime 的测试伪实例按"允许"处理；
     /// - 实例被显式禁用（enabled=false）时不再接受注册。
     bool acceptsRegistration(const PluginInstanceBase* inst) const {
         if (!inst || !inst->enabled) {
@@ -322,7 +322,7 @@ public:
             co_return true;
         }
         if (!inst->lifetime) {
-            // 未装配运行时控制块的测试伪实例: 没有租约可等, 直接视为已归零。
+            // 未加载运行时控制块的测试伪实例: 没有租约可等, 直接视为已归零。
             co_return true;
         }
         const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -351,7 +351,7 @@ protected:
         return runtime_->nextGeneration++;
     }
 
-    /// 为实例装配生命周期控制块 (状态机 + 执行 lease), 并把本管理器的运行时
+    /// 为实例加载生命周期控制块 (状态机 + 执行 lease), 并把本管理器的运行时
     /// 一并写入实例 ([PluginInstanceBase::runtime])。
     ///
     /// 运行时经弱引用登记, 使 Operation 驱动器与驱动请求无需回查管理器类型即可
@@ -375,10 +375,10 @@ protected:
         );
     }
 
-    std::shared_ptr<pluginxx::PluginRuntime>     runtime_    = std::make_shared<pluginxx::PluginRuntime>();
-    asio::any_io_executor&             ioExecutor_ = runtime_->executor;
-    std::atomic<std::thread::id>&      ioThreadId_ = runtime_->ioThreadId;
-    std::set<std::string, std::less<>> loadingNames_;
+    std::shared_ptr<pluginxx::PluginRuntime> runtime_ = std::make_shared<pluginxx::PluginRuntime>();
+    asio::any_io_executor&                   ioExecutor_ = runtime_->executor;
+    std::atomic<std::thread::id>&            ioThreadId_ = runtime_->ioThreadId;
+    std::set<std::string, std::less<>>       loadingNames_;
 };
 
 // =====================================================================

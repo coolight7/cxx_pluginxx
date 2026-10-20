@@ -45,7 +45,6 @@ extern "C" {
 
 #pragma pack(push, 8)
 
-
 /* ==================== 接口表: 事件 (pluginxx.events) ==================== */
 
 #define PLUGINXX_IFACE_EVENTS             "pluginxx.events"
@@ -96,7 +95,7 @@ typedef struct PluginxxCapabilitiesIface {
         const PluginxxStringView*       capability,
         PluginxxCapabilityStartFunction start,
         PluginxxOperatorCancelFunction  cancel,
-        void*                                ctx
+        void*                           ctx
     );
     int32_t(PLUGINXX_CALL* unregister_capability)(
         const PluginxxHost*       host,
@@ -113,7 +112,7 @@ typedef struct PluginxxCapabilitiesIface {
         const PluginxxStringView* method,
         const PluginxxStringView* args_json,
         PluginxxOperatorCallback  cb,
-        void*                          ud,
+        void*                     ud,
         PluginxxString*           error_out
     );
     void(PLUGINXX_CALL* op_cancel)(PluginxxOperatorHandle* op);
@@ -132,34 +131,24 @@ typedef struct PluginxxSchedulerIface {
     uint32_t struct_size;
 
     int32_t(PLUGINXX_CALL* is_io_thread)(const PluginxxHost* host);
-    int32_t(PLUGINXX_CALL* post_to_io)(
-        const PluginxxHost* host,
-        void(PLUGINXX_CALL* fn)(void* ud),
-        void* ud
-    );
+    int32_t(PLUGINXX_CALL*
+                post_to_io)(const PluginxxHost* host, void(PLUGINXX_CALL* fn)(void* ud), void* ud);
     PluginxxOperatorHandle*(PLUGINXX_CALL* sleep)(
         const PluginxxHost*      host,
-        int64_t                       ms,
+        int64_t                  ms,
         PluginxxOperatorCallback cb,
-        void*                         ud,
+        void*                    ud,
         PluginxxString*          error_out
     );
     void(PLUGINXX_CALL* op_cancel)(PluginxxOperatorHandle* op);
 
     PluginxxOperatorHandle*(PLUGINXX_CALL* offload)(
         const PluginxxHost* host,
-        void*(PLUGINXX_CALL* work)(
-            void*                           ud,
-            const PluginxxCancelToken* token,
-            PluginxxString*            error_out
-        ),
-        void(PLUGINXX_CALL* done)(
-            void*                          ud,
-            int32_t                        status,
-            void*                          result,
-            const PluginxxStringView* error
-        ),
-        void*                ud,
+        void*(PLUGINXX_CALL*
+                  work)(void* ud, const PluginxxCancelToken* token, PluginxxString* error_out),
+        void(PLUGINXX_CALL*
+                 done)(void* ud, int32_t status, void* result, const PluginxxStringView* error),
+        void*           ud,
         PluginxxString* error_out
     );
 } PluginxxSchedulerIface;
@@ -200,7 +189,7 @@ typedef struct PluginxxCoroutineRuntimeIface {
     PluginxxDriver*(PLUGINXX_CALL* request_driver)(
         const PluginxxHost* host,
         PluginxxDriveOnceFn drive_once,
-        void*                    user_data,
+        void*               user_data,
         PluginxxString*     error_out
     );
 
@@ -227,19 +216,13 @@ typedef struct PluginxxPluginsIface {
     int32_t  version; ///< 主程序填 PLUGINXX_IFACE_PLUGINS_VERSION
     uint32_t struct_size;
 
-    int32_t(PLUGINXX_CALL* list_plugins)(
-        const PluginxxHost* host,
-        PluginxxString*     out
-    );
+    int32_t(PLUGINXX_CALL* list_plugins)(const PluginxxHost* host, PluginxxString* out);
     int32_t(PLUGINXX_CALL* get_plugin)(
         const PluginxxHost*       host,
         const PluginxxStringView* name,
         PluginxxString*           out
     );
-    int32_t(PLUGINXX_CALL* get_own_info)(
-        const PluginxxHost* host,
-        PluginxxString*     out
-    );
+    int32_t(PLUGINXX_CALL* get_own_info)(const PluginxxHost* host, PluginxxString* out);
 } PluginxxPluginsIface;
 
 /* ==================== 接口表: 主程序配置 (pluginxx.config) ==================== */
@@ -257,15 +240,9 @@ typedef struct PluginxxConfigIface {
     /// 主程序 AgentConfig 关键字段 JSON (io 线程; host->alloc):
     /// {"dataDir": "...", "projectRoot": "..."(可为空), "platform":
     /// "windows"|"linux"|"macos"|"android"|"ios"}
-    int32_t(PLUGINXX_CALL* get_config)(
-        const PluginxxHost* host,
-        PluginxxString*     out
-    );
+    int32_t(PLUGINXX_CALL* get_config)(const PluginxxHost* host, PluginxxString* out);
     /// 本插件配置参数 JSON (yaml `plugins` 条目 args; io 线程; host->alloc):
-    int32_t(PLUGINXX_CALL* get_plugin_args)(
-        const PluginxxHost* host,
-        PluginxxString*     out
-    );
+    int32_t(PLUGINXX_CALL* get_plugin_args)(const PluginxxHost* host, PluginxxString* out);
     /// 主程序 toolPrompt 配置 (io 线程; host->alloc):
     /// {"depict": "...", "args": {"参数名": "参数说明", ...}}
     int32_t(PLUGINXX_CALL* get_tool_prompt)(
@@ -273,7 +250,7 @@ typedef struct PluginxxConfigIface {
         const PluginxxStringView* tool_name,
         PluginxxString*           out
     );
-    /// 指定会话生效的工作目录 (io 线程; host->alloc; 失败/未装配返回空串):
+    /// 指定会话生效的工作目录 (io 线程; host->alloc; 失败/未加载返回空串):
     /// - session_id 非空: worktree 绑定优先, 依次回退会话覆写 / AgentConfig
     /// - session_id 为空: 返回解析后的默认会话工作目录
     int32_t(PLUGINXX_CALL* get_session_work_dir)(
@@ -285,16 +262,10 @@ typedef struct PluginxxConfigIface {
     /// host->alloc; 未指定返回空串, 空串表示未配置)
     /// - 可指向文件或目录 (由插件自行判断类型并加载)
     /// - 主程序已归一化为绝对路径 (正斜杠, lexically_normal)
-    int32_t(PLUGINXX_CALL* get_plugin_config_path)(
-        const PluginxxHost* host,
-        PluginxxString*     out
-    );
+    int32_t(PLUGINXX_CALL* get_plugin_config_path)(const PluginxxHost* host, PluginxxString* out);
     /// 读取当前使用的语言 (io 线程; 返回 0 成功, out 填入语言代码如 "en" / "zh-cn", host->alloc
     /// 分配; 默认 "en")
-    int32_t(PLUGINXX_CALL* get_language)(
-        const PluginxxHost* host,
-        PluginxxString*     out
-    );
+    int32_t(PLUGINXX_CALL* get_language)(const PluginxxHost* host, PluginxxString* out);
     /// 指定使用的语言 (io 线程; 返回 0 成功; 不支持 auto, 为空或 auto 时回退为 "en")
     int32_t(PLUGINXX_CALL* set_language)(
         const PluginxxHost*       host,
@@ -392,7 +363,7 @@ typedef struct PluginxxTasksIface {
     PluginxxOperatorHandle*(PLUGINXX_CALL* register_task)(
         const PluginxxHost*            host,
         PluginxxOperatorCancelFunction cancel_fn,
-        void*                               cancel_ud,
+        void*                          cancel_ud,
         PluginxxOperatorNotify*        notify,
         PluginxxString*                error_out
     );

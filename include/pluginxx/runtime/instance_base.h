@@ -15,6 +15,7 @@
 /// (调用方遵守线程约定), 驱动登记表用独立互斥 (允许任意线程取消)。
 #pragma once
 
+#include "asio/any_io_executor.hpp"
 #include "pluginxx/api/abi.h"
 #include "pluginxx/host/capability_registry.h"
 #include "pluginxx/host/event_bus.h"
@@ -23,7 +24,6 @@
 #include "pluginxx/runtime/runtime.h"
 #include "utilxx_base/json.h"
 #include "utilxx_base/log.h"
-#include "asio/any_io_executor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -58,6 +58,7 @@ struct PluginxxOperationCompletionEndpoint;
 namespace pluginxx {
 
 class PluginHostControl;
+
 // =====================================================================
 // 实例公共基类
 // =====================================================================
@@ -82,10 +83,10 @@ struct PluginInstanceBase {
     /// 内置插件 (合并编译进主程序二进制) 的 destroy 入口; 动态库插件为 nullptr
     /// (此时 destroy 由 [destroyPlugin] 经 [pluginDestroySymbol] 向动态库查找)
     PluginxxDestroyFn builtinUnload = nullptr;
-    bool                     enabled   = true; ///< 是否启用 (禁用: 注册摘除/命令停用)
-    bool userDisabled          = false; ///< 是否被用户显式禁用 (区别于级联禁用)
-    bool blockedByDependencies = false; ///< 是否因必选依赖不可用而级联禁用
-    bool unloadRequested       = false; ///< 已请求卸载 (防重复)
+    bool              enabled       = true; ///< 是否启用 (禁用: 注册摘除/命令停用)
+    bool              userDisabled = false; ///< 是否被用户显式禁用 (区别于级联禁用)
+    bool blockedByDependencies     = false; ///< 是否因必选依赖不可用而级联禁用
+    bool unloadRequested           = false; ///< 已请求卸载 (防重复)
     /// create 是否成功产出可销毁的 pluginCtx。
     bool pluginCreated = false;
     /// 插件上下文是否已经调用 destroy。只在所属 IO 线程更新。
@@ -187,7 +188,7 @@ struct PluginInstanceBase {
     /// IO 线程访问不同), 因此本表用独立互斥保护。
     static constexpr size_t kFinishedDriverRetention = 16;
 
-    mutable std::mutex                                 driversMutex;
+    mutable std::mutex                            driversMutex;
     std::deque<std::shared_ptr<::PluginxxDriver>> drivers;
 
     /// 登记请求句柄 (任意线程; 由 request_driver 在排队前调用)。
@@ -308,7 +309,7 @@ public:
 
     /// 实例所属插件框架运行时 (io executor / Operation 表 / 投递通道)。
     ///
-    /// 由管理器在装配 [lifetime] 时一并写入 (见 [PluginManagerBase::makeLifetime]);
+    /// 由管理器在加载 [lifetime] 时一并写入 (见 [PluginManagerBase::makeLifetime]);
     /// 弱引用是因为运行时由管理器持有且比实例长命, 实例不应延长其生命周期。
     /// Operation 驱动器与驱动请求据此拿到 io executor 与线程标识, 无需回查管理器
     /// 具体类型 (插件框架因此不依赖主程序的管理器类型)。
@@ -339,21 +340,27 @@ public:
     /// - `allowClosing=false` (默认): "开始新动作", 实例进入 Closing/Disabled 后获取失败;
     /// - `allowClosing=true`: 只读查询 / 取消 / 完成清理, 关闭过程中仍需执行。
     ///
-    /// 未装配 lifetime 的实例 (单元测试直接构造的伪实例) 视为无租约约束。
+    /// 未加载 lifetime 的实例 (单元测试直接构造的伪实例) 视为无租约约束。
     struct InflightGuard {
         PluginInstanceBase*                 inst = nullptr;
         std::shared_ptr<PluginInstanceBase> owner;
-        pluginxx::InstanceLease                       lease;
+        pluginxx::InstanceLease             lease;
 
         explicit InflightGuard(std::shared_ptr<PluginInstanceBase> i, bool allowClosing = false) :
             inst(i.get()),
             owner(std::move(i)),
-            lease(inst ? pluginxx::InstanceLease::acquire(inst->lifetime, allowClosing) : pluginxx::InstanceLease{}) {}
+            lease(
+                inst ? pluginxx::InstanceLease::acquire(inst->lifetime, allowClosing)
+                     : pluginxx::InstanceLease{}
+            ) {}
 
         explicit InflightGuard(PluginInstanceBase* i, bool allowClosing = false) :
             inst(i),
             owner(i ? i->ownerSelf.lock() : nullptr),
-            lease(i ? pluginxx::InstanceLease::acquire(i->lifetime, allowClosing) : pluginxx::InstanceLease{}) {}
+            lease(
+                i ? pluginxx::InstanceLease::acquire(i->lifetime, allowClosing)
+                  : pluginxx::InstanceLease{}
+            ) {}
 
         explicit operator bool() const noexcept {
             return inst == nullptr || inst->lifetime == nullptr || static_cast<bool>(lease);
@@ -362,7 +369,7 @@ public:
         ~InflightGuard() = default;
     };
 
-    /// 交给插件的主程序视图（控制块内地址，永不失效）；未装配控制块返回 nullptr。
+    /// 交给插件的主程序视图（控制块内地址，永不失效）；未加载控制块返回 nullptr。
     /// 插件保存该指针跨卸载继续调用时，各 vtable 入口会安全失败。
     const PluginxxHost* hostView() const noexcept;
 
@@ -411,7 +418,7 @@ public:
     /// 创建并注册控制块。`vtable` 为本端主程序静态函数表（agent/client 各自一份）。
     static std::shared_ptr<PluginHostControl> create(
         const std::shared_ptr<PluginInstanceBase>& instance,
-        const PluginxxHostVtable*                   vtable
+        const PluginxxHostVtable*                  vtable
     ) {
         std::shared_ptr<PluginHostControl> control(new PluginHostControl(instance, vtable));
         registerControl(control);
@@ -451,7 +458,7 @@ private:
 
     PluginHostControl(
         const std::shared_ptr<PluginInstanceBase>& instance,
-        const PluginxxHostVtable*                   vtable
+        const PluginxxHostVtable*                  vtable
     ) :
         instance_(instance),
         generation_(instance ? instance->lifetime ? instance->lifetime->generation() : 0 : 0) {
@@ -474,7 +481,7 @@ private:
         registry.controls.emplace(control->token(), control);
     }
 
-    PluginxxHost                 host_{};
+    PluginxxHost                      host_{};
     std::weak_ptr<PluginInstanceBase> instance_;
     uint64_t                          generation_ = 0;
     std::atomic<bool>                 retired_{false};
@@ -641,9 +648,7 @@ inline PluginxxString hostMemoryCreateString(const char* s) {
     if (!s) {
         return PluginxxString{nullptr, 0};
     }
-    return hostMemoryCreateString(
-        PluginxxStringView{s, static_cast<uint64_t>(std::strlen(s))}
-    );
+    return hostMemoryCreateString(PluginxxStringView{s, static_cast<uint64_t>(std::strlen(s))});
 }
 
 // =====================================================================

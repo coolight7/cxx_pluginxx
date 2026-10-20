@@ -16,11 +16,6 @@
 #ifndef PLUGINXX_RUNTIME_OP_DRIVER_H
 #define PLUGINXX_RUNTIME_OP_DRIVER_H
 
-#include "pluginxx/api/abi.h"
-#include "pluginxx/runtime/instance_base.h"
-#include "pluginxx/runtime/runtime.h"
-#include "utilxx/cancel.h"
-#include "utilxx_base/log.h"
 #include "asio/as_tuple.hpp"
 #include "asio/bind_cancellation_slot.hpp"
 #include "asio/post.hpp"
@@ -28,6 +23,11 @@
 #include "asio/this_coro.hpp"
 #include "asio/use_awaitable.hpp"
 #include "fmt/format.h"
+#include "pluginxx/api/abi.h"
+#include "pluginxx/runtime/instance_base.h"
+#include "pluginxx/runtime/runtime.h"
+#include "utilxx/cancel.h"
+#include "utilxx_base/log.h"
 
 #include <algorithm>
 #include <chrono>
@@ -51,8 +51,8 @@ struct OpCore;
 /// 插件仍持有 notify.host_ud 时也不会落到已经释放的 OpCore; 第一次完成会
 /// 原子化地取走这份强引用, 随后由完成包继续保活到 IO 提交结束。
 struct PluginxxOperationCompletionEndpoint {
-    std::mutex                                 mutex;
-    std::shared_ptr<pluginxx::OpCore>          operation;
+    std::mutex                        mutex;
+    std::shared_ptr<pluginxx::OpCore> operation;
 
     std::shared_ptr<pluginxx::OpCore> takeOperation() noexcept {
         std::lock_guard lock(mutex);
@@ -74,18 +74,18 @@ struct PluginxxOperatorHandle : std::enable_shared_from_this<PluginxxOperatorHan
     std::weak_ptr<pluginxx::PluginInstanceBase> caller;
     /// 取消请求需要投递回 IO 线程执行; executor 暂时停止时由它保留请求,
     /// 使"已接受但尚未终结"的操作仍能在 executor 恢复后完成取消。
-    std::weak_ptr<pluginxx::PluginRuntime>                    runtime;
-    asio::any_io_executor                                     executor;
-    std::function<void()>                                     cancelFn;
+    std::weak_ptr<pluginxx::PluginRuntime>               runtime;
+    asio::any_io_executor                                executor;
+    std::function<void()>                                cancelFn;
     std::shared_ptr<PluginxxOperationCompletionEndpoint> completionEndpoint;
-    std::atomic<bool>                                         cancelled{false};
-    std::atomic<bool>                                         completed{false};
+    std::atomic<bool>                                    cancelled{false};
+    std::atomic<bool>                                    completed{false};
 };
 
 namespace pluginxx {
 struct OpDrive {
     std::function<void*(const PluginxxOperatorNotify*, PluginxxString*)> start;
-    std::function<void(void*)>                                                     cancel;
+    std::function<void(void*)>                                           cancel;
 };
 
 using OpErrorCode = utilxx_base::AsioErrorCode;
@@ -226,8 +226,8 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
     bool start(OpDrive drive, std::string& error) {
         drive_ = std::move(drive);
         PluginxxString startError{};
-        auto                ntf     = notify();
-        const auto          started = std::chrono::steady_clock::now();
+        auto           ntf     = notify();
+        const auto     started = std::chrono::steady_clock::now();
         try {
             if (drive_.start) {
                 providerHandle_ = drive_.start(&ntf, &startError);
@@ -441,7 +441,9 @@ public:
         }
         auto [ec] = co_await finished_.async_wait(asio::as_tuple(asio::use_awaitable));
         if (!completed()) {
-            throw utilxx_base::AsioSystemError(ec ? ec : OpErrorCode(asio::error::operation_aborted));
+            throw utilxx_base::AsioSystemError(
+                ec ? ec : OpErrorCode(asio::error::operation_aborted)
+            );
         }
     }
 
@@ -465,7 +467,10 @@ private:
         auto* ud        = std::exchange(callbackUd_, nullptr);
         try {
             if (callback) {
-                auto sv = PluginxxStringView{completion_.payload.data(), static_cast<uint64_t>(completion_.payload.size())};
+                auto sv = PluginxxStringView{
+                    completion_.payload.data(),
+                    static_cast<uint64_t>(completion_.payload.size())
+                };
                 callback(ud, completion_.status, &sv);
             }
         } catch (const std::exception& e) {
@@ -521,18 +526,18 @@ private:
     std::string                       label_;
     std::atomic<PluginOperationState> state_{PluginOperationState::Accepted};
     /// 取消/完成提交的互斥点。协议见 [cancelOnIo] 上方的说明：锁内不调用插件。
-    mutable std::mutex                                        submitMutex_;
-    bool                                                      completionSubmitted_ = false;
-    CompletionPacket                                          completion_;
-    OpDrive                                                   drive_;
-    void*                                                     providerHandle_ = nullptr;
-    OpGuardPtr                                                provider_, caller_;
+    mutable std::mutex                                   submitMutex_;
+    bool                                                 completionSubmitted_ = false;
+    CompletionPacket                                     completion_;
+    OpDrive                                              drive_;
+    void*                                                providerHandle_ = nullptr;
+    OpGuardPtr                                           provider_, caller_;
     std::shared_ptr<PluginxxOperatorHandle>              handle_;
     std::shared_ptr<PluginxxOperationCompletionEndpoint> completionEndpoint_;
     PluginxxOperatorCallback                             callback_   = nullptr;
-    void*                                                     callbackUd_ = nullptr;
-    std::function<void(int32_t, std::string_view)>            completionHandler_;
-    asio::steady_timer                                        finished_;
+    void*                                                callbackUd_ = nullptr;
+    std::function<void(int32_t, std::string_view)>       completionHandler_;
+    asio::steady_timer                                   finished_;
 };
 
 /// 任意线程取消：先捕获独立句柄，再把完整检查与插件 cancel 调用交给 IO。
@@ -610,7 +615,7 @@ inline std::string PluginRuntime::pendingOperationSummary() const {
 }
 
 /// 等待一次插件操作的工具参数
-/// - `inst` 为主程序的插件实例 (须继承 [pluginxx::PluginInstanceBase] 且已装配
+/// - `inst` 为主程序的插件实例 (须继承 [pluginxx::PluginInstanceBase] 且已加载
 ///   [pluginxx::PluginInstanceBase::runtime]);
 /// - `cancelToken` 使用统一取消抽象 [utilxx::CancelTokenPtr]: 主程序的取消源
 ///   (如图引擎取消令牌) 经适配器转换后传入。

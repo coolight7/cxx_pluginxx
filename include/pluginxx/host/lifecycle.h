@@ -17,7 +17,7 @@
 ///                   public pluginxx::DomainHooks {
 ///     // 1. 构造体内 setDomainHooks(this) (通用表取数);
 ///     // 2. 覆写下方"主程序扩展点"里的纯虚函数与需要的可选项;
-///     // 3. query_interface 里用 pluginxx::queryGenericPluginIface 装配通用表。
+///     // 3. query_interface 里用 pluginxx::queryGenericPluginIface 加载通用表。
 /// };
 /// ```
 ///
@@ -26,6 +26,9 @@
 /// stop/start 事务按需投递到 IO 线程执行 (调用方不必在 IO 线程)。
 #pragma once
 
+#include "asio/co_spawn.hpp"
+#include "asio/detached.hpp"
+#include "asio/post.hpp"
 #include "pluginxx/api/entry.h"
 #include "pluginxx/host/abi_util.h"
 #include "pluginxx/host/domain_hooks.h"
@@ -38,9 +41,6 @@
 #include "pluginxx/runtime/runtime.h"
 #include "utilxx_base/json.h"
 #include "utilxx_base/log.h"
-#include "asio/co_spawn.hpp"
-#include "asio/detached.hpp"
-#include "asio/post.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -104,11 +104,11 @@ public:
     ///
     /// - `return` 加载成功返回实例; 任一环节失败返回 nullptr (错误记日志, 已做回滚)
     asio::awaitable<InstancePtr> loadNativeAsync(
-        std::string                  path,
-        const PluginLoadOptions*     options             = nullptr,
-        bool                         allowMissingEntry   = false,
-        const PluginManifestResources&  resources        = {},
-        const PluginManifestInterfaces& interfaces       = {}
+        std::string                     path,
+        const PluginLoadOptions*        options           = nullptr,
+        bool                            allowMissingEntry = false,
+        const PluginManifestResources&  resources         = {},
+        const PluginManifestInterfaces& interfaces        = {}
     ) {
         std::string err;
         void*       dl = NativeLoader::open(path, err);
@@ -144,9 +144,9 @@ public:
 
         auto getInfoFn = reinterpret_cast<PluginxxGetInfoFn>(lookupSymbol(entries.getInfo, err));
         std::string createErr;
-        auto        createFn = reinterpret_cast<PluginxxCreateFn>(lookupSymbol(entries.create, createErr));
+        auto createFn = reinterpret_cast<PluginxxCreateFn>(lookupSymbol(entries.create, createErr));
         std::string startErr;
-        auto        startFn = reinterpret_cast<PluginxxStartFn>(lookupSymbol(entries.start, startErr));
+        auto startFn = reinterpret_cast<PluginxxStartFn>(lookupSymbol(entries.start, startErr));
         std::string stopErr;
         auto        stopFn = reinterpret_cast<PluginxxStopFn>(lookupSymbol(entries.stop, stopErr));
 
@@ -202,9 +202,8 @@ public:
             co_return nullptr;
         }
 
-        std::string name = info && info->name.data
-                               ? std::string(info->name.data, info->name.size)
-                               : std::filesystem::path(path).stem().string();
+        std::string name = info && info->name.data ? std::string(info->name.data, info->name.size)
+                                                   : std::filesystem::path(path).stem().string();
         if (name.starts_with("lib")) {
             name = name.substr(3);
         }
@@ -279,9 +278,9 @@ public:
         std::string                     path,
         std::vector<std::string>        depends,
         std::vector<std::string>        optionalDepends,
-        const PluginLoadOptions*        options            = nullptr,
-        const PluginManifestResources&  resources          = {},
-        const PluginManifestInterfaces& interfaces         = {}
+        const PluginLoadOptions*        options    = nullptr,
+        const PluginManifestResources&  resources  = {},
+        const PluginManifestInterfaces& interfaces = {}
     ) {
         auto entry = findBuiltinPlugin(name);
         if (!entry) {
@@ -289,11 +288,7 @@ public:
             co_return nullptr;
         }
         if (!entry->create || !entry->start || !entry->stop) {
-            XX_LOGE(
-                "{}Built-in plugin `{}` does not export create/start/stop",
-                logTag(),
-                name
-            );
+            XX_LOGE("{}Built-in plugin `{}` does not export create/start/stop", logTag(), name);
             co_return nullptr;
         }
 
@@ -454,7 +449,11 @@ public:
                         btName,
                         fallback.string()
                     );
-                    co_return co_await loadPluginAsync(fallback.string(), options, allowMissingEntry);
+                    co_return co_await loadPluginAsync(
+                        fallback.string(),
+                        options,
+                        allowMissingEntry
+                    );
                 }
             }
             for (const auto& dep : depends) {
@@ -583,8 +582,8 @@ public:
     }
 
     /// 逐个卸载全部插件并等待安全关闭 (协程; 各实例共享同一超时时刻)
-    asio::awaitable<bool> shutdownAsync(std::chrono::milliseconds timeout = std::chrono::seconds{30}
-    ) {
+    asio::awaitable<bool>
+        shutdownAsync(std::chrono::milliseconds timeout = std::chrono::seconds{30}) {
         co_return co_await this->shutdownAllAsync(
             timeout,
             [this](const std::string& name, std::chrono::steady_clock::time_point deadline) {
@@ -699,12 +698,7 @@ public:
                 "plugin stop",
                 error
             )) {
-            XX_LOGE(
-                "{}Plugin `{}` stop failed while disabling: {}",
-                logTag(),
-                inst->name,
-                error
-            );
+            XX_LOGE("{}Plugin `{}` stop failed while disabling: {}", logTag(), inst->name, error);
             co_return;
         }
         inst->lifecycleStopped = true;
@@ -782,12 +776,7 @@ public:
             }
             detachInstanceRegistrations(inst.get());
             clearPluginOwnedRegistrations(inst.get());
-            XX_LOGE(
-                "{}Plugin `{}` start failed while enabling: {}",
-                logTag(),
-                inst->name,
-                error
-            );
+            XX_LOGE("{}Plugin `{}` start failed while enabling: {}", logTag(), inst->name, error);
             co_return;
         }
         inst->lifecycleStopped = false;
@@ -918,7 +907,7 @@ protected:
         }
     }
 
-    /// 装配实例的通用部分 (主程序的自定义加载路径也应调用它)
+    /// 加载实例的通用部分 (主程序的自定义加载路径也应调用它)
     ///
     /// - 生命周期入口 (start/stop);
     /// - 基类自引用: 通用表实现与完成回调只依赖 `ownerSelf` (不依赖管理器类型);
@@ -926,7 +915,7 @@ protected:
     /// - 交给插件的框架控制块: host 视图必须在进程级稳定地址上, 插件卸载后继续使用
     ///   旧指针时各 vtable 入口只会安全失败 (tombstone 语义, 见 instance_base.h)。
     void attachInstance(
-        const InstancePtr&         inst,
+        const InstancePtr&    inst,
         const PluginxxStartFn startFn,
         const PluginxxStopFn  stopFn
     ) {
@@ -952,10 +941,8 @@ protected:
     }
 
     /// manifest entry 找不到时的平台默认库文件名 (lib<name>.so / name.dll / lib<name>.dylib)
-    static std::string defaultPluginLibraryPath(
-        const std::filesystem::path& dir,
-        const std::string&           name
-    ) {
+    static std::string
+        defaultPluginLibraryPath(const std::filesystem::path& dir, const std::string& name) {
 #if XX_IS_WIN_D
         auto p = dir / (name + ".dll");
         if (std::filesystem::exists(p)) {
@@ -969,11 +956,11 @@ protected:
 #endif
     }
 
-    /// 插件实例的公共装配 (两种加载路径共用): 元信息/生命周期入口/框架控制块
+    /// 插件实例的公共加载 (两种加载路径共用): 元信息/生命周期入口/框架控制块
     InstancePtr makeInstance(
-        std::string                name,
+        std::string           name,
         const PluginxxInfo*   info,
-        std::string                path,
+        std::string           path,
         const PluginxxStartFn startFn,
         const PluginxxStopFn  stopFn
     ) {
@@ -981,8 +968,9 @@ protected:
         if (!inst) {
             return nullptr;
         }
-        inst->version = info && info->version.data ? std::string(info->version.data, info->version.size)
-                                                   : "1.0.0";
+        inst->version     = info && info->version.data
+                                ? std::string(info->version.data, info->version.size)
+                                : "1.0.0";
         inst->description = info && info->description.data
                                 ? std::string(info->description.data, info->description.size)
                                 : "";
@@ -1066,11 +1054,7 @@ protected:
 
         inst->destroyPlugin();
         if (!inst->pluginDestroyed) {
-            XX_LOGW(
-                "{}Plugin shutdown deferred after destroy attempt: `{}`",
-                logTag(),
-                inst->name
-            );
+            XX_LOGW("{}Plugin shutdown deferred after destroy attempt: `{}`", logTag(), inst->name);
             return;
         }
         /// 插件上下文已销毁: 关闭动态库句柄, 释放对插件文件的占用
@@ -1232,18 +1216,9 @@ protected:
                     try {
                         std::rethrow_exception(e);
                     } catch (const std::exception& ex) {
-                        XX_LOGE(
-                            "{}Plugin `{}` disable stop threw: {}",
-                            tag,
-                            inst->name,
-                            ex.what()
-                        );
+                        XX_LOGE("{}Plugin `{}` disable stop threw: {}", tag, inst->name, ex.what());
                     } catch (...) {
-                        XX_LOGE(
-                            "{}Plugin `{}` disable stop threw unknown",
-                            tag,
-                            inst->name
-                        );
+                        XX_LOGE("{}Plugin `{}` disable stop threw unknown", tag, inst->name);
                     }
                 }
             );
@@ -1276,18 +1251,9 @@ protected:
                     try {
                         std::rethrow_exception(e);
                     } catch (const std::exception& ex) {
-                        XX_LOGE(
-                            "{}Plugin `{}` enable start threw: {}",
-                            tag,
-                            inst->name,
-                            ex.what()
-                        );
+                        XX_LOGE("{}Plugin `{}` enable start threw: {}", tag, inst->name, ex.what());
                     } catch (...) {
-                        XX_LOGE(
-                            "{}Plugin `{}` enable start threw unknown",
-                            tag,
-                            inst->name
-                        );
+                        XX_LOGE("{}Plugin `{}` enable start threw unknown", tag, inst->name);
                     }
                 }
             );
@@ -1321,11 +1287,8 @@ protected:
             inst->lifetime->requestClose();
         }
 
-        for (const auto& dep : collectReverseRequiredDeps(
-                 this->plugins_,
-                 inst->name,
-                 cascadeUnloadEnabledOnly()
-             )) {
+        for (const auto& dep :
+             collectReverseRequiredDeps(this->plugins_, inst->name, cascadeUnloadEnabledOnly())) {
             auto depInst = this->find(dep);
             if (depInst) {
                 if (!co_await unloadAsyncUntil(depInst->name, deadline)) {
@@ -1395,11 +1358,7 @@ protected:
 
         inst->destroyPlugin();
         if (!inst->pluginDestroyed) {
-            XX_LOGW(
-                "{}Plugin `{}` unload deferred after destroy attempt",
-                logTag(),
-                inst->name
-            );
+            XX_LOGW("{}Plugin `{}` unload deferred after destroy attempt", logTag(), inst->name);
             co_return false;
         }
         /// 插件上下文已销毁、lease 已归零: 关闭动态库句柄, 让插件文件在卸载之后
