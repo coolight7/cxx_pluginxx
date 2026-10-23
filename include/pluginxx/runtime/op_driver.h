@@ -694,7 +694,8 @@ inline asio::awaitable<bool> awaitPluginLifecycle(
     std::string&                               error
 ) {
     error.clear();
-    if (!hook || !runtime || !instance) {
+    // hook 是调用方给的 lambda (永远可用), 只需检查运行时与实例
+    if (!runtime || !instance) {
         co_return true;
     }
     std::shared_ptr<OpCore> core;

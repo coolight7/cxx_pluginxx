@@ -1679,6 +1679,14 @@ public:
         return ref;
     }
 
+    /// 稳定借用的视图指针 (缓存在本对象里, 有效期同本对象)
+    /// - 方便把引用传给需要 `const PluginxxScopeRef*` 的调用点而不必每次建临时量
+    const PluginxxScopeRef* ptr() const noexcept {
+        cache_          = raw();
+        cache_.id       = PluginStringView::from(id_.data(), id_.size());
+        return &cache_;
+    }
+
     friend bool operator==(const ScopeRef& a, const ScopeRef& b) noexcept {
         return a.seq_ == b.seq_ && a.id_ == b.id_;
     }
@@ -1694,6 +1702,8 @@ private:
 
     std::string id_;
     uint64_t    seq_ = 0;
+    /// [ptr] 的缓存 (mutable: ptr() 是 const)
+    mutable PluginxxScopeRef cache_{};
 };
 
 /* ==================== 插件框架事件驱动取消注册表 (CancelRegistry) ==================== */
