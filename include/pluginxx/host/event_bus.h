@@ -68,8 +68,10 @@ struct PluginxxSubscription {
     std::string topic;
     /// 事件后端的订阅句柄 (0 = 未登记或已撤销)
     size_t subscriptionId = 0;
-    /// 订阅者实例 (弱引用: 句柄不延长实例生命周期)
+    /// 插件实例 (弱引用: 句柄不延长实例生命周期)
     std::weak_ptr<pluginxx::PluginInstanceBase> inst;
+    /// 订阅时的 agent 标识 (空 = 订阅的是主程序总线; 挂载卸载时据此筛出本挂载的订阅)
+    std::string agentId;
     /// 插件框架运行时 (撤销时把簿记投递到 IO 线程; 弱引用不延长其生命周期)
     std::weak_ptr<pluginxx::PluginRuntime> runtime;
     /// 插件事件回调 (C ABI 函数指针)

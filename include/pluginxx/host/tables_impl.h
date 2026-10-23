@@ -298,6 +298,7 @@ struct GenericTableEntries {
 
     static int32_t PLUGINXX_CALL sessionWorkDirEntry(
         const PluginxxHost*       host,
+        const PluginxxScopeRef*   agent,
         const PluginxxStringView* thread_id,
         PluginxxString*           out
     ) {
@@ -313,9 +314,15 @@ struct GenericTableEntries {
             }
             auto              keep = call;
             const std::string tid  = thread_id ? svToStr(*thread_id) : std::string{};
-            auto              dir  = ioCallSyncKeep<std::string>(keep, mgr, [keep, tid]() {
+            PluginxxScopeRef  agentCopy{};
+            const bool        hasAgent = pluginxx_scope_ref_ok(agent) && agent;
+            if (hasAgent) {
+                agentCopy = *agent;
+            }
+            auto dir = ioCallSyncKeep<std::string>(keep, mgr, [keep, hasAgent, agentCopy, tid]() {
                 auto* hooks = keep.manager()->domainHooks();
-                return hooks ? hooks->sessionWorkDir(tid) : std::string{};
+                return hooks ? hooks->sessionWorkDir(hasAgent ? &agentCopy : nullptr, tid)
+                             : std::string{};
             });
             if (dir.empty()) {
                 return -1;
@@ -459,6 +466,7 @@ struct GenericTableEntries {
 
     static PluginxxSubscription* PLUGINXX_CALL subscribeEntry(
         const PluginxxHost*       host,
+        const PluginxxScopeRef*   agent,
         const PluginxxStringView* topic,
         void(PLUGINXX_CALL* handler)(const PluginxxStringView* event_json, void* ud),
         void* ud
@@ -470,13 +478,26 @@ struct GenericTableEntries {
             if (!mgr || !inst || detail::abiViewEmpty(topic) || !handler) {
                 return static_cast<PluginxxSubscription*>(nullptr);
             }
+            // 引用含借用视图: 投递前复制为自有的 id/seq (库内部结构)
             auto              keep      = call;
             const std::string topicCopy = svToStr(*topic);
+            PluginxxScopeRef  agentCopy{};
+            const bool        hasAgent = pluginxx_scope_ref_ok(agent) && agent;
+            if (hasAgent) {
+                agentCopy = *agent;
+            }
             return ioCallSyncKeep<PluginxxSubscription*>(
                 keep,
                 mgr,
-                [keep, topicCopy, handler, ud]() {
-                    return keep.manager()->subscribe(keep.instance(), topicCopy, handler, ud);
+                [keep, hasAgent, agentCopy, topicCopy, handler, ud]() {
+                    return keep.manager()
+                        ->subscribe(
+                            keep.instance(),
+                            hasAgent ? &agentCopy : nullptr,
+                            topicCopy,
+                            handler,
+                            ud
+                        );
                 }
             );
         });
@@ -597,6 +618,7 @@ struct GenericTableEntries {
 
     static PluginxxOperatorHandle* PLUGINXX_CALL invokeCapabilityAsyncEntry(
         const PluginxxHost*       host,
+        const PluginxxScopeRef*   agent,
         const PluginxxStringView* capability,
         const PluginxxStringView* method,
         const PluginxxStringView* args_json,
@@ -616,12 +638,18 @@ struct GenericTableEntries {
             const std::string cap  = svToStr(*capability);
             const std::string meth = svToStr(*method);
             const std::string args = args_json ? svToStr(*args_json) : std::string{"{}"};
+            PluginxxScopeRef  agentCopy{};
+            const bool        hasAgent = pluginxx_scope_ref_ok(agent) && agent;
+            if (hasAgent) {
+                agentCopy = *agent;
+            }
             return ioCallSyncKeep<PluginxxOperatorHandle*>(
                 keep,
                 mgr,
-                [keep, cap, meth, args, cb, ud, error_out]() {
+                [keep, hasAgent, agentCopy, cap, meth, args, cb, ud, error_out]() {
                     return keep.manager()->invokeCapabilityAsync(
                         keep.instance(),
+                        hasAgent ? &agentCopy : nullptr,
                         cap,
                         meth,
                         args,
@@ -837,6 +865,7 @@ struct GenericTableEntries {
 
     static int32_t PLUGINXX_CALL cancelIsCancelledEntry(
         const PluginxxHost*       host,
+        const PluginxxScopeRef*   agent,
         const PluginxxStringView* thread_id
     ) {
         return guardVtableCall(0, [&]() -> int32_t {
@@ -847,9 +876,15 @@ struct GenericTableEntries {
             }
             auto              keep = call;
             const std::string tid  = svToStr(*thread_id);
-            return ioCallSyncKeep<bool>(keep, mgr, [keep, tid]() {
+            PluginxxScopeRef  agentCopy{};
+            const bool        hasAgent = pluginxx_scope_ref_ok(agent) && agent;
+            if (hasAgent) {
+                agentCopy = *agent;
+            }
+            return ioCallSyncKeep<bool>(keep, mgr, [keep, hasAgent, agentCopy, tid]() {
                 auto* hooks = keep.manager()->domainHooks();
-                return hooks ? hooks->isSessionCancelled(tid) : false;
+                return hooks ? hooks->isSessionCancelled(hasAgent ? &agentCopy : nullptr, tid)
+                             : false;
             })
                        ? 1
                        : 0;
@@ -969,6 +1004,7 @@ struct GenericTableEntries {
             PLUGINXX_IFACE_CANCEL_VERSION,
             sizeof(PluginxxCancelIface),
             &cancelIsCancelledEntry,
+            &opCancelEntry,
         };
         return iface;
     }

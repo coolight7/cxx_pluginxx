@@ -33,7 +33,11 @@
 ///   调到隔壁函数) —— 要改就换新 IID;
 /// - 用 `_MIN_VERSION` 表达"我加了新成员"是错的 (那等于把老主程序全部判死)。
 ///
-/// 本表的当前状态: 全部为 v1 (本次一次性重置, 基线 = 完整布局, 还没有任何追加段)。
+/// 本表的当前状态: 通用表 10 张。其中 `events` / `capabilities` / `config` / `cancel`
+/// 为 v2 (agent 引用参数与表尾追加成员), 其余 6 张仍为 v1。
+///
+/// 接口契约的代次 (全局): v2 = 插件一次加载、可挂到多个 agent, agent 级接口
+/// 带 [PluginxxScopeRef]。v1 插件由 `PLUGINXX_MIN_API_VERSION` 挡在加载阶段。
 #ifndef PLUGINXX_API_TABLES_H
 #define PLUGINXX_API_TABLES_H
 
@@ -48,8 +52,9 @@ extern "C" {
 /* ==================== 接口表: 事件 (pluginxx.events) ==================== */
 
 #define PLUGINXX_IFACE_EVENTS             "pluginxx.events"
-#define PLUGINXX_IFACE_EVENTS_VERSION     1
-#define PLUGINXX_IFACE_EVENTS_MIN_VERSION 1
+/// v2: `subscribe` 增加 `agent` 参数 (可空 = 订阅主程序总线)
+#define PLUGINXX_IFACE_EVENTS_VERSION     2
+#define PLUGINXX_IFACE_EVENTS_MIN_VERSION 2
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
 #define PLUGINXX_IFACE_EVENTS_BASELINE_SIZE sizeof(PluginxxEventsIface)
 
@@ -57,8 +62,13 @@ typedef struct PluginxxEventsIface {
     int32_t  version; ///< 主程序填 PLUGINXX_IFACE_EVENTS_VERSION
     uint32_t struct_size;
 
+    /// 订阅事件
+    /// - `agent` 为空: 订阅主程序总线 (进程级事件; 一般在 `start` 里做);
+    /// - `agent` 非空: 订阅该 agent 的总线 (会话 / 轮次事件; 在 `mount` 里做);
+    ///   引用无效返回 NULL 并记警告
     PluginxxSubscription*(PLUGINXX_CALL* subscribe)(
         const PluginxxHost*       host,
+        const PluginxxScopeRef*   agent,
         const PluginxxStringView* topic,
         void(PLUGINXX_CALL* handler)(const PluginxxStringView* event_json, void* ud),
         void* ud
@@ -74,8 +84,9 @@ typedef struct PluginxxEventsIface {
 /* ==================== 接口表: 能力 (pluginxx.capabilities) ==================== */
 
 #define PLUGINXX_IFACE_CAPABILITIES             "pluginxx.capabilities"
-#define PLUGINXX_IFACE_CAPABILITIES_VERSION     1
-#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 1
+/// v2: `invoke_capability_async` 增加 `agent` 参数 (可空 = 发起方不在 agent 上下文)
+#define PLUGINXX_IFACE_CAPABILITIES_VERSION     2
+#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 2
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
 #define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE sizeof(PluginxxCapabilitiesIface)
 
@@ -108,6 +119,7 @@ typedef struct PluginxxCapabilitiesIface {
 
     PluginxxOperatorHandle*(PLUGINXX_CALL* invoke_capability_async)(
         const PluginxxHost*       host,
+        const PluginxxScopeRef*   agent,
         const PluginxxStringView* capability,
         const PluginxxStringView* method,
         const PluginxxStringView* args_json,
@@ -228,8 +240,9 @@ typedef struct PluginxxPluginsIface {
 /* ==================== 接口表: 主程序配置 (pluginxx.config) ==================== */
 
 #define PLUGINXX_IFACE_CONFIG             "pluginxx.config"
-#define PLUGINXX_IFACE_CONFIG_VERSION     1
-#define PLUGINXX_IFACE_CONFIG_MIN_VERSION 1
+/// v2: `get_session_work_dir` 增加 `agent` 参数
+#define PLUGINXX_IFACE_CONFIG_VERSION     2
+#define PLUGINXX_IFACE_CONFIG_MIN_VERSION 2
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
 #define PLUGINXX_IFACE_CONFIG_BASELINE_SIZE sizeof(PluginxxConfigIface)
 
@@ -251,10 +264,12 @@ typedef struct PluginxxConfigIface {
         PluginxxString*           out
     );
     /// 指定会话生效的工作目录 (io 线程; host->alloc; 失败/未加载返回空串):
+    /// - `agent` 必须非空 (引用无效返回 -1 并记警告): 会话属于某个 agent
     /// - session_id 非空: worktree 绑定优先, 依次回退会话覆写 / AgentConfig
     /// - session_id 为空: 返回解析后的默认会话工作目录
     int32_t(PLUGINXX_CALL* get_session_work_dir)(
         const PluginxxHost*       host,
+        const PluginxxScopeRef*   agent,
         const PluginxxStringView* session_id,
         PluginxxString*           out
     );
@@ -276,20 +291,27 @@ typedef struct PluginxxConfigIface {
 /* ==================== 接口表: 会话取消状态 (pluginxx.cancel) ==================== */
 
 #define PLUGINXX_IFACE_CANCEL             "pluginxx.cancel"
-#define PLUGINXX_IFACE_CANCEL_VERSION     1
-#define PLUGINXX_IFACE_CANCEL_MIN_VERSION 1
+/// v2: `is_cancelled` 增加 `agent` 参数; 表尾追加 `op_cancel` (取消异步操作句柄)
+#define PLUGINXX_IFACE_CANCEL_VERSION     2
+#define PLUGINXX_IFACE_CANCEL_MIN_VERSION 2
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
 #define PLUGINXX_IFACE_CANCEL_BASELINE_SIZE sizeof(PluginxxCancelIface)
 
 typedef struct PluginxxCancelIface {
     int32_t  version; ///< 主程序填 PLUGINXX_IFACE_CANCEL_VERSION
     uint32_t struct_size;
-    /// 查询会话当前轮次是否已取消 (advisory 定位; 权威通知始终是 cancel 回调)
 
+    /// 查询会话当前轮次是否已取消 (advisory 定位; 权威通知始终是 cancel 回调)
+    /// - `agent` 必须非空 (引用无效返回 0 并记警告)
     int32_t(PLUGINXX_CALL* is_cancelled)(
         const PluginxxHost*       host,
-        const PluginxxStringView* session_id
+        const PluginxxScopeRef*   agent,
+        const PluginxxStringView* thread_id
     );
+
+    /// 取消一次异步操作句柄 (协作式; 与 scheduler/capabilities/tasks 的取消同语义)
+    /// - 异步接口统一在这里取消, 不再每张业务表各留一份
+    void(PLUGINXX_CALL* op_cancel)(PluginxxOperatorHandle* op);
 } PluginxxCancelIface;
 
 /* ==================== 接口表: JSON 辅助 (pluginxx.json) ==================== */

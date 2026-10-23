@@ -1641,6 +1641,61 @@ inline void BridgeRoot::abandon(std::string_view reason) noexcept {
 
 } // namespace detail
 
+/* ==================== 作用域引用的值类型 (ScopeRef) ==================== */
+
+/// 主程序作用域引用的**值类型**: 自己持有 id 字符串 + 序号
+///
+/// - 用于插件把"我挂在哪个 agent 上"存进 per-agent 状态, 之后任何线程都能直接用;
+/// - [raw] 返回借用视图 (指向本对象内部), 因此只能在本对象存活期间使用;
+/// - 可拷贝 / 可比较 / 可排序 (日志与诊断)。
+class ScopeRef {
+public:
+
+    ScopeRef() = default;
+
+    ScopeRef(std::string id, uint64_t seq) :
+        id_(std::move(id)),
+        seq_(seq) {}
+
+    std::string_view id() const noexcept {
+        return id_;
+    }
+
+    uint64_t seq() const noexcept {
+        return seq_;
+    }
+
+    bool empty() const noexcept {
+        return id_.empty();
+    }
+
+    /// 传给接口表的借用视图 (指向本对象内部, 不要长期保存)
+    PluginxxScopeRef raw() const noexcept {
+        PluginxxScopeRef ref{};
+        ref.struct_size = static_cast<uint32_t>(sizeof(PluginxxScopeRef));
+        ref.flags       = 0;
+        ref.id          = PluginStringView::from(id_.data(), id_.size());
+        ref.seq         = seq_;
+        return ref;
+    }
+
+    friend bool operator==(const ScopeRef& a, const ScopeRef& b) noexcept {
+        return a.seq_ == b.seq_ && a.id_ == b.id_;
+    }
+
+    friend bool operator<(const ScopeRef& a, const ScopeRef& b) noexcept {
+        if (a.id_ != b.id_) {
+            return a.id_ < b.id_;
+        }
+        return a.seq_ < b.seq_;
+    }
+
+private:
+
+    std::string id_;
+    uint64_t    seq_ = 0;
+};
+
 /* ==================== 插件框架事件驱动取消注册表 (CancelRegistry) ==================== */
 
 /// 插件框架事件驱动取消注册表
@@ -1929,6 +1984,8 @@ struct OpCtl {
     const PluginxxCancelIface*         cancelIface = nullptr;
     std::string                        sessionId;
     CancelRegistry*                    cancelRegistry = nullptr;
+    /// 本操作所属的作用域 (哪个 agent 的会话); 空 = 不归因
+    ScopeRef agent;
 
     bool cancelled() const noexcept {
         if (cancelFlag && cancelFlag->load(std::memory_order_acquire)) {
@@ -1938,8 +1995,9 @@ struct OpCtl {
             return true;
         }
         if (host && cancelIface && cancelIface->is_cancelled && !sessionId.empty()) {
-            auto sv = PluginStringView::from(sessionId.data(), sessionId.size());
-            return cancelIface->is_cancelled(host, &sv) != 0;
+            auto sv  = PluginStringView::from(sessionId.data(), sessionId.size());
+            auto ref = agent.raw();
+            return cancelIface->is_cancelled(host, agent.empty() ? nullptr : &ref, &sv) != 0;
         }
         return false;
     }
@@ -2928,12 +2986,15 @@ public:
         return res;
     }
 
-    std::string workDir(PluginxxStringView tid = {}) const {
+    /// 会话生效的工作目录 (`get_session_work_dir`)
+    /// - `agent` 是本挂载的 agent 引用 (`mount` 时存下来的那份); 会话属于某个 agent
+    /// - `tid` 为空 = 该 agent 的默认会话工作目录
+    std::string workDir(const PluginxxScopeRef* agent, PluginxxStringView tid = {}) const {
         if (!host || !iface.config || !iface.config->get_session_work_dir) {
             return "";
         }
         PluginxxString s{nullptr, 0};
-        iface.config->get_session_work_dir(host, &tid, &s);
+        iface.config->get_session_work_dir(host, agent, &tid, &s);
         if (s.data) {
             std::string res(s.data, static_cast<size_t>(s.size));
             PluginString::free(host, &s);
@@ -2942,8 +3003,8 @@ public:
         return "";
     }
 
-    std::string workDir(std::string_view tid) const {
-        return workDir(PluginStringView::from(tid.data(), tid.size()));
+    std::string workDir(const PluginxxScopeRef* agent, std::string_view tid) const {
+        return workDir(agent, PluginStringView::from(tid.data(), tid.size()));
     }
 
     std::string argsJson() const {
@@ -2998,7 +3059,8 @@ public:
     /// 会话是否已取消 (优化版: 优先本地无抖动查询)
     /// - 主程序下发 cancel 时已通过 execute_cancel 写入 cancelRegistry
     /// - 故本地为 true 时必然已取消，直接返回 true，避免任何跨线程通信
-    bool sessionCancelled(PluginxxStringView tid) const {
+    /// - `agent` 是本挂载的 agent 引用（会话属于某个 agent）
+    bool sessionCancelled(const PluginxxScopeRef* agent, PluginxxStringView tid) const {
         if (!tid.data || tid.size == 0) {
             return false;
         }
@@ -3009,11 +3071,11 @@ public:
         if (!host || !iface.cancel || !iface.cancel->is_cancelled) {
             return false;
         }
-        return iface.cancel->is_cancelled(host, &tid) != 0;
+        return iface.cancel->is_cancelled(host, agent, &tid) != 0;
     }
 
-    bool sessionCancelled(std::string_view tid) const {
-        return sessionCancelled(PluginStringView::from(tid.data(), tid.size()));
+    bool sessionCancelled(const PluginxxScopeRef* agent, std::string_view tid) const {
+        return sessionCancelled(agent, PluginStringView::from(tid.data(), tid.size()));
     }
 
     char* strdup(PluginxxStringView sv) const {
@@ -3349,6 +3411,21 @@ enum class AwaiterState : uint32_t {
 struct InvokeCapState {
     const PluginxxHost*              host = nullptr;
     const PluginxxCapabilitiesIface* caps = nullptr;
+    PluginxxScopeRef                 agent{}; ///< 归因引用 (借用视图指向 awaiter 内部)
+    std::string                      agentId;
+    uint64_t                         agentSeq = 0;
+
+    /// 归因引用 (空 id 时返回 NULL; 否则指向本结构体内部, 仅供本次调用)
+    const PluginxxScopeRef* agentScope() {
+        if (agentId.empty()) {
+            return nullptr;
+        }
+        agent.struct_size = static_cast<uint32_t>(sizeof(PluginxxScopeRef));
+        agent.flags       = 0;
+        agent.id          = PluginStringView::from(agentId.data(), agentId.size());
+        agent.seq         = agentSeq;
+        return &agent;
+    }
     /// 协程驱动桥 (可空): 完成回调经它投递 continuation 并唤醒 driver。
     PollOneBridge*            bridge = nullptr;
     std::string               capability;
@@ -3371,7 +3448,9 @@ struct InvokeCapAwaiter {
         std::string_view                 in_cap,
         std::string_view                 in_method,
         std::string_view                 in_args,
-        PollOneBridge*                   in_bridge = nullptr
+        PollOneBridge*                   in_bridge = nullptr,
+        std::string_view                 in_agent  = {},
+        uint64_t                         in_agentSeq = 0
     ) :
         st(std::make_shared<InvokeCapState>()) {
         st->host       = in_host;
@@ -3380,6 +3459,8 @@ struct InvokeCapAwaiter {
         st->method     = std::string(in_method);
         st->argsJson   = std::string(in_args);
         st->bridge     = in_bridge;
+        st->agentId    = std::string(in_agent);
+        st->agentSeq   = in_agentSeq;
     }
 
     bool await_ready() const noexcept {
@@ -3399,6 +3480,7 @@ struct InvokeCapAwaiter {
 
         st->opHandle = st->caps->invoke_capability_async(
             st->host,
+            st->agentScope(),
             &capSv,
             &methSv,
             &argsSv,
@@ -3518,6 +3600,27 @@ inline detail::InvokeCapAwaiter invoke_cap(
         method,
         argsJson,
         &ctx.bridge()
+    };
+}
+
+/// 带作用域归因的能力调用 (被调方可以从请求上下文知道"谁在调")
+template<typename Ctx>
+inline detail::InvokeCapAwaiter invoke_cap(
+    const Ctx&             ctx,
+    const ScopeRef&        agent,
+    std::string_view       capability,
+    std::string_view       method,
+    std::string_view       argsJson = "{}"
+) {
+    return detail::InvokeCapAwaiter{
+        ctx.host,
+        ctx.iface.capabilities,
+        capability,
+        method,
+        argsJson,
+        &ctx.bridge(),
+        agent.id(),
+        agent.seq()
     };
 }
 
@@ -3689,6 +3792,7 @@ inline PluginxxString invoke_capability_blocking(
     const PluginxxHost*              host,
     const PluginxxCapabilitiesIface* caps,
     const PluginxxSchedulerIface*    sched,
+    const PluginxxScopeRef*          agent,
     std::string_view                 capability,
     std::string_view                 method,
     std::string_view                 args_json,
@@ -3724,6 +3828,7 @@ inline PluginxxString invoke_capability_blocking(
 
     PluginxxOperatorHandle* handle = caps->invoke_capability_async(
         host,
+        agent,
         &capSv,
         &methSv,
         &argsSv,

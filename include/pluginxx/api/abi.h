@@ -50,16 +50,21 @@ extern "C" {
 #define PLUGINXX_CALL
 #endif
 
-/// 全局 API 版本 (agent 侧; 当前框架版本, 用于展示与新增能力判定)
-#define PLUGINXX_API_VERSION 1
+/// 全局 API 版本 (本框架的 SDK 版本, 用于展示与新增能力判定)
+///
+/// 历史: v1 = 每 agent 一份插件实例; v2 = 插件一次加载、可挂到多个 agent,
+/// agent 级接口带 [PluginxxScopeRef]。
+#define PLUGINXX_API_VERSION 2
 
 /// 框架支持的最低插件 API 版本
 ///
 /// 检查规则只有这一条: 插件 `PluginxxInfo.api_version >= PLUGINXX_MIN_API_VERSION`。
 /// 插件声明更高版本不再被拒绝 (更高版本意味着它可能用了当前框架没有的能力, 由插件
-/// 自己在 `get_info` 里读 `PLUGINXX_API_VERSION` 决定要不要降级), 也允许插件声明
-/// 比当前框架更低的版本继续运行。
-#define PLUGINXX_MIN_API_VERSION 1
+/// 自己在 `get_info` 里读 `PLUGINXX_API_VERSION` 决定要不要降级)。
+///
+/// v1 插件被本值挡住 (加载阶段直接拒绝, 提示重编), 因此 v1 里"每个实例只服务一个
+/// agent"的心智模型不会和新契约混用。
+#define PLUGINXX_MIN_API_VERSION 2
 
 #pragma pack(push, 8)
 
@@ -81,6 +86,37 @@ typedef struct PluginxxString {
     char* data; ///< 指向主程序堆分配的 UTF-8 字节序列 (以 \0 结尾; 空串或 NULL 时可为 NULL)
     uint64_t size; ///< 字节数 (不含结尾 \0; O(1) 访问)
 } PluginxxString;
+
+/// ==================== 主程序作用域引用 ====================
+
+/// 主程序侧作用域的引用 (agentxx 里作用域 = 一个已挂载的 agent)
+///
+/// 凡是需要落到某个具体 agent 的接口都带一个本结构体指针, 由调用方显式说明
+/// "这是哪个 agent"; 主程序不保存"当前是哪个挂载"这类隐式状态。
+///
+/// - `id` 是**借用视图**, 指向调用方自己的内存, 只要本次调用期间有效即可;
+/// - `seq` 是挂载时下发的单调序号: 同一 id 卸载后重新挂载会拿到新序号,
+///   上一轮留在调用方里的旧引用自动失效 (否则上一轮的状态会写进新的一轮);
+///   0 = 不校验序号;
+/// - 结构体带 `struct_size`: 以后追加字段时老调用方传旧长度, 主程序只读基线以内的字段。
+typedef struct PluginxxScopeRef {
+    uint32_t           struct_size; ///< sizeof(PluginxxScopeRef)
+    uint32_t           flags;       ///< 预留 (0)
+    PluginxxStringView id;          ///< 作用域标识 (UTF-8; 借用调用方内存)
+    uint64_t           seq;         ///< 作用域序号; 0 = 不校验
+} PluginxxScopeRef;
+
+/// 基线: 重置时 = 完整布局; 以后追加字段保持不变 (改为 offsetof(第一个追加字段))
+#define PLUGINXX_SCOPE_REF_BASELINE_SIZE sizeof(PluginxxScopeRef)
+
+/// 引用是否可读 (为空或长度不足基线时返回 0)
+static inline int32_t pluginxx_scope_ref_ok(const PluginxxScopeRef* ref) {
+    if (!ref) {
+        return 0;
+    }
+    return (ref->struct_size == 0 || ref->struct_size >= PLUGINXX_SCOPE_REF_BASELINE_SIZE) ? 1
+                                                                                          : 0;
+}
 
 /// ==================== 插件元信息 ====================
 
@@ -225,6 +261,9 @@ typedef struct PluginxxBuiltinInfo {
     PluginxxDestroyFn destroy; ///< 可空 (实例销毁)
     PluginxxStartFn start; ///< 可空 (create 后的注册/启动事务)
     PluginxxStopFn  stop;  ///< 可空 (关闭事务, destroy 前调用)
+    /// 主程序的"每 agent 挂载"入口 (可空; 类型由主程序解释, 框架只透传)
+    void* mount;
+    void* unmount;
 } PluginxxBuiltinInfo;
 
 // 与 PluginxxBuiltinInfo 同步生成于主程序侧的内置插件清单源码

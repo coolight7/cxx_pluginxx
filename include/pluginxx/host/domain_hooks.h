@@ -30,7 +30,10 @@ public:
     // ==================== 事件表 ====================
 
     /// 事件后端; 返回 nullptr 表示主程序不支持事件订阅/发布
-    virtual std::shared_ptr<EventSource> eventSource() {
+    /// - `agent` 为空: 主程序总线 (进程级事件)
+    /// - `agent` 非空: 该 agent 的总线 (会话 / 轮次事件); 引用无效时返回 nullptr
+    virtual std::shared_ptr<EventSource> eventSource(const PluginxxScopeRef* agent) {
+        (void)agent;
         return nullptr;
     }
 
@@ -55,7 +58,8 @@ public:
     virtual std::string toolPromptJson(std::string_view toolName) = 0;
 
     /// 指定会话生效的工作目录 (`get_session_work_dir`; 空 sessionId = 默认工作目录)
-    virtual std::string sessionWorkDir(std::string_view sessionId) = 0;
+    /// - `agent` 非空而引用无效时由实现方返回空串
+    virtual std::string sessionWorkDir(const PluginxxScopeRef* agent, std::string_view sessionId) = 0;
 
     /// 当前语言代码 (如 "en" / "zh-cn"); 空串由调用方回退为 "en"
     virtual std::string language() = 0;
@@ -66,7 +70,8 @@ public:
     // ==================== cancel 表 ====================
 
     /// 会话当前轮次是否已取消 (`is_cancelled`; 权威通知始终是取消回调)
-    virtual bool isSessionCancelled(std::string_view sessionId) = 0;
+    /// - `agent` 非空而引用无效时返回 false
+    virtual bool isSessionCancelled(const PluginxxScopeRef* agent, std::string_view sessionId) = 0;
 
     // ==================== plugins 表 ====================
 
