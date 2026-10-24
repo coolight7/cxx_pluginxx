@@ -236,7 +236,7 @@ public:
         PluginxxString*          error_out
     ) {
         // 引用只用于归因 (不影响路由), 当前只做有效性记录, 供后续能力方法识别人发起方;
-        // 能力本身是宿主级, 不因 agent 不同而分流。
+        // 能力本身是主程序级的, 不因 agent 不同而分流。
         const std::string callerScope
             = (pluginxx_scope_ref_ok(agent) && agent && agent->id.data && agent->id.size > 0)
                   ? std::string(agent->id.data, static_cast<size_t>(agent->id.size))

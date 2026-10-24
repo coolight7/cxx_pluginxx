@@ -878,6 +878,27 @@ protected:
         (void)enabled;
     }
 
+    /// 禁用事务完成后的主程序补充动作 (可选覆写)
+    ///
+    /// - 调用时机: 骨架已摘除该实例的全部注册、stop 事务已完成 (或无需 stop);
+    /// - 需要"禁用时跟着拆掉某个作用域"的主程序在这里做 (agentxx: 拆插件挂载);
+    /// - 在管理器 io executor 上执行, 可以长时间等待, 但异常会被骨架记录并忽略。
+    virtual asio::awaitable<void> onInstanceDisabledAsync(const InstancePtr& inst) {
+        (void)inst;
+        co_return;
+    }
+
+    /// 启用事务完成后的主程序补充动作 (可选覆写)
+    ///
+    /// - 调用时机: start 事务已成功、状态已回到 Ready;
+    /// - 需要"启用时重新建好某个作用域"的主程序在这里做 (agentxx: 重新挂载插件,
+    ///   因为 agent 级的注册都发生在插件的 `mount` 回调里);
+    /// - 失败只记日志: 实例仍是启用状态, 只是没挂到该作用域上。
+    virtual asio::awaitable<void> onInstanceEnabledAsync(const InstancePtr& inst) {
+        (void)inst;
+        co_return;
+    }
+
     /// 实例加载完成 (状态置 Ready 之前) 的主程序收尾
     virtual void onInstanceLoaded(InstanceT& inst) {
         (void)inst;
@@ -1208,6 +1229,8 @@ protected:
                 this->ioExecutor(),
                 [self, inst]() -> asio::awaitable<void> {
                     co_await self->stopForDisable(inst);
+                    // 主程序补充动作: 禁用时拆掉该实例在本程序侧的作用域 (agentxx: 拆挂载)
+                    co_await self->onInstanceDisabledAsync(inst);
                 },
                 [inst, tag = std::string{logTag()}](std::exception_ptr e) {
                     if (!e) {
@@ -1243,6 +1266,10 @@ protected:
                 this->ioExecutor(),
                 [self, inst]() -> asio::awaitable<void> {
                     co_await self->startForEnable(inst);
+                    // 主程序补充动作: 重新挂到作用域上 (agent 级注册都在插件的 mount 里)
+                    if (inst->enabled) {
+                        co_await self->onInstanceEnabledAsync(inst);
+                    }
                 },
                 [inst, tag = std::string{logTag()}](std::exception_ptr e) {
                     if (!e) {
