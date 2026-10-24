@@ -28,6 +28,15 @@ cmake_policy(SET CMP0167 OLD)
 set(PLUGINXX_VERSION "0.1.0")
 project(cxx_pluginxx VERSION ${PLUGINXX_VERSION} LANGUAGES C CXX)
 
+# 插件 API 契约版本: 代码里 (pluginxx/api/abi.h) 的默认值是 1 —— 本库被多个
+# 主程序共用, 默认值不跟随某一个主程序的契约。需要更高契约的主程序在本库构建时
+# 传入这两个变量 (例如 -DPLUGINXX_API_VERSION=2), 值会作为 PUBLIC 定义下发,
+# 保证框架、使用方与插件看到同一个值。
+set(PLUGINXX_API_VERSION "1" CACHE STRING "插件 API 版本 (代码默认 1)")
+set(PLUGINXX_MIN_API_VERSION "1" CACHE STRING "框架接受的最低插件 API 版本")
+set(PLUGINXX_API_VERSION_VALUE ${PLUGINXX_API_VERSION})
+set(PLUGINXX_MIN_API_VERSION_VALUE ${PLUGINXX_MIN_API_VERSION})
+
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
@@ -103,7 +112,14 @@ set_target_properties(${_CXX_PLUGINXX_TARGETS} PROPERTIES
 )
 
 if (XX_IS_MSVC_D)
-  # 导出面控制 (MSVC): 动态库默认不导出任何符号, 仅导出标注 PLUGINXX_API 的公开 API。
+  foreach (_t ${_CXX_PLUGINXX_TARGETS})
+    target_compile_definitions(${_t} PUBLIC
+        PLUGINXX_API_VERSION=${PLUGINXX_API_VERSION_VALUE}
+        PLUGINXX_MIN_API_VERSION=${PLUGINXX_MIN_API_VERSION_VALUE}
+    )
+endforeach()
+
+# 导出面控制 (MSVC): 动态库默认不导出任何符号, 仅导出标注 PLUGINXX_API 的公开 API。
   # 不能使用 WINDOWS_EXPORT_ALL_SYMBOLS (CMake 自动导出): 该机制要解析每个 .obj 的
   # 符号表生成 .def, 而 /GL (LTO) 产物不含符号表 (dumpbin: "ANONYMOUS OBJECT"),
   # 解析必失败 ("unrecognized file format in 'xxx.obj, 0'"), 即自动导出与 LTO 互斥。

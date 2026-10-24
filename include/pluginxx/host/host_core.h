@@ -332,7 +332,7 @@ public:
         sub->handler = handler;
         sub->ud      = ud;
         if (agent && agent->id.data && agent->id.size > 0) {
-            sub->agentId.assign(agent->id.data, static_cast<size_t>(agent->id.size));
+            sub->scopeId.assign(agent->id.data, static_cast<size_t>(agent->id.size));
         }
 
         const size_t subId = source->subscribe(sub->topic, [sub](std::string_view data) {

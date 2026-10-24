@@ -70,8 +70,8 @@ struct PluginxxSubscription {
     size_t subscriptionId = 0;
     /// 插件实例 (弱引用: 句柄不延长实例生命周期)
     std::weak_ptr<pluginxx::PluginInstanceBase> inst;
-    /// 订阅时的 agent 标识 (空 = 订阅的是主程序总线; 挂载卸载时据此筛出本挂载的订阅)
-    std::string agentId;
+    /// 订阅时的作用域标识 (空 = 订阅的是主程序总线; 卸载作用域时据此筛出该作用域的订阅)
+    std::string scopeId;
     /// 插件框架运行时 (撤销时把簿记投递到 IO 线程; 弱引用不延长其生命周期)
     std::weak_ptr<pluginxx::PluginRuntime> runtime;
     /// 插件事件回调 (C ABI 函数指针)
