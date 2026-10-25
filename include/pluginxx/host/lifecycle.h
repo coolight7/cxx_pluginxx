@@ -191,12 +191,15 @@ public:
             XX_LOGW("{}Plugin `{}` get_info threw unknown exception", logTag(), path);
         }
         if (info && info->api_version < PLUGINXX_MIN_API_VERSION) {
+            // info 指向插件内部内存: 先把取值取出来再关库 (关库后插件代码段/常量段
+            // 可能已释放, 再读 info 就是访问已卸载的内存 —— 实测 ASan 报 access-violation)
+            const auto pluginApiVersion = info->api_version;
             NativeLoader::close(dl);
             XX_LOGE(
                 "{}Plugin `{}` API version too old (got {}, framework requires >= {})",
                 logTag(),
                 path,
-                info->api_version,
+                pluginApiVersion,
                 PLUGINXX_MIN_API_VERSION
             );
             co_return nullptr;
