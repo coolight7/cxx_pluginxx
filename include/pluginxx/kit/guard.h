@@ -10,9 +10,8 @@
 /// - [reportCurrentException]: 重抛检查当前异常并分类上报;
 /// - [guardCall] / [guardCallVoid]: 有/无返回值的 C ABI 边界守卫 (异常 → 上报 + 回退值)。
 ///
-/// 主程序业务部分 (client 侧日志接口表的重载) 位于主程序仓库: agentxx 侧见
-/// [plugin_guard.h](/agent/lib/include/agentxx/plugin/api/plugin_guard.h), 该头包含本头并把
-/// 通用名引入 `agentxx::plugin`。
+/// 主程序业务部分 (如 client 侧日志接口表的重载) 由主程序自己补: 主程序在自己的
+/// 头文件里包含本头, 并用 `using` 把通用名引入本程序命名空间即可。
 #pragma once
 #include "pluginxx/kit/kit.h"
 

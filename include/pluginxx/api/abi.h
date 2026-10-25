@@ -250,8 +250,8 @@ typedef void*(PLUGINXX_CALL* PluginxxStopFn)(
 
 /* ==================== 插件入口符号名 (由主程序定义, 见 pluginxx/api/entry.h) ==================== */
 
-/// 插件框架**不**定义入口符号名常量: 符号名属于主程序命名空间 (agentxx 用
-/// `agentxx_plugin_agent_*` / `agentxx_plugin_client_*`, musicxx 用 `musicxx_plugin_*`)。
+/// 插件框架**不**定义入口符号名常量: 符号名属于主程序命名空间
+/// (形如 `<主程序前缀>_plugin_agent_*` / `<主程序前缀>_plugin_client_*`)。
 /// - 主程序侧: 覆写 `pluginxx::PluginHostLifecycle::entrySymbols()` 交出符号名;
 /// - 插件侧: 用 `PLUGINXX_EXPORT_PLUGIN(SymbolPrefix, ...)` (见 kit.h) 生成入口。
 

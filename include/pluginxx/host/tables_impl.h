@@ -133,7 +133,7 @@ struct GenericTableEntries {
                 break;
         }
         // 模块名 `plugin.<插件名>` (计划 OBS-5): 主程序可按插件前缀单独调日志级别
-        // (如 `plugin.agentxx_codegraph=debug`); 只读查询入口, 关闭过程中也允许记录
+        // (如 `plugin.example_plugin=debug`); 只读查询入口, 关闭过程中也允许记录
         std::string module{"plugin"};
         if (auto call = enterHost(host, /*allowClosing=*/true); call.ok()) {
             if (const auto* inst = call.instance(); inst != nullptr && !inst->name.empty()) {

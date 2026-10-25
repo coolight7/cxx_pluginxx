@@ -8,7 +8,7 @@
 /// - [PluginHostCore] (host_core.h): 通用表 (log/json/config/plugins/events/
 ///   scheduler/coroutine_runtime/tasks/cancel/capabilities) 的状态与方法实现;
 /// - 本类的 [PluginHostLifecycle]: 在框架核心之上补齐上面那套生命周期骨架;
-/// - 主程序 (agentxx / musicxx): 业务表 + 业务注册 + 业务数据。
+/// - 主程序: 业务表 + 业务注册 + 业务数据。
 ///
 /// 主程序用法:
 /// ```cpp
@@ -64,7 +64,7 @@ namespace pluginxx {
 
 /// 插件加载参数 (与主程序配置类型解耦: 主程序把自己的配置字段拷进来)
 ///
-/// 背景: 各主程序的配置类型不同 (agentxx 的 `agent::PluginConfig` 等), 插件框架
+/// 背景: 各主程序的配置类型不同, 插件框架
 /// 不能引用它们, 因此加加载口只接收这两个真正会用到的字段。
 struct PluginLoadOptions {
     /// 插件配置参数 (yaml `plugins` 条目 args; 主程序原样保存, 不解析字段语义)
@@ -77,7 +77,7 @@ struct PluginLoadOptions {
 ///
 /// - `InstanceT` 须继承 [PluginInstanceBase], 且由主程序经 [createInstance] 构造;
 /// - 主程序业务动作经"主程序扩展点"(纯虚函数与可选覆写)注入, 见各类说明;
-/// - 本类提供的行为与 agentxx 既有实现逐条一致 (含失败回滚、关闭超时、
+/// - 本类提供的行为与既有主程序实现逐条一致 (含失败回滚、关闭超时、
 ///   停止后重试、级联依赖), 新接入的主程序无需重复实现。
 template<typename InstanceT>
 class PluginHostLifecycle : public PluginHostCore<InstanceT> {
@@ -884,7 +884,7 @@ protected:
     /// 禁用事务完成后的主程序补充动作 (可选覆写)
     ///
     /// - 调用时机: 骨架已摘除该实例的全部注册、stop 事务已完成 (或无需 stop);
-    /// - 需要"禁用时跟着拆掉某个作用域"的主程序在这里做 (agentxx: 拆插件挂载);
+    /// - 需要"禁用时跟着拆掉某个作用域"的主程序在这里做 (如拆掉插件挂载);
     /// - 在管理器 io executor 上执行, 可以长时间等待, 但异常会被骨架记录并忽略。
     virtual asio::awaitable<void> onInstanceDisabledAsync(const InstancePtr& inst) {
         (void)inst;
@@ -894,7 +894,7 @@ protected:
     /// 启用事务完成后的主程序补充动作 (可选覆写)
     ///
     /// - 调用时机: start 事务已成功、状态已回到 Ready;
-    /// - 需要"启用时重新建好某个作用域"的主程序在这里做 (agentxx: 重新挂载插件,
+    /// - 需要"启用时重新建好某个作用域"的主程序在这里做 (如重新挂载插件,
     ///   因为 agent 级的注册都发生在插件的 `mount` 回调里);
     /// - 失败只记日志: 实例仍是启用状态, 只是没挂到该作用域上。
     virtual asio::awaitable<void> onInstanceEnabledAsync(const InstancePtr& inst) {
@@ -1232,7 +1232,7 @@ protected:
                 this->ioExecutor(),
                 [self, inst]() -> asio::awaitable<void> {
                     co_await self->stopForDisable(inst);
-                    // 主程序补充动作: 禁用时拆掉该实例在本程序侧的作用域 (agentxx: 拆挂载)
+                    // 主程序补充动作: 禁用时拆掉该实例在本程序侧的作用域 (如拆挂载)
                     co_await self->onInstanceDisabledAsync(inst);
                 },
                 [inst, tag = std::string{logTag()}](std::exception_ptr e) {

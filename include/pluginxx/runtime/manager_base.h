@@ -1,6 +1,6 @@
 /// pluginxx 插件管理器公共基类 (主程序侧, 与主程序业务无关)
 ///
-/// 背景: agent 侧 PluginManager 与 client 侧 ClientPluginManager 存在大量重复基建
+/// 背景: agent 侧与 client 侧的插件管理器存在大量重复基建
 /// (插件表查找/名称预占、io 线程投递、实例 lease 归零等待、反向必选依赖收集)。
 /// 提取到本基类避免两侧行为漂移。
 ///

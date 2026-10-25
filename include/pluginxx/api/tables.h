@@ -250,7 +250,7 @@ typedef struct PluginxxConfigIface {
     int32_t  version; ///< 主程序填 PLUGINXX_IFACE_CONFIG_VERSION
     uint32_t struct_size;
 
-    /// 主程序 AgentConfig 关键字段 JSON (io 线程; host->alloc):
+    /// 主程序配置的关键字段 JSON (io 线程; host->alloc):
     /// {"dataDir": "...", "projectRoot": "..."(可为空), "platform":
     /// "windows"|"linux"|"macos"|"android"|"ios"}
     int32_t(PLUGINXX_CALL* get_config)(const PluginxxHost* host, PluginxxString* out);
@@ -265,7 +265,7 @@ typedef struct PluginxxConfigIface {
     );
     /// 指定会话生效的工作目录 (io 线程; host->alloc; 失败/未加载返回空串):
     /// - `agent` 必须非空 (引用无效返回 -1 并记警告): 会话属于某个 agent
-    /// - session_id 非空: worktree 绑定优先, 依次回退会话覆写 / AgentConfig
+    /// - session_id 非空: 会话级覆写优先, 未设置时回退主程序默认工作目录
     /// - session_id 为空: 返回解析后的默认会话工作目录
     int32_t(PLUGINXX_CALL* get_session_work_dir)(
         const PluginxxHost*       host,

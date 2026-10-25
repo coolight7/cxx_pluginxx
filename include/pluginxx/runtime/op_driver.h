@@ -660,7 +660,7 @@ inline asio::awaitable<std::string> awaitPluginOp(PluginOpAwaitArgs args) {
     try {
         co_await core->wait();
     } catch (...) {
-        // 清理后原样传播取消/NodeInterrupt；不把协程控制流转换为普通失败。
+        // 清理后原样传播取消/中断；不把协程控制流转换为普通失败。
         abort = std::current_exception();
     }
     if (cancel) {

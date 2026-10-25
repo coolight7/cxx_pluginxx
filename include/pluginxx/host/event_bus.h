@@ -2,7 +2,7 @@
 ///
 /// 内容:
 /// - [EventSource]: 主程序事件总线的最小抽象 (订阅 / 撤销 / 发布) —— 主程序用自己已有的
-///   事件系统实现它 (agentxx 侧见 `agentxx/plugin/plugin_event_source.h`);
+///   事件系统实现它;
 /// - [PluginxxSubscription]: 事件订阅句柄的**实现体** (C ABI 中作为不透明指针
 ///   `PluginxxSubscription*` 传递, 因此名字保持 ABI 冻结时的形态);
 /// - [unsubscribePluginSubscription]: 幂等撤销 (任意线程; 主程序侧簿记在 IO 线程执行)。

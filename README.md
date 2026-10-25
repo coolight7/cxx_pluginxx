@@ -8,14 +8,14 @@
   清单与依赖顺序、接口表查询、协程驱动、取消与卸载 (> 通用接口表实现见下)
 - **主程序业务内容不在此**: 各主程序自身的业务工具/权限/钩子/会话/UI/事件/自身信息等, 均由主程序自行定义与实现
 - **依赖**: `cxx_utilxx_base` (取消令牌/日志/JSON)、fmt、Boost (仅头文件, 不链接 Boost 编译库)
-  —— **禁止**依赖 neograph / OpenSSL / SQLite / 任何主程序业务头文件
+  —— **禁止**依赖 OpenSSL / SQLite 等重依赖与任何主程序业务头文件
 
 ## 跨边界 C ABI (不可变契约)
 
-- 符号名: `agentxx_plugin_agent_get_info/create/start/stop/destroy`、
-  `agentxx_plugin_client_*` (改动即破坏已编译插件)
+- 符号名: `<主程序前缀>_plugin_agent_get_info/create/start/stop/destroy`、
+  `<主程序前缀>_plugin_client_*` —— 前缀由主程序定义, 不属于插件框架
 - 结构体名 / 宏名 / IID 字符串: `PluginxxHost`、`PluginxxString`、
-  `PLUGINXX_CALL`、`PLUGINXX_EXPORT`、`"agentxx.agent.tools"` 等
+  `PLUGINXX_CALL`、`PLUGINXX_EXPORT`、通用表 IID (如 `pluginxx.log` / `pluginxx.json`) 等
 - 调用约定与对齐: `PLUGINXX_CALL` (Windows `__stdcall`)、8 字节对齐、定长基础类型
 - 版本: `PLUGINXX_API_VERSION` (接口表 `version` / `struct_size` 自校验)
 
@@ -32,7 +32,7 @@ include/pluginxx/
                    通用表聚合 PluginIfaceCore、Logger、Task<T> 锚定协程与锚定原语
                    (sleep/yield/offload/invoke_cap)、CancelRegistry/OpCtl/ArgReader、
                    后台任务 spawn、能力注册 capability、实例上下文基类
-                   PluginBaseT<IfacesT>、通用导出宏 AGENTXX_PLUGIN_AGENT_EXPORT
+                   PluginBaseT<IfacesT>、入口符号导出宏 PLUGINXX_EXPORT_PLUGIN
           guard.h  C ABI 边界异常守卫 (logTo/reportCurrentException/guardCall/guardCallVoid)
   runtime/插件运行时 (runtime/driver/instance_base/manager_base/op_driver)
   host/   loader.h (dlopen/LoadLibrary)、manifest.h (plugin.yaml/名称推导/拓扑排序)、
@@ -77,26 +77,26 @@ protected:
 - **生命周期骨架 (在本库)**: 动态库加载与入口校验、create/start 事务、启用与禁用级联、
   stop 事务补齐、inflight 归零等待、destroy 与动态库卸载、失败回滚、关闭超时重试；
   主程序只提供少量扩展点 (见上)，因此新接入的主程序不必重写这套纪律；
-- **业务表 (主程序自己实现)**: agentxx 的 tools/permission/hooks/session/model/prompt/
-  resources/graph 与 client 侧的 ui/events/session/wire/self 表；
+- **业务表 (主程序自己实现)**: 各主程序按自身业务定义 (agent 侧如工具/权限/钩子/会话/
+  模型/提示词/资源/图, client 侧如 UI/事件/会话/线路/自身信息)；
 - `query_interface` 里先调 `pluginxx::queryGenericPluginIface<InstanceT, ManagerT>(iid)`
   取通用表，未命中再分发主程序的业务表。
 
 > 已实现: `api/` 两个纯 C 头、`kit/` (插件 SDK 通用部分 + 边界守卫)、
 > `runtime/` (实例状态机/执行 lease/协程驱动/Operation 驱动器/管理器基类)、
 > `host/` (加载/清单/ABI 辅助/能力注册表/事件后端/业务数据入口/框架核心/通用表入口/
-> 生命周期骨架) —— agentxx 侧的 `agentxx/plugin/api/plugin_kit.h` 与 `plugin_guard.h`
-> 作为 umbrella 引用它们 + 各自的业务 helper (工具/钩子/图节点/权限/client UI)，
-> 插件源码无需改动; agent 侧 `PluginManager` 与 client 侧 `ClientPluginManager`
-> 都已接入 `PluginHostLifecycle` (client 侧仅"加载"保留自己的实现，因为 dlopen 卸载到
-> 内部线程池、接口协商限制与双端入口探测属 client 特有语义)。
+> 生命周期骨架)。主程序侧的用法: 用一份自己的 umbrella 头文件包含它们, 再补上各自的
+> 业务 helper (工具/钩子/图节点/权限/client UI 等)。
+> 主程序管理器 (agent 侧与 client 侧各一份) 都接入 `PluginHostLifecycle`; 若某端的
+> "加载"步骤有本端特有语义 (例如 dlopen 卸载到内部线程池、接口协商限制、双端入口探测),
+> 该端可只保留这一步自己的实现。
 
 业务表归属 (由主程序定义与实现):
 
 | 主程序 | 业务表 |
 |---|---|
-| agentxx (agent 侧) | tools / permission / hooks / session / model / prompt / resources / graph |
-| agentxx (client 侧) | client.ui / client.events / client.session / client.wire / client.self |
+| 主程序 (agent 侧) | 由该主程序自行定义 (工具/权限/钩子/会话/模型/提示词/资源/图等) |
+| 主程序 (client 侧) | 由该主程序自行定义 (UI/事件/会话/线路/自身信息等) |
 
 ## 构建与使用
 

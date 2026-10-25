@@ -38,7 +38,7 @@ public:
     }
 
     /// 补齐事件主题的命名空间 (订阅与发布都经它, 保证两侧主题一致)
-    /// - agentxx 侧实现: 不以 `plugin.` / `client.` 开头时补 `plugin.` 前缀
+    /// - 主程序可自行规定前缀 (例如不以 `plugin.` / `client.` 开头时补一个前缀)
     virtual std::string qualifyEventTopic(std::string_view topic) {
         return std::string{topic};
     }

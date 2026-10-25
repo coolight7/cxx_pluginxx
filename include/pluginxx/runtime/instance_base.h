@@ -103,8 +103,9 @@ struct PluginInstanceBase {
     /// stop 事务是否已执行完成 (destroy 的前提)。
     bool lifecycleStopped = false;
 
-    /// 本端 destroy 入口符号名 (agent 侧 `agentxx_plugin_agent_destroy` /
-    /// client 侧 `agentxx_plugin_client_destroy`); 由派生实例类实现。
+    /// 本端 destroy 入口符号名 (符号名由主程序定义, 形如
+    /// `<主程序前缀>_plugin_agent_destroy` / `<主程序前缀>_plugin_client_destroy`);
+    /// 由派生实例类实现。
     /// 两端的入口符号名不同, 因此 [destroyPlugin] 需要它来查找动态库符号。
     virtual const char* pluginDestroySymbol() const noexcept = 0;
 

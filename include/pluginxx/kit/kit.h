@@ -14,9 +14,9 @@
 /// - 导出宏 PLUGINXX_EXPORT_PLUGIN / PLUGINXX_EXPORT_PLUGIN_LIFECYCLE
 ///   (入口符号前缀由主程序给出; 主程序侧再包一层自己的导出宏)
 ///
-/// 主程序业务部分 (工具 / 权限 / 钩子 / 图节点 / client UI 等) 位于主程序仓库: agentxx 侧见
-/// [plugin_kit.h](/agent/lib/include/agentxx/plugin/api/plugin_kit.h), 该头包含本头并把
-/// 通用名引入 `agentxx::plugin` —— 插件源码只包含它即可, 无需关心本节分层。
+/// 主程序业务部分 (工具 / 权限 / 钩子 / 图节点 / client UI 等) 由主程序自己补: 主程序在
+/// 自己的头文件里包含本头, 并用 `using` 把通用名引入本程序命名空间 —— 插件源码只包含
+/// 主程序那份头即可, 无需关心本节分层。
 #pragma once
 #include "asio/awaitable.hpp"
 #include "asio/co_spawn.hpp"
@@ -68,7 +68,7 @@ using JsonView = utilxx_base::JsonView;
 
 /* ==================== C++ 字符串/接口便捷工具 (非 ABI) ====================
  *
- * [pluginxx/api/abi.h](/agent/third_party/cxx_pluginxx/include/pluginxx/api/abi.h) 为纯 C ABI
+ * `pluginxx/api/abi.h` 为纯 C ABI
  * (跨边界契约), 其结构体在 C++ 下仅带最小便捷成员
  * (构造/empty, 不改变布局)。面向主程序/插件 C++ 源码的字符串与接口操作集中
  * 在本命名空间:
@@ -410,8 +410,8 @@ const Iface* queryInterface(const PluginxxHost* host, const char* iid) noexcept 
 /// 通用接口表聚合 (与主程序业务无关的十个表; 成员为 NULL 表示主程序未实现该接口)
 ///
 /// 业务表 (工具 / 权限 / 钩子 / 会话 / 模型 / 提示词 / 资源 / 图, 以及 client 侧 UI)
-/// 由主程序在自己的聚合体中补充: agentxx 侧的 `AgentIfaces` 是本聚合
-/// 的超集, 可直接作为 [PluginBaseT] 的模板实参。
+/// 由主程序在自己的聚合体中补充: 主程序那侧的聚合体是本聚合的超集,
+/// 可直接作为 [PluginBaseT] 的模板实参。
 struct PluginIfaceCore {
     const PluginxxLogIface*          log          = nullptr; ///< "pluginxx.log"
     const PluginxxJsonIface*         json         = nullptr; ///< "pluginxx.json"
@@ -2923,7 +2923,7 @@ inline void spawn(Ctx& ctx, Fn&& fn) {
 ///   主程序堆字符串 (strdup / createString / createPluginString) / 后台任务 spawn;
 /// - 协程驱动桥 (见 [bridge]) 让插件协程与主程序协程在同一 IO 执行序列中交错推进;
 /// - 业务能力由主程序侧派生基类补齐: 派生类既可在 `IfacesT` 中带业务表, 也可覆写
-///   [onHostReady] 挂钩业务初始化 (见 agentxx 侧的 `PluginBase`)。
+///   [onHostReady] 挂钩业务初始化 (由主程序派生类实现)。
 template<typename IfacesT>
 class PluginBaseT {
 public:
@@ -2978,7 +2978,7 @@ public:
         log.logIface = iface.log;
         log.logFn    = (iface.log && iface.log->log) ? iface.log->log : nullptr;
 
-        // 业务挂钩: 由主程序侧派生基类补齐 (agentxx 侧在此订阅会话轮次开始事件)
+        // 业务挂钩: 由主程序侧派生基类补齐 (如在此订阅会话轮次开始事件)
         onHostReady();
     }
 
@@ -3216,7 +3216,7 @@ public:
 protected:
 
     /// 业务挂钩: [init] 末尾调用, 由主程序侧派生基类补齐业务初始化
-    /// (agentxx 侧在此订阅会话轮次开始事件, 用于重置会话级取消登记)
+    /// (主程序可在此订阅会话轮次开始事件, 用于重置会话级取消登记)
     virtual void onHostReady() {}
 
 private:
@@ -3942,18 +3942,18 @@ inline void logCreateFailure(
     iface->log(host, 4, &sv);
 }
 
-/// 入口符号名拼接: `PLUGINXX_ENTRY_SYMBOL(musicxx_plugin_, create)` → `musicxx_plugin_create`
+/// 入口符号名拼接: `PLUGINXX_ENTRY_SYMBOL(<前缀>_plugin_, create)` → `<前缀>_plugin_create`
 ///
 /// 符号前缀由主程序给出 (插件框架不含任何主程序专名); 主程序在自己的 SDK 头里用它包出对插件作者
-/// 友好的导出宏 (agentxx 的 `AGENTXX_PLUGIN_AGENT_EXPORT`、musicxx 的 `MUSICXX_PLUGIN_EXPORT`)。
+/// 友好的导出宏 (主程序可包出自己的名字, 如 `<前缀>_PLUGIN_AGENT_EXPORT`)。
 #define PLUGINXX_ENTRY_SYMBOL_JOIN__(Prefix, Suffix) Prefix##Suffix
 #define PLUGINXX_ENTRY_SYMBOL_JOIN_(Prefix, Suffix)  PLUGINXX_ENTRY_SYMBOL_JOIN__(Prefix, Suffix)
 #define PLUGINXX_ENTRY_SYMBOL(Prefix, Suffix)        PLUGINXX_ENTRY_SYMBOL_JOIN_(Prefix, Suffix)
 
 /// 插件入口导出 (生成 `<SymbolPrefix>get_info/create/start/stop/destroy` 五个符号)。
 ///
-/// `SymbolPrefix` 是主程序命名空间前缀, 例如 agentxx 的 `agentxx_plugin_agent_`、
-/// musicxx 的 `musicxx_plugin_`; 运行时主程序必须经 `entrySymbols()` 交出同一批符号名
+/// `SymbolPrefix` 是主程序命名空间前缀 (形如 `<主程序前缀>_plugin_agent_` /
+/// `<主程序前缀>_plugin_client_`); 运行时主程序必须经 `entrySymbols()` 交出同一批符号名
 /// (见 `pluginxx/api/entry.h`), 两侧不一致时加载失败。
 ///
 /// 主程序按以下顺序调用, 插件必须遵守 (见 docs/zh-cn/design/plugins.md):

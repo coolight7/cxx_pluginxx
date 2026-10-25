@@ -4,8 +4,8 @@
 /// (`get_info` / `create` / `start` / `stop`; `destroy` 由实例类给出, 见
 /// `pluginxx/runtime/instance_base.h` 的 `pluginDestroySymbol`)。这组符号名属于
 /// **主程序的命名空间**, 不属于插件框架:
-/// - agentxx 使用 `agentxx_plugin_agent_*` / `agentxx_plugin_client_*`;
-/// - musicxx 使用 `musicxx_plugin_*`。
+/// - 形如 `<主程序前缀>_plugin_agent_*` / `<主程序前缀>_plugin_client_*`
+///   (两端各一套前缀, 由主程序自己定义)。
 ///
 /// 因此插件框架只定义"主程序怎么把符号名交进来"这一扩展点:
 /// - 主程序侧: 覆写 `pluginxx::PluginHostLifecycle::entrySymbols()` 返回自己的符号名;

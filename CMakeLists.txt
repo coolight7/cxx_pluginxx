@@ -6,7 +6,7 @@
 #   - include/pluginxx/runtime/ 插件运行时 (header-only)
 #   - include/pluginxx/host/    主程序侧通用实现 (装载/清单/注册簿记/通用表加载)
 # 依赖: cxx_utilxx_base (取消令牌/日志/JSON 等) + fmt + Boost (仅头文件)
-#       **禁止**依赖 neograph / OpenSSL / SQLite 等重依赖与 Boost 编译库
+#       **禁止**依赖 OpenSSL / SQLite / 图引擎等重依赖与 Boost 编译库
 # 产物 (命名规则: Release 无后缀, Debug 文件名追加 d):
 #   Release: libcxx_pluginxx.so        libcxx_pluginxx_static.a
 #   Debug:   libcxx_pluginxxd.so       libcxx_pluginxx_staticd.a
