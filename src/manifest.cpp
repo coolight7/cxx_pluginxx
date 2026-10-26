@@ -1,12 +1,14 @@
 /// pluginxx 插件清单与名称推导实现 (见 pluginxx/host/manifest.h)
 ///
-/// 提取到插件框架的原因: agent 侧与 client 侧插件主程序共用同一套清单解析/
+/// 提取到插件框架的原因: 主程序多种插件框架共用同一套清单解析/
 /// 名称推导/入口路径解析, 放在一处可避免两侧行为漂移。
 #include "pluginxx/host/manifest.h"
 
 #include "pluginxx/api/abi.h"
+#include "utilxx_base/json.h"
 #include "yaml-cpp/yaml.h"
 
+#include <charconv>
 #include <system_error>
 #include <utility>
 
@@ -17,6 +19,64 @@ std::string_view pluginStringView2std(PluginxxStringView str) {
 }
 
 namespace {
+
+/// YAML 值转 JSON (资源声明的附加字段以 JSON 文本交给主程序)
+///
+/// - 序列/映射递归转换; 标量按整数 → 布尔 → 浮点 → 字符串的顺序尝试;
+/// - **标量必须用圆括号构造**: `utilxx_base::Json` 有 initializer_list 构造函数,
+///   花括号初始化会优先匹配它, 把标量包成单元素数组 (`Json{true}` → `[true]`);
+/// - 先判标量再判序列: yaml-cpp 对单标量节点也可能按"长度 1 的序列"迭代,
+///   顺序反过来会把每个标量都包成数组。
+utilxx_base::Json yamlToJson(const YAML::Node& node) {
+    if (!node.IsDefined() || node.IsNull()) {
+        return utilxx_base::Json{};
+    }
+    if (node.IsScalar()) {
+        std::string text = node.as<std::string>();
+        // 整数 (允许前导正负号; 不用 stoll 避免抛异常)
+        {
+            const char* first = text.data();
+            const char* last  = text.data() + text.size();
+            long long   value = 0;
+            if (auto rc = std::from_chars(first, last, value);
+                rc.ec == std::errc{} && rc.ptr == last) {
+                return utilxx_base::Json(value);
+            }
+        }
+        if (text == "true" || text == "True") {
+            return utilxx_base::Json(true);
+        }
+        if (text == "false" || text == "False") {
+            return utilxx_base::Json(false);
+        }
+        {
+            const char* first = text.data();
+            const char* last  = text.data() + text.size();
+            double      value = 0;
+            if (auto rc = std::from_chars(first, last, value);
+                rc.ec == std::errc{} && rc.ptr == last) {
+                return utilxx_base::Json(value);
+            }
+        }
+        return utilxx_base::Json(std::move(text));
+    }
+    if (node.IsSequence()) {
+        utilxx_base::Json arr = utilxx_base::Json::array();
+        for (const auto& item : node) {
+            arr.push_back(yamlToJson(item));
+        }
+        return arr;
+    }
+    if (node.IsMap()) {
+        utilxx_base::Json obj = utilxx_base::Json::object();
+        for (const auto& kv : node) {
+            obj[kv.first.as<std::string>()] = yamlToJson(kv.second);
+        }
+        return obj;
+    }
+    return utilxx_base::Json{};
+}
+
 /// 提供者登记位 (函数内静态: 与任何静态初始化顺序无关)
 BuiltinPluginProvider& providerSlot() noexcept {
     static BuiltinPluginProvider provider{};
@@ -118,9 +178,12 @@ bool parseManifestNode(
                 }
             }
         }
-        // ---- 资源声明段 (skill/memory/mcp; 键名与主配置 yaml 一致) ----
-        // 相对路径按插件目录解析为绝对路径; 段缺失/非法项跳过并告警,
-        // 不影响 manifest 合法性 (声明是可选增强)
+        // ---- 资源声明段 ----
+        // 框架只做"解析 + 相对路径归一", 资源种类 (type) 与字段语义交给主程序:
+        // - 规范写法: `resources:` 列表, 每项 {type, path?, args?}
+        // - 兼容旧写法: 顶层 `skill:` / `memory:` / `mcp:` 段 (元素可为标量路径
+        //   或对象), 按同名 type 逐条映射成条目
+        // 段缺失/非法项跳过并告警, 不影响 manifest 合法性 (声明是可选增强)
         if (resources) {
             *resources = PluginManifestResources{};
             // 绝对路径原样保留; 相对路径按插件目录拼接并规范化
@@ -138,62 +201,67 @@ bool parseManifestNode(
                 }
                 return (baseDir / fp).lexically_normal().string();
             };
-            if (node["skill"] && node["skill"].IsSequence()) {
-                for (const auto& s : node["skill"]) {
-                    if (!s.IsScalar()) {
-                        continue;
-                    }
-                    auto p = resolveRel(s.as<std::string>());
-                    if (!p.empty()) {
-                        resources->skillDirs.push_back(std::move(p));
-                    }
+            // 一条资源: 唯一的标量字段按 path 处理, 其余字段转成 args JSON
+            auto pushEntry = [&](std::string type, const YAML::Node& item) {
+                if (type.empty()) {
+                    return;
                 }
-            }
-            if (node["memory"] && node["memory"].IsSequence()) {
-                for (const auto& m : node["memory"]) {
-                    if (!m.IsScalar()) {
-                        continue;
-                    }
-                    auto p = resolveRel(m.as<std::string>());
+                if (item.IsScalar()) {
+                    auto p = resolveRel(item.as<std::string>());
                     if (!p.empty()) {
-                        resources->memoryFiles.push_back(std::move(p));
+                        resources->entries.push_back(PluginManifestResources::Entry{
+                            .type     = std::move(type),
+                            .path     = std::move(p),
+                            .argsJson = {}
+                        });
                     }
+                    return;
                 }
-            }
-            if (node["mcp"] && node["mcp"].IsSequence()) {
-                for (const auto& m : node["mcp"]) {
-                    if (!m.IsMap()) {
+                if (!item.IsMap()) {
+                    XX_LOGW(
+                        "Plugin manifest `{}` resource `{}` entry is neither path nor map, skipped",
+                        logHint,
+                        type
+                    );
+                    return;
+                }
+                PluginManifestResources::Entry entry{.type = std::move(type)};
+                utilxx_base::Json              entryArgs = utilxx_base::Json::object();
+                for (const auto& kv : item) {
+                    auto key = kv.first.as<std::string>();
+                    if (key == "type") {
                         continue;
                     }
-                    auto ns  = m["namespace"] ? m["namespace"].as<std::string>() : std::string{};
-                    auto url = m["url"] ? m["url"].as<std::string>() : std::string{};
-                    if (ns.empty() || url.empty()) {
+                    if (key == "path" && kv.second.IsScalar()) {
+                        entry.path = resolveRel(kv.second.as<std::string>());
+                        continue;
+                    }
+                    entryArgs[key] = yamlToJson(kv.second);
+                }
+                if (entryArgs.size() > 0) {
+                    entry.argsJson = entryArgs.dump();
+                }
+                resources->entries.push_back(std::move(entry));
+            };
+            if (node["resources"] && node["resources"].IsSequence()) {
+                for (const auto& item : node["resources"]) {
+                    if (!item.IsMap() || !item["type"] || !item["type"].IsScalar()) {
                         XX_LOGW(
-                            "Plugin manifest `{}` mcp entry missing `namespace`/`url`, skipped",
+                            "Plugin manifest `{}` resource entry missing `type`, skipped",
                             logHint
                         );
                         continue;
                     }
-                    long long timeoutSec = 120; // 与主配置默认一致
-                    if (m["timeout"]) {
-                        try {
-                            timeoutSec = m["timeout"].as<long long>();
-                        } catch (const std::exception&) {
-                            XX_LOGW(
-                                "Plugin manifest `{}` mcp `{}` invalid timeout, using default",
-                                logHint,
-                                ns
-                            );
-                        }
-                    }
-                    if (timeoutSec < 0) {
-                        timeoutSec = 0;
-                    }
-                    // 重复命名空间: 后者覆盖前者 (与主配置 override 行为一致)
-                    resources->mcpServers[ns] = PluginManifestResources::McpDecl{
-                        .url       = url,
-                        .timeoutMs = timeoutSec * 1000
-                    };
+                    pushEntry(item["type"].as<std::string>(), item);
+                }
+            }
+            // 兼容旧写法: 顶层 skill / memory / mcp 段
+            for (const char* legacyType : {"skill", "memory", "mcp"}) {
+                if (!node[legacyType] || !node[legacyType].IsSequence()) {
+                    continue;
+                }
+                for (const auto& item : node[legacyType]) {
+                    pushEntry(legacyType, item);
                 }
             }
         }

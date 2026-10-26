@@ -2,7 +2,7 @@
 ///
 /// 内容:
 /// - [PluginInstanceBase]: 实例公共基类 (元信息/依赖/启用标志/主程序句柄/驱动登记表/
-///   执行 lease/destroy 执行), agent 侧与 client 侧实例各自继承;
+///   执行 lease/destroy 执行), 主程序各端的实例各自继承;
 /// - [PluginHostControl]: 交给插件的 `PluginxxHost*` 视图所在的控制块 —— 地址
 ///   永不失效, 实例关闭后只清空实例引用 (tombstone), 因此插件跨卸载持有旧 host 指针
 ///   时各 vtable 入口只会安全失败, 既不访问已释放对象也不误指新实例;
@@ -63,7 +63,7 @@ class PluginHostControl;
 // 实例公共基类
 // =====================================================================
 
-/// 插件实例公共基类 (agent 侧 PluginInstance / client 侧 ClientPluginInstance 继承)
+/// 插件实例公共基类 (主程序各端的实例类继承)
 /// - 持有跨端一致的元信息/依赖/启用标志/执行中计数/主程序句柄
 /// - InflightGuard 为公共 RAII (事件 handler / 命令 execute / 异步 op 入口计数)
 struct PluginInstanceBase {
@@ -117,7 +117,7 @@ struct PluginInstanceBase {
     /// 在所有活动 lease 归零后销毁插件上下文；析构时也作为最后一道安全收尾。
     /// 返回 false 表示仍有活动 lease，调用方不得关闭动态库。
     ///
-    /// 语义 (agent / client 两侧一致):
+    /// 语义 (各端一致):
     /// - 已有活动 lease: 置 destroyDeferred 并拒绝销毁 (调用方保留 DSO);
     /// - create 未成功 (pluginCreated=false): 只退休框架控制块 (或已销毁则直接返回);
     /// - 否则查找 destroy 入口 (内置插件用 [builtinUnload], 动态库插件按
@@ -416,7 +416,7 @@ inline PluginHostControlRegistry& pluginHostControlRegistry() {
 class PluginHostControl {
 public:
 
-    /// 创建并注册控制块。`vtable` 为本端主程序静态函数表（agent/client 各自一份）。
+    /// 创建并注册控制块。`vtable` 为本端主程序静态函数表（各端各一份）。
     static std::shared_ptr<PluginHostControl> create(
         const std::shared_ptr<PluginInstanceBase>& instance,
         const PluginxxHostVtable*                  vtable
@@ -654,7 +654,7 @@ inline PluginxxString hostMemoryCreateString(const char* s) {
 
 // =====================================================================
 // 可执行目录 helper (跨平台: Windows GetModuleFileNameW / Linux /proc/self/exe)
-// 供 builtin:// 回退探测使用 (agent/client 两侧共用, 原两份实现合并)
+// 供 builtin:// 回退探测使用 (各端共用, 原两份实现合并)
 // =====================================================================
 
 inline std::filesystem::path getExecutableDirPath() noexcept {

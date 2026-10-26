@@ -53,8 +53,9 @@ extern "C" {
 /// 全局 API 版本 (本框架的 SDK 版本, 用于展示与新增能力判定)
 ///
 /// - 代码里的默认值保持 1: 本库被多个主程序共用, 默认值不跟随某一个主程序的契约;
-/// - 需要更高契约的主程序在构建参数里覆盖 (见 CMake 选项 `PLUGINXX_API_VERSION`),
-///   同一份源码编出来的框架与插件因此总是看到同一个值。
+/// - 需要更高契约的主程序在**自己的**构建参数里覆盖 (见 CMake 选项
+///   `PLUGINXX_API_VERSION` / `PLUGINXX_MIN_API_VERSION`), 同一份源码编出来的
+///   框架与插件因此总是看到同一个值。
 #ifndef PLUGINXX_API_VERSION
 #define PLUGINXX_API_VERSION 1
 #endif
@@ -263,7 +264,7 @@ typedef struct PluginxxBuiltinInfo {
     PluginxxDestroyFn destroy; ///< 可空 (实例销毁)
     PluginxxStartFn start; ///< 可空 (create 后的注册/启动事务)
     PluginxxStopFn  stop;  ///< 可空 (关闭事务, destroy 前调用)
-    /// 主程序的"每 agent 挂载"入口 (可空; 类型由主程序解释, 框架只透传)
+    /// 主程序的"每作用域挂载"入口 (可空; 类型由主程序解释, 框架只透传)
     void* mount;
     void* unmount;
 } PluginxxBuiltinInfo;

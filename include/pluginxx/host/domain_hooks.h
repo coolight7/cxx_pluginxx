@@ -1,9 +1,10 @@
 /// pluginxx 主程序业务数据入口 (通用表实现的取数入口)
 ///
-/// 定位: 通用表 (**与会话/模型/工具/提示词/图无关**的表) 的实现位于 cxx_pluginxx,
-/// 但其中少数入口需要主程序数据 (配置内容 / 语言 / 会话工作目录 / 会话取消状态 /
-/// 插件清单 / 工作线程池 / 事件总线)。这些数据一律经本接口取, 因此 pluginxx 源码
-/// 不包含任何主程序头、不依赖任何主程序类型。
+/// 定位: 通用表 (**与主程序业务无关**的表) 的实现位于 cxx_pluginxx, 但其中少数入口
+/// 需要主程序数据 (配置内容 / 语言 / 插件清单 / 工作线程池 / 事件总线)。这些数据一律
+/// 经本接口取, 因此 pluginxx 源码不包含任何主程序头、不依赖任何主程序类型。
+/// 主程序业务语义 (工具 / 提示词 / 会话 / 图 ...) 一律走主程序自己的业务表,
+/// 不进入本接口。
 ///
 /// 主程序侧用法: 主程序管理器实现本接口, 并在任何通用表入口可能被调用之前
 /// 经 [PluginHostCore::setDomainHooks] 注入 (通常在管理器构造函数体内完成)。
@@ -30,10 +31,10 @@ public:
     // ==================== 事件表 ====================
 
     /// 事件后端; 返回 nullptr 表示主程序不支持事件订阅/发布
-    /// - `agent` 为空: 主程序总线 (进程级事件)
-    /// - `agent` 非空: 该 agent 的总线 (会话 / 轮次事件); 引用无效时返回 nullptr
-    virtual std::shared_ptr<EventSource> eventSource(const PluginxxScopeRef* agent) {
-        (void)agent;
+    /// - `scope` 为空: 主程序总线 (进程级事件)
+    /// - `scope` 非空: 该作用域的总线 (主程序定义的域内事件); 引用无效时返回 nullptr
+    virtual std::shared_ptr<EventSource> eventSource(const PluginxxScopeRef* scope) {
+        (void)scope;
         return nullptr;
     }
 
@@ -54,24 +55,11 @@ public:
     /// 主程序配置 JSON (`get_config` 的业务部分, 如 dataDir / projectRoot / platform)
     virtual std::string configJson() = 0;
 
-    /// 指定工具的提示词配置 JSON (`get_tool_prompt`; 不存在返回空串)
-    virtual std::string toolPromptJson(std::string_view toolName) = 0;
-
-    /// 指定会话生效的工作目录 (`get_session_work_dir`; 空 sessionId = 默认工作目录)
-    /// - `agent` 非空而引用无效时由实现方返回空串
-    virtual std::string sessionWorkDir(const PluginxxScopeRef* agent, std::string_view sessionId) = 0;
-
     /// 当前语言代码 (如 "en" / "zh-cn"); 空串由调用方回退为 "en"
     virtual std::string language() = 0;
 
     /// 指定语言 (返回值忽略: 只读查询失败与写入失败在 ABI 上都表现为空结果)
     virtual void setLanguage(std::string_view lang) = 0;
-
-    // ==================== cancel 表 ====================
-
-    /// 会话当前轮次是否已取消 (`is_cancelled`; 权威通知始终是取消回调)
-    /// - `agent` 非空而引用无效时返回 false
-    virtual bool isSessionCancelled(const PluginxxScopeRef* agent, std::string_view sessionId) = 0;
 
     // ==================== plugins 表 ====================
 

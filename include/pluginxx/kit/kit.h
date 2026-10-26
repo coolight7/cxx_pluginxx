@@ -585,7 +585,7 @@ inline auto ctxGuardLogger(Ctx* ctx) noexcept {
 ///
 /// - `args`:
 ///     - [host] 主程序句柄
-///     - [jsonIface] 主程序 json 接口表 (agent/client 两侧共用, 可空)
+///     - [jsonIface] 主程序 json 接口表 (主程序多种插件共用, 可空)
 ///     - [text] 待转义文本 (内容可含任意字节, 含非法 UTF-8 时应先自行修复)
 ///
 /// - `return` 形如 `"..."` 的 JSON 字符串字面量
@@ -1645,7 +1645,7 @@ inline void BridgeRoot::abandon(std::string_view reason) noexcept {
 
 /// 主程序作用域引用的**值类型**: 自己持有 id 字符串 + 序号
 ///
-/// - 用于插件把"我挂在哪个 agent 上"存进 per-agent 状态, 之后任何线程都能直接用;
+/// - 用于插件把"我挂在哪个作用域上"存进按作用域划分的状态, 之后任何线程都能直接用;
 /// - [raw] 返回借用视图 (指向本对象内部), 因此只能在本对象存活期间使用;
 /// - 可拷贝 / 可比较 / 可排序 (日志与诊断)。
 class ScopeRef {
@@ -1682,8 +1682,8 @@ public:
     /// 稳定借用的视图指针 (缓存在本对象里, 有效期同本对象)
     /// - 方便把引用传给需要 `const PluginxxScopeRef*` 的调用点而不必每次建临时量
     const PluginxxScopeRef* ptr() const noexcept {
-        cache_          = raw();
-        cache_.id       = PluginStringView::from(id_.data(), id_.size());
+        cache_    = raw();
+        cache_.id = PluginStringView::from(id_.data(), id_.size());
         return &cache_;
     }
 
@@ -1709,7 +1709,7 @@ private:
 /* ==================== 插件框架事件驱动取消注册表 (CancelRegistry) ==================== */
 
 /// 插件框架事件驱动取消注册表
-/// - 职责: 管理会话级别与操作级别的取消事件注册、注销与原子通知
+/// - 职责: 按作用域键登记与操作级登记的取消事件注册、注销与原子通知
 /// - 线程安全: 完全支持多线程并发注册、注销与触发
 /// - 内存自治: 纯堆内存实例，无任何全局/静态状态，严格契合多实例契约
 /// - 零悬挂保证: unregisterCallback
@@ -1737,7 +1737,7 @@ public:
     CancelRegistry& operator=(const CancelRegistry&) = delete;
 
     /// 注册取消回调
-    /// - `key`: 会话标识 (sessionId / thread_id)，为空表示未绑定会话的独立操作
+    /// - `key`: 作用域内的键 (由主程序定义, 如会话 / 房间 / 请求)，为空表示不绑定具体键的独立操作
     /// - `cb`: 取消触发时的回调动作
     /// - `return`: 注册凭证 ID (0 表示由于已经处于取消态而直接同步触发，无需反注册)
     RegId registerCallback(std::string_view key, CancelCallback cb) {
@@ -1990,26 +1990,17 @@ private:
 
 struct OpCtl {
     std::shared_ptr<std::atomic<bool>> cancelFlag;
-    const PluginxxHost*                host        = nullptr;
-    const PluginxxCancelIface*         cancelIface = nullptr;
-    std::string                        sessionId;
     CancelRegistry*                    cancelRegistry = nullptr;
-    /// 本操作所属的作用域 (哪个 agent 的会话); 空 = 不归因
-    ScopeRef agent;
+    /// 主程序定义的作用域内键 (如会话 / 房间 / 请求); 空 = 未绑定具体键
+    std::string scopeKey;
+    /// 本操作所属的作用域; 空 = 不归因
+    ScopeRef scope;
 
     bool cancelled() const noexcept {
         if (cancelFlag && cancelFlag->load(std::memory_order_acquire)) {
             return true;
         }
-        if (cancelRegistry && !sessionId.empty() && cancelRegistry->isCancelled(sessionId)) {
-            return true;
-        }
-        if (host && cancelIface && cancelIface->is_cancelled && !sessionId.empty()) {
-            auto sv  = PluginStringView::from(sessionId.data(), sessionId.size());
-            auto ref = agent.raw();
-            return cancelIface->is_cancelled(host, agent.empty() ? nullptr : &ref, &sv) != 0;
-        }
-        return false;
+        return cancelRegistry && !scopeKey.empty() && cancelRegistry->isCancelled(scopeKey);
     }
 
     void throw_if_cancelled() const {
@@ -2380,7 +2371,7 @@ inline std::shared_ptr<detail::BridgeRoot> startBridgedRoot(
  * 下面两个类型把这套协议集中在一处，避免每个 helper 各写一遍。
  */
 
-/// 根操作拥有型输入（plugin.md 6.2 / F13）。
+/// 根操作拥有型输入。
 ///
 /// - C ABI 传入的视图只在 start 调用期间有效，本结构先把它们复制成自己的
 ///   `std::string`，业务代码拿到的 `std::string_view` 因此在整个根操作期间有效；
@@ -2388,16 +2379,17 @@ inline std::shared_ptr<detail::BridgeRoot> startBridgedRoot(
 ///   一起释放；
 /// - 业务需要跨操作保留时仍要自己复制（Request 之外不保证）。
 struct RootRequest {
-    std::string argsJson;   ///< 工具参数 / 能力参数 JSON（空则为 "{}"）
-    std::string sessionId;  ///< ABI thread_id / session_id
-    std::string callId;     ///< 工具 tool_call_id；能力方法名放 method
-    std::string method;     ///< 能力方法名（非能力操作为空）
-    std::string nodeName;   ///< 图节点实例名（仅图节点操作）
-    std::string configJson; ///< 图节点 config JSON（仅图节点操作）
-    std::string stateJson;  ///< GraphState::serialize() 只读快照（仅图节点操作）
+    std::string argsJson; ///< 操作参数 JSON（空则为 "{}"）
+    std::string scopeKey; ///< 主程序定义的作用域内键 (ABI 的 scope_key)
+    std::string callId; ///< 操作标识（工具调用 id / 请求 id；语义由主程序定义）
+    std::string method; ///< 能力方法名（非能力操作为空）
 
     const PluginxxHost*        host        = nullptr;
     const PluginxxCancelToken* cancelToken = nullptr; ///< offload/worker 内的取消令牌视图
+
+    /// 主程序自定义字段（键 → 值）: 框架不解释, 只在根操作期间原样携带。
+    /// 供主程序把自己的操作种类细节（节点名 / 只读快照 / 目标对象 ...）带给业务代码。
+    std::vector<std::pair<std::string, std::string>> extraFields;
 
     static std::string copyView(const PluginxxStringView* sv, const char* fallback = "") {
         if (!sv || (!sv->data && sv->size == 0)) {
@@ -2406,30 +2398,7 @@ struct RootRequest {
         return std::string(sv->data ? sv->data : "", static_cast<size_t>(sv->size));
     }
 
-    /// 工具：args/session/tool_call_id
-    static RootRequest forTool(
-        const PluginxxHost*       host,
-        const PluginxxStringView* args,
-        const PluginxxStringView* session,
-        const PluginxxStringView* call
-    ) {
-        RootRequest req;
-        req.host      = host;
-        req.argsJson  = copyView(args, "{}");
-        req.sessionId = copyView(session);
-        req.callId    = copyView(call);
-        return req;
-    }
-
-    /// 钩子：node_input_json（args 为空时按 "{}"）
-    static RootRequest forHook(const PluginxxHost* host, const PluginxxStringView* nodeInputJson) {
-        RootRequest req;
-        req.host     = host;
-        req.argsJson = copyView(nodeInputJson, "{}");
-        return req;
-    }
-
-    /// 能力：method/args
+    /// 能力：method/args（唯一的框架内置根操作: 能力 RPC 本身与业务无关）
     static RootRequest forCapability(
         const PluginxxHost*       host,
         const PluginxxStringView* method,
@@ -2442,29 +2411,34 @@ struct RootRequest {
         return req;
     }
 
-    /// 图节点：node_name/config_json/state_json/thread_id
-    static RootRequest forGraphNode(
-        const PluginxxHost*       host,
-        const PluginxxStringView* nodeName,
-        const PluginxxStringView* configJson,
-        const PluginxxStringView* stateJson,
-        const PluginxxStringView* sessionId
-    ) {
-        RootRequest req;
-        req.host       = host;
-        req.nodeName   = copyView(nodeName);
-        req.configJson = copyView(configJson, "{}");
-        req.stateJson  = copyView(stateJson, "{}");
-        req.sessionId  = copyView(sessionId);
-        return req;
+    /// 设置主程序自定义字段（同名键覆盖）
+    RootRequest& setExtra(std::string key, std::string value) {
+        for (auto& [k, v] : extraFields) {
+            if (k == key) {
+                v = std::move(value);
+                return *this;
+            }
+        }
+        extraFields.emplace_back(std::move(key), std::move(value));
+        return *this;
+    }
+
+    /// 读取主程序自定义字段（不存在返回空串视图；视图指向本对象内部）
+    std::string_view extra(std::string_view key) const noexcept {
+        for (const auto& [k, v] : extraFields) {
+            if (k == key) {
+                return v;
+            }
+        }
+        return {};
     }
 
     std::string_view args() const noexcept {
         return argsJson;
     }
 
-    std::string_view session() const noexcept {
-        return sessionId;
+    std::string_view scope() const noexcept {
+        return scopeKey;
     }
 
     std::string_view call() const noexcept {
@@ -2473,18 +2447,6 @@ struct RootRequest {
 
     std::string_view capMethod() const noexcept {
         return method;
-    }
-
-    std::string_view node() const noexcept {
-        return nodeName;
-    }
-
-    std::string_view config() const noexcept {
-        return configJson;
-    }
-
-    std::string_view state() const noexcept {
-        return stateJson;
     }
 };
 
@@ -2860,7 +2822,7 @@ inline void spawnTaskImpl(Ctx& ctx, Fn&& fn) {
         // 任务协程以引用接收 ctl：必须由 SpawnRecord 持有到任务结束（不能放在
         // starter 的栈上，否则任务一挂起就悬垂）。
         if (!rec->ctl) {
-            rec->ctl = std::make_shared<OpCtl>(OpCtl{cancelFlag, ctx.host, ctx.iface.cancel, ""});
+            rec->ctl = std::make_shared<OpCtl>(OpCtl{cancelFlag, nullptr, std::string{}, {}});
         }
         auto task = fn(ctx, *rec->ctl);
         if (task.handle_) {
@@ -2919,7 +2881,7 @@ inline void spawn(Ctx& ctx, Fn&& fn) {
 ///
 /// - 持有主程序句柄、通用接口表聚合、实例级 [Logger] 与 [CancelRegistry];
 /// - 提供与主程序业务无关的常用操作: config / workDir / argsJson / configPath /
-///   language / setLanguage / sessionCancelled / jsonEscape / jsonGetString /
+///   language / setLanguage / jsonEscape / jsonGetString /
 ///   主程序堆字符串 (strdup / createString / createPluginString) / 后台任务 spawn;
 /// - 协程驱动桥 (见 [bridge]) 让插件协程与主程序协程在同一 IO 执行序列中交错推进;
 /// - 业务能力由主程序侧派生基类补齐: 派生类既可在 `IfacesT` 中带业务表, 也可覆写
@@ -2978,7 +2940,7 @@ public:
         log.logIface = iface.log;
         log.logFn    = (iface.log && iface.log->log) ? iface.log->log : nullptr;
 
-        // 业务挂钩: 由主程序侧派生基类补齐 (如在此订阅会话轮次开始事件)
+        // 业务挂钩: 由主程序侧派生基类补齐 (如在此订阅域内的轮次开始事件)
         onHostReady();
     }
 
@@ -2994,27 +2956,6 @@ public:
         std::string res(s.data, static_cast<size_t>(s.size));
         PluginString::free(host, &s);
         return res;
-    }
-
-    /// 会话生效的工作目录 (`get_session_work_dir`)
-    /// - `agent` 是本挂载的 agent 引用 (`mount` 时存下来的那份); 会话属于某个 agent
-    /// - `tid` 为空 = 该 agent 的默认会话工作目录
-    std::string workDir(const PluginxxScopeRef* agent, PluginxxStringView tid = {}) const {
-        if (!host || !iface.config || !iface.config->get_session_work_dir) {
-            return "";
-        }
-        PluginxxString s{nullptr, 0};
-        iface.config->get_session_work_dir(host, agent, &tid, &s);
-        if (s.data) {
-            std::string res(s.data, static_cast<size_t>(s.size));
-            PluginString::free(host, &s);
-            return res;
-        }
-        return "";
-    }
-
-    std::string workDir(const PluginxxScopeRef* agent, std::string_view tid) const {
-        return workDir(agent, PluginStringView::from(tid.data(), tid.size()));
     }
 
     std::string argsJson() const {
@@ -3064,28 +3005,6 @@ public:
         }
         auto langSv = PluginStringView::from(lang.data(), lang.size());
         return iface.config->set_language(host, &langSv) == 0;
-    }
-
-    /// 会话是否已取消 (优化版: 优先本地无抖动查询)
-    /// - 主程序下发 cancel 时已通过 execute_cancel 写入 cancelRegistry
-    /// - 故本地为 true 时必然已取消，直接返回 true，避免任何跨线程通信
-    /// - `agent` 是本挂载的 agent 引用（会话属于某个 agent）
-    bool sessionCancelled(const PluginxxScopeRef* agent, PluginxxStringView tid) const {
-        if (!tid.data || tid.size == 0) {
-            return false;
-        }
-        std::string_view sv(tid.data, static_cast<size_t>(tid.size));
-        if (cancelRegistry.isCancelled(sv)) {
-            return true;
-        }
-        if (!host || !iface.cancel || !iface.cancel->is_cancelled) {
-            return false;
-        }
-        return iface.cancel->is_cancelled(host, agent, &tid) != 0;
-    }
-
-    bool sessionCancelled(const PluginxxScopeRef* agent, std::string_view tid) const {
-        return sessionCancelled(agent, PluginStringView::from(tid.data(), tid.size()));
     }
 
     char* strdup(PluginxxStringView sv) const {
@@ -3216,7 +3135,7 @@ public:
 protected:
 
     /// 业务挂钩: [init] 末尾调用, 由主程序侧派生基类补齐业务初始化
-    /// (主程序可在此订阅会话轮次开始事件, 用于重置会话级取消登记)
+    /// (主程序可在此订阅域内的轮次开始事件, 用于重置按作用域键的取消登记)
     virtual void onHostReady() {}
 
 private:
@@ -3421,21 +3340,22 @@ enum class AwaiterState : uint32_t {
 struct InvokeCapState {
     const PluginxxHost*              host = nullptr;
     const PluginxxCapabilitiesIface* caps = nullptr;
-    PluginxxScopeRef                 agent{}; ///< 归因引用 (借用视图指向 awaiter 内部)
-    std::string                      agentId;
-    uint64_t                         agentSeq = 0;
+    PluginxxScopeRef                 scope{}; ///< 归因引用 (借用视图指向 awaiter 内部)
+    std::string                      scopeId;
+    uint64_t                         scopeSeq = 0;
 
     /// 归因引用 (空 id 时返回 NULL; 否则指向本结构体内部, 仅供本次调用)
-    const PluginxxScopeRef* agentScope() {
-        if (agentId.empty()) {
+    const PluginxxScopeRef* scopeRef() {
+        if (scopeId.empty()) {
             return nullptr;
         }
-        agent.struct_size = static_cast<uint32_t>(sizeof(PluginxxScopeRef));
-        agent.flags       = 0;
-        agent.id          = PluginStringView::from(agentId.data(), agentId.size());
-        agent.seq         = agentSeq;
-        return &agent;
+        scope.struct_size = static_cast<uint32_t>(sizeof(PluginxxScopeRef));
+        scope.flags       = 0;
+        scope.id          = PluginStringView::from(scopeId.data(), scopeId.size());
+        scope.seq         = scopeSeq;
+        return &scope;
     }
+
     /// 协程驱动桥 (可空): 完成回调经它投递 continuation 并唤醒 driver。
     PollOneBridge*            bridge = nullptr;
     std::string               capability;
@@ -3458,9 +3378,9 @@ struct InvokeCapAwaiter {
         std::string_view                 in_cap,
         std::string_view                 in_method,
         std::string_view                 in_args,
-        PollOneBridge*                   in_bridge = nullptr,
-        std::string_view                 in_agent  = {},
-        uint64_t                         in_agentSeq = 0
+        PollOneBridge*                   in_bridge   = nullptr,
+        std::string_view                 in_scope    = {},
+        uint64_t                         in_scopeSeq = 0
     ) :
         st(std::make_shared<InvokeCapState>()) {
         st->host       = in_host;
@@ -3469,8 +3389,8 @@ struct InvokeCapAwaiter {
         st->method     = std::string(in_method);
         st->argsJson   = std::string(in_args);
         st->bridge     = in_bridge;
-        st->agentId    = std::string(in_agent);
-        st->agentSeq   = in_agentSeq;
+        st->scopeId    = std::string(in_scope);
+        st->scopeSeq   = in_scopeSeq;
     }
 
     bool await_ready() const noexcept {
@@ -3490,7 +3410,7 @@ struct InvokeCapAwaiter {
 
         st->opHandle = st->caps->invoke_capability_async(
             st->host,
-            st->agentScope(),
+            st->scopeRef(),
             &capSv,
             &methSv,
             &argsSv,
@@ -3616,11 +3536,11 @@ inline detail::InvokeCapAwaiter invoke_cap(
 /// 带作用域归因的能力调用 (被调方可以从请求上下文知道"谁在调")
 template<typename Ctx>
 inline detail::InvokeCapAwaiter invoke_cap(
-    const Ctx&             ctx,
-    const ScopeRef&        agent,
-    std::string_view       capability,
-    std::string_view       method,
-    std::string_view       argsJson = "{}"
+    const Ctx&       ctx,
+    const ScopeRef&  scope,
+    std::string_view capability,
+    std::string_view method,
+    std::string_view argsJson = "{}"
 ) {
     return detail::InvokeCapAwaiter{
         ctx.host,
@@ -3629,8 +3549,8 @@ inline detail::InvokeCapAwaiter invoke_cap(
         method,
         argsJson,
         &ctx.bridge(),
-        agent.id(),
-        agent.seq()
+        scope.id(),
+        scope.seq()
     };
 }
 
@@ -3802,7 +3722,7 @@ inline PluginxxString invoke_capability_blocking(
     const PluginxxHost*              host,
     const PluginxxCapabilitiesIface* caps,
     const PluginxxSchedulerIface*    sched,
-    const PluginxxScopeRef*          agent,
+    const PluginxxScopeRef*          scope,
     std::string_view                 capability,
     std::string_view                 method,
     std::string_view                 args_json,
@@ -3838,7 +3758,7 @@ inline PluginxxString invoke_capability_blocking(
 
     PluginxxOperatorHandle* handle = caps->invoke_capability_async(
         host,
-        agent,
+        scope,
         &capSv,
         &methSv,
         &argsSv,
@@ -3945,14 +3865,14 @@ inline void logCreateFailure(
 /// 入口符号名拼接: `PLUGINXX_ENTRY_SYMBOL(<前缀>_plugin_, create)` → `<前缀>_plugin_create`
 ///
 /// 符号前缀由主程序给出 (插件框架不含任何主程序专名); 主程序在自己的 SDK 头里用它包出对插件作者
-/// 友好的导出宏 (主程序可包出自己的名字, 如 `<前缀>_PLUGIN_AGENT_EXPORT`)。
+/// 友好的导出宏 (主程序可包出自己的名字, 如 `<主程序前缀>_PLUGIN_<端>_EXPORT`)。
 #define PLUGINXX_ENTRY_SYMBOL_JOIN__(Prefix, Suffix) Prefix##Suffix
 #define PLUGINXX_ENTRY_SYMBOL_JOIN_(Prefix, Suffix)  PLUGINXX_ENTRY_SYMBOL_JOIN__(Prefix, Suffix)
 #define PLUGINXX_ENTRY_SYMBOL(Prefix, Suffix)        PLUGINXX_ENTRY_SYMBOL_JOIN_(Prefix, Suffix)
 
 /// 插件入口导出 (生成 `<SymbolPrefix>get_info/create/start/stop/destroy` 五个符号)。
 ///
-/// `SymbolPrefix` 是主程序命名空间前缀 (形如 `<主程序前缀>_plugin_agent_` /
+/// `SymbolPrefix` 是主程序命名空间前缀 (形如 `<主程序前缀>_plugin_<端>_` /
 /// `<主程序前缀>_plugin_client_`); 运行时主程序必须经 `entrySymbols()` 交出同一批符号名
 /// (见 `pluginxx/api/entry.h`), 两侧不一致时加载失败。
 ///

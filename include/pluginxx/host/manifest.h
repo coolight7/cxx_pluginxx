@@ -73,28 +73,33 @@ PLUGINXX_API const PluginxxBuiltinManifest* findBuiltinManifest(std::string_view
 PLUGINXX_API std::string pluginNameFromPath(const std::string& path);
 
 /// 插件清单资源声明 (plugin.yaml 可选段; 相对插件目录的路径已解析为绝对路径)
-/// - 键名与主配置 yaml 的 skill/memory/mcp 段一致 (降低理解成本):
-///     skill:  [dir, ...]                  → skillDirs
-///     memory: [file, ...]                 → memoryFiles
-///     mcp:    [{namespace,url,timeout},…] → mcpServers
-/// - 仅 agent 侧使用; client 侧插件主程序忽略资源声明
+///
+/// - **框架不解释资源种类**: `type` 与 `argsJson` 的取值由主程序定义
+///   (例如 "skill" / "memory" / "mcp" ...), 框架只负责解析与相对路径归一;
+/// - 规范写法是 `resources` 列表:
+///     resources:
+///       - {type: skill,   path: skills}
+///       - {type: memory,  path: notes.md}
+///       - {type: mcp,     args: {namespace: time, url: 'https://...', timeout: 120}}
+/// - 兼容旧写法 (清单顶层 `skill:` / `memory:` / `mcp:` 段): 解析后按同名 `type`
+///   映射成条目, 老清单无需改动;
+/// - 由声明资源的主程序一侧使用; 另一端的主程序可忽略资源声明
 struct PluginManifestResources {
-    /// 单个 MCP server 声明
-    struct McpDecl {
-        std::string url;
-        long long   timeoutMs = 120000; ///< 工具调用超时; 0 = 不限制
+    /// 单条资源声明
+    struct Entry {
+        std::string type;     ///< 资源种类 (主程序定义, 非空)
+        std::string path;     ///< 资源路径 (相对路径已解析为绝对); 可为空
+        std::string argsJson; ///< 该条其余字段 (JSON 对象文本); 无则为空串
     };
 
-    std::vector<std::string> skillDirs;
-    std::vector<std::string> memoryFiles;
-    /// key = MCP 工具命名空间
-    std::map<std::string, McpDecl> mcpServers;
+    /// 声明顺序即清单里的书写顺序
+    std::vector<Entry> entries;
 };
 
 /// 插件清单接口声明 (plugin.yaml 可选段 `interfaces`, 键名 require/optional):
 ///   interfaces:
-///     require:  [myapp.agent.core, myapp.client.command]
-///     optional: [myapp.client.toast]
+///     require:  [myapp.core, myapp.command]
+///     optional: [myapp.toast]
 /// - 同一清单可同时声明两侧接口 (前缀决定归属), 服务 cli/tui/gui 多主程序
 /// - 归属过滤与主程序支持集比对由主程序侧的 checkInterfacesForSide 完成
 struct PluginManifestInterfaces {

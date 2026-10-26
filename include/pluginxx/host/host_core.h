@@ -221,13 +221,13 @@ public:
 
     /// 调用能力 (**IO 线程**; ABI 入口已把跨线程调用投递过来)
     /// - `caller` 为发起调用的插件实例 (持有其执行 lease, 卸载等待必然覆盖本次调用);
-    /// - `agent` 为归因用的作用域引用 (可空 = 发起方不在 agent 上下文); 被调方的
+    /// - `scope` 为归因用的作用域引用 (可空 = 发起方不在任何作用域上下文); 被调方的
     ///   handler 可以从请求上下文里知道"谁在调" (引用内容由调用方自己取);
     /// - 完成通知经 [OpCore] 恒在 IO 线程发布 (即使插件同步 done);
     /// - 真正拒绝 (能力不存在/提供者不可用) 返回 NULL 并写 `error_out`, 此时不调用 `cb`。
     PluginxxOperatorHandle* invokeCapabilityAsync(
         InstanceT*               caller,
-        const PluginxxScopeRef*  agent,
+        const PluginxxScopeRef*  scope,
         std::string_view         capability,
         std::string_view         method,
         std::string_view         argsJson,
@@ -236,10 +236,10 @@ public:
         PluginxxString*          error_out
     ) {
         // 引用只用于归因 (不影响路由), 当前只做有效性记录, 供后续能力方法识别人发起方;
-        // 能力本身是主程序级的, 不因 agent 不同而分流。
+        // 能力本身是主程序级的, 不因作用域不同而分流。
         const std::string callerScope
-            = (pluginxx_scope_ref_ok(agent) && agent && agent->id.data && agent->id.size > 0)
-                  ? std::string(agent->id.data, static_cast<size_t>(agent->id.size))
+            = (pluginxx_scope_ref_ok(scope) && scope && scope->id.data && scope->id.size > 0)
+                  ? std::string(scope->id.data, static_cast<size_t>(scope->id.size))
                   : std::string{};
         (void)callerScope;
         std::shared_ptr<OpCore> core;
@@ -295,14 +295,14 @@ public:
 
     /// 订阅事件 (**IO 线程**)
     /// - `topic` 经 [DomainHooks::qualifyEventTopic] 补齐命名空间;
-    /// - `agent` 为空: 订阅主程序总线; 非空: 订阅该 agent 的总线
+    /// - `scope` 为空: 订阅主程序总线; 非空: 订阅该作用域的总线
     ///   (后端由 [DomainHooks::eventSource] 按引用给出, 无效引用返回 nullptr);
     /// - 事件回调在主程序事件线程执行, 每次回调都在实例执行 lease 保护下调用插件
     ///   (因此卸载的 idle 等待覆盖它);
     /// - 实例正在关闭/已禁用, 或主程序无事件后端时返回 nullptr。
     PluginxxSubscription* subscribe(
         InstanceT*                inst,
-        const PluginxxScopeRef*   agent,
+        const PluginxxScopeRef*   scope,
         std::string_view          topic,
         void(PLUGINXX_CALL* handler)(const PluginxxStringView* event_json, void* ud),
         void* ud
@@ -314,12 +314,12 @@ public:
             XX_LOGW("Plugin `{}` subscribe rejected: instance is closing or disabled", inst->name);
             return nullptr;
         }
-        auto source = hooks_ ? hooks_->eventSource(agent) : nullptr;
+        auto source = hooks_ ? hooks_->eventSource(scope) : nullptr;
         if (!source) {
             XX_LOGW(
-                "Plugin `{}` subscribe rejected: no event source (agent ref {})",
+                "Plugin `{}` subscribe rejected: no event source (scope ref {})",
                 inst->name,
-                agent ? "present" : "absent"
+                scope ? "present" : "absent"
             );
             return nullptr;
         }
@@ -331,8 +331,8 @@ public:
         sub->runtime = this->runtime();
         sub->handler = handler;
         sub->ud      = ud;
-        if (agent && agent->id.data && agent->id.size > 0) {
-            sub->scopeId.assign(agent->id.data, static_cast<size_t>(agent->id.size));
+        if (scope && scope->id.data && scope->id.size > 0) {
+            sub->scopeId.assign(scope->id.data, static_cast<size_t>(scope->id.size));
         }
 
         const size_t subId = source->subscribe(sub->topic, [sub](std::string_view data) {

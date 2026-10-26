@@ -1,6 +1,6 @@
 /// pluginxx 插件管理器公共基类 (主程序侧, 与主程序业务无关)
 ///
-/// 背景: agent 侧与 client 侧的插件管理器存在大量重复基建
+/// 背景: 主程序两端 (agent 侧与界面侧) 的插件管理器存在大量重复基建
 /// (插件表查找/名称预占、io 线程投递、实例 lease 归零等待、反向必选依赖收集)。
 /// 提取到本基类避免两侧行为漂移。
 ///
@@ -110,12 +110,12 @@ inline PluginHostCall<InstanceT, ManagerT>
 // 管理器公共基类 (CRTP: Derived 提供实例类型与具体能力)
 // =====================================================================
 
-/// 插件管理器公共基类 (agent 侧 PluginManager / client 侧 ClientPluginManager 继承)
+/// 插件管理器公共基类 (各端的管理器类继承)
 /// - 公共状态: 插件表 / io executor / ioThreadId_
 /// - 公共操作: io 线程投递 (isIoThread/postToIo/postToIoAsync)、查找、等待
 ///   in-flight 归零 (waitInflightZero)、反向必选依赖收集 (reverseRequiredDeps)
 /// - InstanceT 须继承 PluginInstanceBase; 具体加载/卸载/注册动作由 Derived
-///   实现 (本类不持有 agent/client 特有字段)
+///   实现 (本类不持有任一端特有字段)
 template<typename InstanceT>
 class PluginManagerBase {
 public:
@@ -142,7 +142,7 @@ public:
     }
 
     /// 是否仍有未安全关闭的实例 (stop 未完成 / lease 未归零 / destroy 未执行)。
-    /// 用于 owner 在停止 executor、销毁 agent 或进程退出前自检关闭流程是否走完。
+    /// 用于 owner 在停止 executor、销毁作用域或进程退出前自检关闭流程是否走完。
     bool hasPendingClose() const {
         for (const auto& [name, inst] : plugins_) {
             (void)name;
@@ -153,7 +153,7 @@ public:
         return false;
     }
 
-    /// 逐个卸载全部插件, 共享同一超时时刻 (agent/client 两侧 shutdownAsync 的公共实现)
+    /// 逐个卸载全部插件, 共享同一超时时刻 (各端 shutdownAsync 的公共实现)
     ///
     /// - 先快照插件名再逐个卸载: 卸载过程会改动插件表, 不能边遍历边卸载
     /// - 每个实例调用派生类的 [unloadUntil] (name, deadline) 完成实际卸载

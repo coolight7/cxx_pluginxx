@@ -14,7 +14,7 @@ bool CapabilityRegistry::registerCapability(
     }
     auto it = caps_.find(name);
     if (it != caps_.end()) {
-        // 同一实例重复声明 = 幂等成功: 能力是主程序级的, 而插件会被多个 agent 各挂载
+        // 同一实例重复声明 = 幂等成功: 能力是主程序级的, 而插件会被多个作用域各挂载
         // 一次 (每份挂载都会声明一遍)。保留首次登记 (含首次的 start/cancel/ctx)。
         if (it->second.provider == provider) {
             return true;

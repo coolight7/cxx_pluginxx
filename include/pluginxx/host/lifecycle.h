@@ -840,7 +840,7 @@ protected:
     // 主程序扩展点 (可选覆写)
     // =====================================================================
 
-    /// 同进程可能同时存在多个主程序 (如 client + agent), 日志前缀用于区分
+    /// 同进程可能同时存在多个主程序实例, 日志前缀用于区分
     virtual std::string_view logTag() const noexcept {
         return {};
     }
@@ -895,7 +895,7 @@ protected:
     ///
     /// - 调用时机: start 事务已成功、状态已回到 Ready;
     /// - 需要"启用时重新建好某个作用域"的主程序在这里做 (如重新挂载插件,
-    ///   因为 agent 级的注册都发生在插件的 `mount` 回调里);
+    ///   因为作用域级的注册都发生在插件的 `mount` 回调里);
     /// - 失败只记日志: 实例仍是启用状态, 只是没挂到该作用域上。
     virtual asio::awaitable<void> onInstanceEnabledAsync(const InstancePtr& inst) {
         (void)inst;
@@ -913,7 +913,7 @@ protected:
     }
 
     /// 卸载级联时是否只统计"启用中"的依赖者
-    /// - false (默认): 全部依赖者一起卸载 (与 agent 侧一致)
+    /// - false (默认): 全部依赖者一起卸载
     /// - true: 已禁用的依赖者保持加载 (client 侧既有行为)
     virtual bool cascadeUnloadEnabledOnly() const noexcept {
         return false;
@@ -1269,7 +1269,7 @@ protected:
                 this->ioExecutor(),
                 [self, inst]() -> asio::awaitable<void> {
                     co_await self->startForEnable(inst);
-                    // 主程序补充动作: 重新挂到作用域上 (agent 级注册都在插件的 mount 里)
+                    // 主程序补充动作: 重新挂到作用域上 (作用域级注册都在插件的 mount 里)
                     if (inst->enabled) {
                         co_await self->onInstanceEnabledAsync(inst);
                     }
