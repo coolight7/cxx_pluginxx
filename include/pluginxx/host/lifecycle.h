@@ -1,6 +1,6 @@
 /// pluginxx 框架生命周期骨架 (加载 / 启停 / 禁用启用 / 卸载 / 级联依赖)
 ///
-/// 定位: 把"与主程序业务无关"的生命周期逻辑从各主程序的管理器里收敛到一处 ——
+/// 定位: 把"与主程序业务无关"的生命周期逻辑从各主程序的管理器里统一到一处 ——
 /// 动态库加载与入口符号校验、create/start 事务、启用与禁用级联、stop 事务补齐、
 /// inflight 归零等待、destroy 与动态库卸载、失败回滚与关闭超时重试。
 ///
@@ -1023,7 +1023,7 @@ protected:
         this->plugins_.erase(inst->name);
         this->releasePluginName(inst->name);
         /// destroy 被活动 lease 挡下时不关句柄: 插件代码可能还在运行, 这时候卸载
-        /// 动态库会直接崩 (实例随最后一个引用释放时由析构兜底)。
+        /// 动态库会直接崩 (实例随最后一个引用释放时由析构函数保证)。
         if (closeHandle && destroyed) {
             inst->closeLibraryHandle();
         }

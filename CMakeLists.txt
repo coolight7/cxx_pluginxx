@@ -1,10 +1,10 @@
-# ===== cxx_pluginxx: 插件框架内核 (纯 C ABI 基座 + 通用接口表 + 插件框架运行时 + SDK) =====
+# ===== cxx_pluginxx: 插件框架内核 (纯 C ABI 契约 + 通用接口表 + 插件框架运行时 + SDK) =====
 #
 # 定位: 与主程序业务无关的插件框架, 供各主程序复用:
 #   - include/pluginxx/api/     纯 C ABI (跨边界契约, 与领域无关的部分)
 #   - include/pluginxx/kit/     插件侧 C++ SDK (header-only)
 #   - include/pluginxx/runtime/ 插件运行时 (header-only)
-#   - include/pluginxx/host/    主程序侧通用实现 (装载/清单/注册簿记/通用表加载)
+#   - include/pluginxx/host/    主程序侧通用实现 (加载/清单/注册记录/通用表加载)
 # 依赖: cxx_utilxx_base (取消令牌/日志/JSON 等) + fmt + Boost (仅头文件)
 #       **禁止**依赖 OpenSSL / SQLite / 图引擎等重依赖与 Boost 编译库
 # 产物 (命名规则: Release 无后缀, Debug 文件名追加 d):
@@ -127,17 +127,17 @@ endforeach()
 else ()
   # GCC/Clang: 默认隐藏全部符号, 仅导出头文件中标注 PLUGINXX_API 的公开 API
   # (该宏在 GCC/Clang 下展开为 visibility("default"));
-  # version script 只保留 local: * 作为兜底: 即便某个静态链入的第三方代码显式声明了
+  # version script 只保留 local: * 作为最后保护: 即便某个静态链入的第三方代码显式声明了
   # visibility("default"), 也不会被本动态库重导出。
   set_target_properties(${_CXX_PLUGINXX_TARGETS} PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
   )
   # version script 仅 ELF (Linux/Android) 可用; Mach-O (macOS/iOS) 无此机制,
-  # 上面的 visibility=hidden 已实现"默认隐藏"语义, 无需额外兜底
+  # 上面的 visibility=hidden 已实现"默认隐藏"语义, 无需额外处理
   if (XX_IS_LINUX_D OR XX_IS_ANDROID_D)
     set(_CXX_PLUGINXX_MAP "${CMAKE_CURRENT_BINARY_DIR}/pluginxx_symbols.map")
-    file(WRITE "${_CXX_PLUGINXX_MAP}" "# cxx_pluginxx 动态库导出兜底 (仅隐藏, 白名单由 PLUGINXX_API 决定)
+    file(WRITE "${_CXX_PLUGINXX_MAP}" "# cxx_pluginxx 动态库导出保护 (仅隐藏, 白名单由 PLUGINXX_API 决定)
 {
 local: *;
 };

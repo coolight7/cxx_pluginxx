@@ -1,9 +1,9 @@
-/// pluginxx 主程序侧 ABI 辅助 (跨边界字符串转换 / 异常兜底 / io 线程同步投递)
+/// pluginxx 主程序侧 ABI 辅助 (跨边界字符串转换 / 异常保护 / io 线程同步投递)
 ///
 /// 内容:
 /// - [svToSv] / [svToStr] / [strToSv] / [pluginStringView2std]: C ABI 字符串视图与
 ///   C++ 字符串视图/字符串之间的零拷贝或有拷贝转换;
-/// - [guardVtableCall] / [guardVtableCallVoid]: C ABI 边界异常兜底 —— vtable 函数
+/// - [guardVtableCall] / [guardVtableCallVoid]: C ABI 边界异常保护 —— vtable 函数
 ///   内部不得让 C++ 异常逃逸 (跨边界 UB), 统一捕获转日志并按失败返回值返回;
 /// - [ioCallSync] / [ioCallSyncVoid] / [ioCallSyncKeep] / [ioCallSyncVoidKeep]:
 ///   跨线程投递到主程序 io 线程并同步等待结果 (duck typing: Mgr 须提供
@@ -62,7 +62,7 @@ inline PluginxxStringView strToSv(std::string_view sv) noexcept {
 /// C ABI 字符串视图 → std::string_view (实现见 src/manifest.cpp)
 PLUGINXX_API std::string_view pluginStringView2std(PluginxxStringView str);
 
-/// ==================== C ABI 边界异常兜底 ====================
+/// ==================== C ABI 边界异常保护 ====================
 namespace detail {
 template<typename Fn, typename Ret>
 inline Ret guardVtableCallImpl(Ret fallback, Fn&& fn) noexcept {
@@ -89,7 +89,7 @@ inline void guardVtableCallVoidImpl(Fn&& fn) noexcept {
 }
 } // namespace detail
 
-/// 边界异常兜底: 执行 fn, 异常时记日志并返回 fallback
+/// 边界异常保护: 执行 fn, 异常时记日志并返回 fallback
 /// - 用法: `return pluginxx::guardVtableCall(-1, [&]() { ... });`
 template<
     typename Ret,
@@ -122,7 +122,7 @@ inline auto guardVtableCall(std::nullptr_t, Fn&& fn) noexcept -> std::invoke_res
     }
 }
 
-/// 边界异常兜底 (void 返回): 异常只记日志
+/// 边界异常保护 (void 返回): 异常只记日志
 template<typename Fn>
 inline void guardVtableCallVoid(Fn&& fn) noexcept {
     detail::guardVtableCallVoidImpl(std::forward<Fn>(fn));

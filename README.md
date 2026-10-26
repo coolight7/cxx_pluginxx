@@ -36,7 +36,7 @@ include/pluginxx/
           guard.h  C ABI 边界异常守卫 (logTo/reportCurrentException/guardCall/guardCallVoid)
   runtime/插件运行时 (runtime/driver/instance_base/manager_base/op_driver)
   host/   loader.h (dlopen/LoadLibrary)、manifest.h (plugin.yaml/名称推导/拓扑排序)、
-          abi_util.h (C 串转换/异常兜底/io 线程同步投递)、
+          abi_util.h (C 串转换/异常保护/io 线程同步投递)、
           capability_registry.h (能力注册表: 能力名 → 提供者插件 + 启动/取消回调)、
           event_bus.h (事件后端抽象 EventSource + 订阅句柄 PluginxxSubscription)、
           domain_hooks.h (业务数据入口 DomainHooks: 通用表需要主程序数据的入口)、
@@ -127,7 +127,7 @@ target_link_libraries(your_target PRIVATE cxx_pluginxx_static)  # 或 cxx_plugin
 - MSVC: 标注展开为 `dllexport` (构建动态库时) / `dllimport` (使用方);
   静态使用方由目标接口定义 `CXX_PLUGINXX_STATIC`, 宏展开为空
 - GCC/Clang: 编译期 `-fvisibility=hidden` (+ `-fvisibility-inlines-hidden`),
-  标注展开为 `visibility("default")`; version script 仅保留 `local: *` 作为兜底
+  标注展开为 `visibility("default")`; version script 仅保留 `local: *` 作为回退
 - 不使用 CMake 的 `WINDOWS_EXPORT_ALL_SYMBOLS`: 该机制要解析每个 `.obj` 的符号表
   生成 `.def`, 而 `/GL` (LTO) 产物只有编译器中间表示、没有符号表, 二者互斥
 

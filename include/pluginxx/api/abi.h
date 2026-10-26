@@ -264,7 +264,7 @@ typedef struct PluginxxBuiltinInfo {
     PluginxxDestroyFn destroy; ///< 可空 (实例销毁)
     PluginxxStartFn start; ///< 可空 (create 后的注册/启动事务)
     PluginxxStopFn  stop;  ///< 可空 (关闭事务, destroy 前调用)
-    /// 主程序的"每作用域挂载"入口 (可空; 类型由主程序解释, 框架只透传)
+    /// 主程序的"每作用域挂载"入口 (可空; 类型由主程序解释, 框架只原样转发)
     void* mount;
     void* unmount;
 } PluginxxBuiltinInfo;

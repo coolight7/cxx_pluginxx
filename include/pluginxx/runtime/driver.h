@@ -42,7 +42,7 @@
 /// - 裸指针句柄在"已排队 / 正在执行"期间有效 (由实例的请求表与投递闭包持有), 插件
 ///   只能在该窗口内 `cancel_driver`; 实例侧另保留最近 16 张已收束请求作为墓碑窗口,
 ///   吸收"刚收束就取消"的迟到调用;
-/// - 句柄校验由进程级地址注册表兜底 ([cancelByHandle]): 过期/伪造指针只被忽略;
+/// - 句柄校验由进程级地址注册表统一处理 ([cancelByHandle]): 过期/伪造指针只被忽略;
 /// - 出队执行 (`runOnIo`) 或取消 (`cancel`) 后释放实例 lease 并摘除登记。
 struct PluginxxDriver : std::enable_shared_from_this<PluginxxDriver> {
     /// 状态机的唯一所有权令牌: Idle 由"执行"与"取消"两方 CAS 竞争, 胜者负责
@@ -87,7 +87,7 @@ struct PluginxxDriver : std::enable_shared_from_this<PluginxxDriver> {
     /// 按地址校验并取消请求 (**任意线程可调用**; 无效/已收束句柄安全忽略)。
     ///
     /// 为什么不能直接解引用: `cancel_driver` 的 ABI 形态不含 host 参数, 主程序无法
-    /// 从实例反查合法句柄, 因此用一个**进程级地址注册表**兜底 —— 先按地址查表,
+    /// 从实例反查合法句柄, 因此用一个**进程级地址注册表**统一处理 —— 先按地址查表,
     /// 命中才经 weak_ptr 升级为强引用并调用 cancel; 未命中 (伪造/过期指针) 只记录
     /// 日志, 绝不解引用。表内只存 weak_ptr 且请求收束时按地址摘除, 因此内存有界,
     /// 也不存在"表项持有最后一个强引用导致自毁"的风险。
@@ -245,7 +245,7 @@ private:
         try {
             drive_(userData_);
         } catch (const std::exception& e) {
-            // 跨 C ABI 抛异常是插件违约; 主程序兜底记账, 不让异常逃出 IO 线程。
+            // 跨 C ABI 抛异常是插件违约; 主程序负责记账, 不让异常逃出 IO 线程。
             XX_LOGE("Plugin driver `{}` callback threw: {}", label_, e.what());
         } catch (...) {
             XX_LOGE("Plugin driver `{}` callback threw unknown exception", label_);

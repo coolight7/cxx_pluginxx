@@ -1,7 +1,7 @@
 /// pluginxx 框架核心 (通用表的状态与方法实现, 与主程序业务无关)
 ///
 /// 定位: 把**通用表** (log / json / config / plugins / events / capabilities /
-/// scheduler / coroutine_runtime / tasks / cancel) 的实现从各主程序的管理器里收敛到
+/// scheduler / coroutine_runtime / tasks / cancel) 的实现从各主程序的管理器里统一到
 /// 一处, 主程序只需:
 /// 1. 管理器继承本类 (`class MyManager : public pluginxx::PluginHostCore<MyInstance>`);
 /// 2. 实现 [DomainHooks] 并调用 [PluginHostCore::setDomainHooks];
@@ -221,7 +221,7 @@ public:
 
     /// 调用能力 (**IO 线程**; ABI 入口已把跨线程调用投递过来)
     /// - `caller` 为发起调用的插件实例 (持有其执行 lease, 卸载等待必然覆盖本次调用);
-    /// - `scope` 为归因用的作用域引用 (可空 = 发起方不在任何作用域上下文); 被调方的
+    /// - `scope` 用于标明归属的作用域引用 (可空 = 发起方不在任何作用域上下文); 被调方的
     ///   handler 可以从请求上下文里知道"谁在调" (引用内容由调用方自己取);
     /// - 完成通知经 [OpCore] 恒在 IO 线程发布 (即使插件同步 done);
     /// - 真正拒绝 (能力不存在/提供者不可用) 返回 NULL 并写 `error_out`, 此时不调用 `cb`。
@@ -235,7 +235,7 @@ public:
         void*                    ud,
         PluginxxString*          error_out
     ) {
-        // 引用只用于归因 (不影响路由), 当前只做有效性记录, 供后续能力方法识别人发起方;
+        // 引用只用于标明归属 (不影响路由), 当前只做有效性记录, 供后续能力方法识别人发起方;
         // 能力本身是主程序级的, 不因作用域不同而分流。
         const std::string callerScope
             = (pluginxx_scope_ref_ok(scope) && scope && scope->id.data && scope->id.size > 0)

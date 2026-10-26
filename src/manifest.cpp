@@ -1,7 +1,7 @@
 /// pluginxx 插件清单与名称推导实现 (见 pluginxx/host/manifest.h)
 ///
 /// 提取到插件框架的原因: 主程序多种插件框架共用同一套清单解析/
-/// 名称推导/入口路径解析, 放在一处可避免两侧行为漂移。
+/// 名称推导/入口路径解析, 放在一处可避免两侧行为差异。
 #include "pluginxx/host/manifest.h"
 
 #include "pluginxx/api/abi.h"

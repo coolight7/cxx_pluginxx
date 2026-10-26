@@ -908,12 +908,12 @@ public:
     using LocalExecutor = asio::io_context::executor_type;
 
     /// 连续多少次 driver 无进展后提示"等待没有主程序可见的唤醒源"。
-    /// 取 8 是为了容忍合理的偶发空转 (同一轮 wake 与已被消费的 continuation 重叠),
+    /// 取 8 是为了容忍合理的偶发空转 (同一轮 wake 与已被处理的 continuation 重叠),
     /// 又不至于让真正的私有 reactor 等待被静默掩盖。
     static constexpr int kNoProgressWarnStreak = 8;
 
     /// ---- 受控轮询 (pump) 参数: 只作用于声明式 `polled_tool` 的根 ----
-    /// 无进展时的退避量子 (ms): 等待插件框架就绪期间约 100 次/秒驱动,
+    /// 无进展时的退避时间片 (ms): 等待插件框架就绪期间约 100 次/秒驱动,
     /// 每次 ≈1 个主程序 post + 1 次 `epoll_wait(0)`, 空闲时不产生任何驱动。
     static constexpr int64_t kPollIntervalMs = 10;
     /// 连续"有进展"多少步后强制让出一次 (给主程序其它任务与同实例其它操作机会),
@@ -1053,7 +1053,7 @@ public:
         readySteps_.fetch_add(1, std::memory_order_acq_rel);
         auto* self = this;
         asio::post(localIo_, [self, fn = std::move(fn)]() mutable {
-            // 本 handler 已被 host driver 选中执行: 消费投递时记下的那一步。
+            // 本 handler 已被 host driver 选中执行: 处理投递时记下的那一步。
             self->readySteps_.fetch_sub(1, std::memory_order_acq_rel);
             try {
                 fn();
@@ -1127,7 +1127,7 @@ public:
     }
 
     /// 立即结束已排定的退避 (取消退避定时器, 让下一次驱动马上到来)。
-    /// 用于 `execute_cancel`: 插件不必等满一个退避量子就能看到取消并收束根。
+    /// 用于 `execute_cancel`: 插件不必等满一个退避时间片就能看到取消并收束根。
     void kickPumpWait() noexcept {
         PluginxxOperatorHandle* waitOp = nullptr;
         {
@@ -1248,7 +1248,7 @@ public:
         logToHost(host_, 4, message);
     }
 
-    /// 静态上下文 (asio handler 内部) 使用的兜底日志入口。
+    /// 静态上下文 (asio handler 内部) 使用的回退日志入口。
     static void logFallback(std::string_view message) noexcept {
         std::fputs("[plugin kit] ", stderr);
         std::fwrite(message.data(), 1, message.size(), stderr);
@@ -1331,7 +1331,7 @@ private:
         bool cancelImmediately = false;
         {
             std::lock_guard lock(mutex_);
-            // 该请求仍归本轮所有 (回调尚未消费它) 时才记录句柄; 否则说明回调已经
+            // 该请求仍归本轮所有 (回调尚未处理它) 时才记录句柄; 否则说明回调已经
             // 跑完 (或实例已停止): 此时请求已收束, 取消是幂等空操作。
             if (pendingEpoch_ == epoch && driverQueued_ && !stopping_) {
                 driver_ = ticket;
@@ -1370,7 +1370,7 @@ private:
                 return;
             }
             driverQueued_  = false;
-            driver_        = nullptr; // 请求已消费, 不再需要取消
+            driver_        = nullptr; // 请求已处理, 不再需要取消
             pendingEpoch_  = 0;
             driverRunning_ = true;
         }
@@ -1417,7 +1417,7 @@ private:
         {
             std::lock_guard lock(mutex_);
             driverRunning_ = false;
-            // 只消费本轮之前或本轮中出现的真实 wake; 没有新 wake 就停止, 外部事件
+            // 只处理本轮之前或本轮中出现的真实 wake; 没有新 wake 就停止, 外部事件
             // 到达时会自己调用 [wake]。
             needRequest = prepareScheduleLocked();
             if (!needRequest) {
@@ -1453,7 +1453,7 @@ private:
     ///
     /// - 无未结束的 polled 操作 (`polledRoots_ == 0`): 不轮询, 突发计数归零;
     /// - 本轮 `poll_one` 执行到了 handler (有进展) 且未达突发上限: 立即续票,
-    ///   等待中的网络/子进程/文件就能在就绪的下一个瞬间被处理 (最坏延迟 = 退避量子);
+    ///   等待中的网络/子进程/文件就能在就绪的下一个瞬间被处理 (最坏延迟 = 退避时间片);
     /// - 否则: 安排一次退避 (无进展 = `kPollIntervalMs`; 达到突发上限 = 让出
     ///   `kPollBurstYieldMs` 给主程序与同实例其它操作), 已有已排定的退避时不重复安排。
     PumpDecision pumpNextLocked(std::size_t progressed, int64_t& backoffMs) noexcept {
@@ -1535,7 +1535,7 @@ private:
     /// 退避定时器到期 (或被 `op_cancel` 取消) 的回调: 请求下一次请求。
     ///
     /// 被取消也算"退避结束" —— `execute_cancel` 正是靠取消退避来让插件立刻获得一次
-    /// 驱动, 从而不必等满整个退避量子才看到取消。
+    /// 驱动, 从而不必等满整个退避时间片才看到取消。
     static void PLUGINXX_CALL
         pumpWaitDone(void* ud, int32_t status, const PluginxxStringView* payload) noexcept {
         (void)status;
@@ -1581,7 +1581,7 @@ private:
     asio::executor_work_guard<asio::io_context::executor_type> work_;
     const PluginxxHost*                                        host_    = nullptr;
     const PluginxxCoroutineRuntimeIface*                       runtime_ = nullptr;
-    /// 主程序计时器/卸载接口表 (`scheduler.sleep` 用于受控轮询的退避量子,
+    /// 主程序计时器/卸载接口表 (`scheduler.sleep` 用于受控轮询的退避时间片,
     /// `op_cancel` 用于取消已排定的退避); 缺失时为 nullptr。
     const PluginxxSchedulerIface* sched_ = nullptr;
 
@@ -1859,7 +1859,7 @@ public:
         }
     }
 
-    /// 触发所有正在运行任务的取消 (插件卸载或实例销毁时兜底调用)
+    /// 触发所有正在运行任务的取消 (插件卸载或实例销毁时补充调用)
     void cancelAll() {
         std::vector<std::pair<RegId, std::shared_ptr<CallbackEntry>>> toInvoke;
         {
@@ -1993,7 +1993,7 @@ struct OpCtl {
     CancelRegistry*                    cancelRegistry = nullptr;
     /// 主程序定义的作用域内键 (如会话 / 房间 / 请求); 空 = 未绑定具体键
     std::string scopeKey;
-    /// 本操作所属的作用域; 空 = 不归因
+    /// 本操作所属的作用域; 空 = 不标明归属
     ScopeRef scope;
 
     bool cancelled() const noexcept {
@@ -3340,11 +3340,11 @@ enum class AwaiterState : uint32_t {
 struct InvokeCapState {
     const PluginxxHost*              host = nullptr;
     const PluginxxCapabilitiesIface* caps = nullptr;
-    PluginxxScopeRef                 scope{}; ///< 归因引用 (借用视图指向 awaiter 内部)
+    PluginxxScopeRef                 scope{}; ///< 归属引用 (借用视图指向 awaiter 内部)
     std::string                      scopeId;
     uint64_t                         scopeSeq = 0;
 
-    /// 归因引用 (空 id 时返回 NULL; 否则指向本结构体内部, 仅供本次调用)
+    /// 归属引用 (空 id 时返回 NULL; 否则指向本结构体内部, 仅供本次调用)
     const PluginxxScopeRef* scopeRef() {
         if (scopeId.empty()) {
             return nullptr;
@@ -3533,7 +3533,7 @@ inline detail::InvokeCapAwaiter invoke_cap(
     };
 }
 
-/// 带作用域归因的能力调用 (被调方可以从请求上下文知道"谁在调")
+/// 带作用域归属的能力调用 (被调方可以从请求上下文知道"谁在调")
 template<typename Ctx>
 inline detail::InvokeCapAwaiter invoke_cap(
     const Ctx&       ctx,
@@ -3962,7 +3962,7 @@ inline void logCreateFailure(
 /// 只导出 start/stop 两个入口 (供手写 create/destroy 的插件使用)。
 ///
 /// 少数插件需要自己控制实例构造或销毁 (如按平台条件创建运行时对象、加自定义日志),
-/// 它们手写 `<SymbolPrefix>create` / `<SymbolPrefix>destroy`, 但仍用本宏生成带异常兜底的
+/// 它们手写 `<SymbolPrefix>create` / `<SymbolPrefix>destroy`, 但仍用本宏生成带异常保护的
 /// start/stop trampoline —— 与 [PLUGINXX_EXPORT_PLUGIN] 的生命周期部分同语义。
 #define PLUGINXX_EXPORT_PLUGIN_LIFECYCLE(SymbolPrefix, CtxType, StartFn, StopFn)               \
     extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, start)( \
