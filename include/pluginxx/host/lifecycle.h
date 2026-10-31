@@ -884,9 +884,22 @@ protected:
     /// 禁用事务完成后的主程序补充动作 (可选覆写)
     ///
     /// - 调用时机: 骨架已摘除该实例的全部注册、stop 事务已完成 (或无需 stop);
-    /// - 需要"禁用时跟着拆掉某个作用域"的主程序在这里做 (如拆掉插件挂载);
+    /// - 需要"禁用时跟着拆掉某个作用域"的主程序在这里做 (如拆掉插件挂载, 让插件的
+    ///   unmount 回调释放 per-agent 状态);
     /// - 在管理器 io executor 上执行, 可以长时间等待, 但异常会被骨架记录并忽略。
     virtual asio::awaitable<void> onInstanceDisabledAsync(const InstancePtr& inst) {
+        (void)inst;
+        co_return;
+    }
+
+    /// 卸载事务开始后的主程序补充动作 (可选覆写)
+    ///
+    /// - 调用时机: 骨架已摘除该实例的全部注册、插件 stop 与 destroy **之前**
+    ///   (实例处于"关闭中", 生命周期操作仍可执行, 业务操作已被拒);
+    /// - 不覆写的话挂载记录会留到挂载析构 (日志会出现"仍有实例未拆挂载", 之后
+    ///   再拆时实例已 Closed, 插件 unmount 只能报 `provider is closing`);
+    /// - 在管理器 io executor 上执行, 异常会被骨架记录并忽略。
+    virtual asio::awaitable<void> onInstanceUnloadingAsync(const InstancePtr& inst) {
         (void)inst;
         co_return;
     }
@@ -1221,9 +1234,10 @@ protected:
         }
     }
 
-    /// 按需投递禁用事务：只有"已 start 且尚未 stop"的实例需要 stop。
+    /// 按需投递禁用事务: 拆作用域 (onInstanceDisabledAsync) 与补 stop 各有自己的
+    /// 前置判断, 所以这里不提前跳过 —— 没有 stop 要补的实例也可能挂着作用域需要拆。
     void requestStopForDisable(const InstancePtr& inst) {
-        if (!inst || !inst->lifecycleStopPending()) {
+        if (!inst) {
             return;
         }
         auto self = selfRef();
@@ -1328,6 +1342,10 @@ protected:
         }
 
         detachInstanceRegistrations(inst.get());
+        // 卸载: 让主程序把该实例从各作用域拆下来 (此时插件 unmount 还能跑; 也必须在
+        // releaseInstanceResources 之前 —— 那里会销毁插件挂的根, 根上的挂载记录
+        // 若还挂着本实例就会变成残局)
+        co_await onInstanceUnloadingAsync(inst);
         releaseInstanceResources(*inst);
 
         if (inst->lifecycleStopPending()) {
