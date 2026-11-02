@@ -486,7 +486,7 @@ public:
                 auto notify = core->notify();
                 notify.done(
                     notify.host_ud,
-                    ec ? PLUGINXX_OPERATOR_CANCELLED : PLUGINXX_OPERATOR_OK,
+                    ec ? PLUGINXX_OPERATOR_CANCELED : PLUGINXX_OPERATOR_OK,
                     nullptr
                 );
             });
@@ -560,7 +560,7 @@ public:
 
             const bool queued = [&]() {
                 if (!hooks_ || !hooks_->postToWorkerThread([core, result, cancelState, work, ud]() {
-                        PluginxxCancelToken token{&isOffloadCancelled, cancelState.get()};
+                        PluginxxCancelToken token{&isOffloadCanceled, cancelState.get()};
                         PluginxxString      workError{};
                         int32_t             status = PLUGINXX_OPERATOR_OK;
                         std::string         error;
@@ -571,7 +571,7 @@ public:
                                 status = PLUGINXX_OPERATOR_FAILED;
                             }
                             if (cancelState->requested.load(std::memory_order_acquire)) {
-                                status = PLUGINXX_OPERATOR_CANCELLED;
+                                status = PLUGINXX_OPERATOR_CANCELED;
                             }
                         } catch (const std::exception& e) {
                             status = PLUGINXX_OPERATOR_FAILED;
@@ -668,7 +668,7 @@ protected:
         std::atomic<bool> requested{false};
     };
 
-    static int32_t PLUGINXX_CALL isOffloadCancelled(const PluginxxCancelToken* token) {
+    static int32_t PLUGINXX_CALL isOffloadCanceled(const PluginxxCancelToken* token) {
         auto* state = token ? static_cast<const OffloadCancelState*>(token->host_ud) : nullptr;
         return state && state->requested.load(std::memory_order_acquire) ? 1 : 0;
     }

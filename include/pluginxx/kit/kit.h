@@ -449,12 +449,12 @@ struct PluginIfaceCore {
 
 /* ==================== 取消异常 ==================== */
 
-class CancelledException : public std::exception {
+class CanceledException : public std::exception {
     std::string msg_;
 
 public:
 
-    explicit CancelledException(std::string msg = "operation cancelled") :
+    explicit CanceledException(std::string msg = "operation canceled") :
         msg_(std::move(msg)) {}
 
     const char* what() const noexcept override {
@@ -1748,11 +1748,11 @@ public:
         entry->cb  = std::move(cb);
 
         RegId id               = nextId_.fetch_add(1, std::memory_order_relaxed);
-        bool  alreadyCancelled = false;
+        bool  alreadyCanceled = false;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            if (!key.empty() && cancelledKeys_.count(std::string(key)) > 0) {
-                alreadyCancelled = true;
+            if (!key.empty() && canceledKeys_.count(std::string(key)) > 0) {
+                alreadyCanceled = true;
             } else {
                 entries_[id] = entry;
                 if (!key.empty()) {
@@ -1763,7 +1763,7 @@ public:
         }
 
         // 若该 key 之前已由主程序下发过取消，锁外直接同步执行回调
-        if (alreadyCancelled) {
+        if (alreadyCanceled) {
             std::lock_guard<std::recursive_mutex> elock(entry->mu);
             if (entry->cb) {
                 try {
@@ -1825,7 +1825,7 @@ public:
         std::vector<std::pair<RegId, std::shared_ptr<CallbackEntry>>> toInvoke;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            cancelledKeys_.insert(std::string(key));
+            canceledKeys_.insert(std::string(key));
             auto kit = keyToIds_.find(std::string(key));
             if (kit != keyToIds_.end()) {
                 for (RegId id : kit->second) {
@@ -1892,21 +1892,21 @@ public:
 
     /// 查询指定 key 是否已被标记取消
     /// - 纯内存无跨线程调用，避免向主程序 IO 线程高频查询
-    bool isCancelled(std::string_view key) const {
+    bool isCanceled(std::string_view key) const {
         if (key.empty()) {
             return false;
         }
         std::lock_guard<std::mutex> lock(mu_);
-        return cancelledKeys_.count(std::string(key)) > 0;
+        return canceledKeys_.count(std::string(key)) > 0;
     }
 
     /// 重置指定 key 的取消标记 (新轮次开始时可选调用)
-    void clearCancelled(std::string_view key) {
+    void clearCanceled(std::string_view key) {
         if (key.empty()) {
             return;
         }
         std::lock_guard<std::mutex> lock(mu_);
-        cancelledKeys_.erase(std::string(key));
+        canceledKeys_.erase(std::string(key));
     }
 
     /// 查询当前注册的活跃回调总数
@@ -1983,7 +1983,7 @@ private:
     std::unordered_map<RegId, std::shared_ptr<CallbackEntry>> activeInvocations_;
     std::unordered_map<std::string, std::vector<RegId>>       keyToIds_;
     std::unordered_map<RegId, std::string>                    idToKey_;
-    std::unordered_set<std::string>                           cancelledKeys_;
+    std::unordered_set<std::string>                           canceledKeys_;
 };
 
 /* ==================== 操作控制对象 (OpCtl) ==================== */
@@ -1996,16 +1996,16 @@ struct OpCtl {
     /// 本操作所属的作用域; 空 = 不标明归属
     ScopeRef scope;
 
-    bool cancelled() const noexcept {
+    bool canceled() const noexcept {
         if (cancelFlag && cancelFlag->load(std::memory_order_acquire)) {
             return true;
         }
-        return cancelRegistry && !scopeKey.empty() && cancelRegistry->isCancelled(scopeKey);
+        return cancelRegistry && !scopeKey.empty() && cancelRegistry->isCanceled(scopeKey);
     }
 
-    void throw_if_cancelled() const {
-        if (cancelled()) {
-            throw CancelledException("operation cancelled");
+    void throw_if_canceled() const {
+        if (canceled()) {
+            throw CanceledException("operation canceled");
         }
     }
 };
@@ -2212,8 +2212,8 @@ inline void finishIfDone(std::coroutine_handle<Promise> h) {
         status = PLUGINXX_OPERATOR_FAILED;
         try {
             std::rethrow_exception(p.exception());
-        } catch (const CancelledException& e) {
-            status     = PLUGINXX_OPERATOR_CANCELLED;
+        } catch (const CanceledException& e) {
+            status     = PLUGINXX_OPERATOR_CANCELED;
             errPayload = e.what();
         } catch (const std::exception& e) {
             errPayload = e.what();
@@ -2221,7 +2221,7 @@ inline void finishIfDone(std::coroutine_handle<Promise> h) {
             errPayload = "unknown exception in coroutine";
         }
     } else if (p.cancelFlag_ && p.cancelFlag_->load(std::memory_order_acquire)) {
-        status = PLUGINXX_OPERATOR_CANCELLED;
+        status = PLUGINXX_OPERATOR_CANCELED;
     } else {
         if constexpr (!std::is_void_v<typename Promise::value_type>) {
             if constexpr (std::is_same_v<typename Promise::value_type, std::string>) {
@@ -2237,7 +2237,7 @@ inline void finishIfDone(std::coroutine_handle<Promise> h) {
     p.opCleanup_                   = nullptr;
     auto root                      = std::move(p.bridgeRoot_);
 
-    // 终态 payload: OK=结果, FAILED=错误信息, CANCELLED=空 (与既有契约一致)
+    // 终态 payload: OK=结果, FAILED=错误信息, Canceled=空 (与既有契约一致)
     std::string_view payload;
     if (status == PLUGINXX_OPERATOR_FAILED) {
         payload = errPayload;
@@ -2453,7 +2453,7 @@ struct RootRequest {
 /// 根操作完成守卫：保证 notify.done 恰好一次，并把异常统一映射为终态。
 ///
 /// 规则（plugin.md 不可变原则 5）：
-/// - 业务代码显式调用 ok()/failed()/cancelled() 表示完成；
+/// - 业务代码显式调用 ok()/failed()/canceled() 表示完成；
 /// - 作用域结束时仍未完成（提前 return 等）时析构补一次 FAILED，绝不留下
 ///   "已接受但永远不 done"的操作；
 /// - 重复完成只记录，不重复回调主程序。
@@ -2500,16 +2500,16 @@ public:
         complete(PLUGINXX_OPERATOR_FAILED, error);
     }
 
-    void cancelled(std::string_view reason = {}) {
-        complete(PLUGINXX_OPERATOR_CANCELLED, reason);
+    void canceled(std::string_view reason = {}) {
+        complete(PLUGINXX_OPERATOR_CANCELED, reason);
     }
 
-    /// 在 catch 块中调用：把当前异常映射为终态（取消异常映射为 CANCELLED）。
+    /// 在 catch 块中调用：把当前异常映射为终态（取消异常映射为 Canceled）。
     void fromCurrentException() noexcept {
         try {
             throw;
-        } catch (const CancelledException& e) {
-            cancelled(e.what());
+        } catch (const CanceledException& e) {
+            canceled(e.what());
         } catch (const std::exception& e) {
             failed(e.what());
         } catch (...) {
@@ -3184,8 +3184,8 @@ struct SleepAwaiter {
                 auto  handle = std::coroutine_handle<Promise>::from_address(self->coroAddr);
                 auto& prom   = handle.promise();
                 prom.clear_outstanding();
-                if (status == PLUGINXX_OPERATOR_CANCELLED) {
-                    prom.set_exception(std::make_exception_ptr(CancelledException("sleep cancelled")
+                if (status == PLUGINXX_OPERATOR_CANCELED) {
+                    prom.set_exception(std::make_exception_ptr(CanceledException("sleep canceled")
                     ));
                 } else if (status == PLUGINXX_OPERATOR_FAILED) {
                     auto message = PluginStringView::str(payload);
@@ -3278,7 +3278,7 @@ struct OffloadAwaiter {
                     } else {
                         self->result = self->work(token);
                     }
-                } catch (const CancelledException&) {
+                } catch (const CanceledException&) {
                     self->exPtr = std::current_exception();
                 } catch (...) {
                     self->exPtr = std::current_exception();
@@ -3319,8 +3319,8 @@ struct OffloadAwaiter {
         if (exPtr) {
             std::rethrow_exception(exPtr);
         }
-        if (status == PLUGINXX_OPERATOR_CANCELLED) {
-            throw CancelledException("offload cancelled");
+        if (status == PLUGINXX_OPERATOR_CANCELED) {
+            throw CanceledException("offload canceled");
         }
         if constexpr (!std::is_void_v<ResultType>) {
             return std::move(*result);
@@ -3473,9 +3473,9 @@ struct InvokeCapAwaiter {
         if (!st->startError.empty()) {
             throw std::runtime_error("invoke_capability start failed: " + st->startError);
         }
-        if (st->status == PLUGINXX_OPERATOR_CANCELLED) {
-            throw CancelledException(
-                st->payload.empty() ? "invoke_capability cancelled" : st->payload
+        if (st->status == PLUGINXX_OPERATOR_CANCELED) {
+            throw CanceledException(
+                st->payload.empty() ? "invoke_capability canceled" : st->payload
             );
         }
         if (st->status != PLUGINXX_OPERATOR_OK) {

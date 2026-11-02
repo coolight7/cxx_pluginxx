@@ -1380,13 +1380,13 @@ protected:
             // 关闭已判定失败: 启动"驱动请求最后防线"。插件桥接正常会在自己的 stop
             // 事务里撤销排队请求 (见 pluginxx/runtime/driver.h 文件头), 这里撤销的是插件没能
             // 撤销的部分, 避免实例 lease 被永远占用 (lease 不归零就无法 destroy/dlclose)。
-            const auto cancelled = inst->cancelPendingDrivers();
-            if (cancelled > 0) {
+            const auto canceled = inst->cancelPendingDrivers();
+            if (canceled > 0) {
                 XX_LOGW(
-                    "{}Plugin `{}` close rescue cancelled {} pending driver ticket(s)",
+                    "{}Plugin `{}` close rescue canceled {} pending driver ticket(s)",
                     logTag(),
                     inst->name,
-                    cancelled
+                    canceled
                 );
             }
             inst->unloadRequested = false;

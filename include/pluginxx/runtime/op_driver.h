@@ -78,7 +78,7 @@ struct PluginxxOperatorHandle : std::enable_shared_from_this<PluginxxOperatorHan
     asio::any_io_executor                                executor;
     std::function<void()>                                cancelFn;
     std::shared_ptr<PluginxxOperationCompletionEndpoint> completionEndpoint;
-    std::atomic<bool>                                    cancelled{false};
+    std::atomic<bool>                                    canceled{false};
     std::atomic<bool>                                    completed{false};
 };
 
@@ -261,7 +261,7 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
         if (!completed() && state() != PluginOperationState::Rejected) {
             state_.store(PluginOperationState::Running, std::memory_order_release);
         }
-        if (!completed() && handle_->cancelled.load(std::memory_order_acquire)) {
+        if (!completed() && handle_->canceled.load(std::memory_order_acquire)) {
             cancel();
         }
         return true;
@@ -326,7 +326,7 @@ private:
                 return;
             }
             state_.store(PluginOperationState::Cancelling, std::memory_order_release);
-            handle_->cancelled.store(true, std::memory_order_release);
+            handle_->canceled.store(true, std::memory_order_release);
             cancel         = drive_.cancel;
             providerHandle = providerHandle_;
         }
@@ -627,7 +627,22 @@ struct PluginOpAwaitArgs {
     OpDrive                             drive;
 };
 
-inline asio::awaitable<std::string> awaitPluginOp(PluginOpAwaitArgs args) {
+/// 一次插件 Operation 的终态
+/// - 三态原样带回 (含 [PLUGINXX_OPERATOR_CANCELED]), 业务失败**不**转异常:
+///   调用方自己决定怎么处理 (工具结果直接取状态, 图节点/钩子走
+///   `agentxx::util::requirePluginOpOk`)
+/// - 等待本身被取消 (协程 cancellation slot / 实例关闭) 仍按原样抛异常
+struct PluginOpResult {
+    int32_t     status = PLUGINXX_OPERATOR_FAILED;
+    std::string payload;
+
+    bool isOk() const noexcept {
+        return status == PLUGINXX_OPERATOR_OK;
+    }
+};
+
+/// 等待一次插件 Operation 结束并返回终态 (不因业务失败抛异常)
+inline asio::awaitable<PluginOpResult> awaitPluginOpResult(PluginOpAwaitArgs args) {
     auto runtime = args.inst ? args.inst->runtime.lock() : nullptr;
     if (!runtime || !isRuntimeIoThread(runtime)) {
         throw std::runtime_error("plugin operation requires its IO executor");
@@ -652,7 +667,7 @@ inline asio::awaitable<std::string> awaitPluginOp(PluginOpAwaitArgs args) {
                 op->cancel();
             }
         });
-        if (cancel->isCancelled()) {
+        if (cancel->isCanceled()) {
             core->cancel();
         }
     }
@@ -670,15 +685,7 @@ inline asio::awaitable<std::string> awaitPluginOp(PluginOpAwaitArgs args) {
         core->cancel();
         std::rethrow_exception(abort);
     }
-    if (core->status() == PLUGINXX_OPERATOR_CANCELLED) {
-        throw utilxx::CancelledException(fmt::format("plugin op `{}` cancelled", args.label));
-    }
-    if (core->status() != PLUGINXX_OPERATOR_OK) {
-        throw std::runtime_error(
-            core->payload().empty() ? "plugin operation failed" : core->payload()
-        );
-    }
-    co_return core->payload();
+    co_return PluginOpResult{core->status(), core->payload()};
 }
 
 /// 调用实例生命周期入口 (start/stop), 复用与工具/能力相同的完成协议:

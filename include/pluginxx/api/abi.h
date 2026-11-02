@@ -135,7 +135,7 @@ typedef struct PluginxxInfo {
 
 /// 操作终结状态 (PluginxxOperatorNotify.done 的 status 参数)
 #define PLUGINXX_OPERATOR_OK        0 ///< 成功 (payload = 结果数据)
-#define PLUGINXX_OPERATOR_CANCELLED 1 ///< 已取消 (payload 可为 NULL/空)
+#define PLUGINXX_OPERATOR_CANCELED 1 ///< 已取消 (payload 可为 NULL/空)
 #define PLUGINXX_OPERATOR_FAILED    2 ///< 失败 (payload = 错误信息)
 
 /// 完成通知器 (主程序实现并随 start 下发; 操作终结时被调方须【恰好回调一次】)
