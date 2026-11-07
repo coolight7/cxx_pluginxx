@@ -254,6 +254,18 @@ public:
                               : detail::qualifyOwnedId(pluginId, rawId));
 
         std::string declError;
+        if (!capabilities_->declares(fullId) && appOwned) {
+            // 官方 id 的声明由应用负责。宿主自己有一份权威声明表时（本项目是生成物
+            // `capability_ids.g.h`）先补一条应用声明，免得再开一条"应用下发声明"的通道。
+            CapabilityDecl appDecl;
+            if (appCapabilityDecl(fullId, &appDecl)) {
+                appDecl.id = fullId;
+                appDecl.declaredBy.clear(); ///< 应用声明（不是插件声明）
+                if (!capabilities_->declare(appDecl, &declError)) {
+                    return fail(PLUGINXX_RESULT_ERR_ARG, declError);
+                }
+            }
+        }
         if (!capabilities_->declares(fullId)) {
             if (appOwned) {
                 return fail(
@@ -291,6 +303,13 @@ public:
         if (!capabilities_->addProvider(fullId, row, &rowError)) {
             return fail(PLUGINXX_RESULT_ERR_ARG, rowError);
         }
+        // 派生宿主把这一行接进自己的派发表（例如 musicxx 的钩子引擎）。
+        // 它拒绝时要把刚加的行撤掉，不能留下"注册表有、派发表没有"的半条登记。
+        const int32_t attachRc = onCapabilityRowAdded(inst, fullId, spec, &rowError);
+        if (attachRc != PLUGINXX_RESULT_OK) {
+            capabilities_->unregisterProvider(fullId, inst->name, row.ownerTag);
+            return fail(attachRc, rowError.empty() ? "register_capability: rejected by host" : rowError);
+        }
         detail::upsertEntry(
             inst->capabilityRegistrations,
             fullId,
@@ -324,6 +343,7 @@ public:
         if (!capabilities_->unregisterProvider(fullId, inst->name, ownerTag)) {
             return PLUGINXX_RESULT_ERR_NOT_DECLARED;
         }
+        onCapabilityRowRemoved(inst, fullId, ownerTag);
         return PLUGINXX_RESULT_OK;
     }
 
@@ -939,6 +959,49 @@ public:
     }
 
 protected:
+
+    /// 一条能力实现行登记成功后的挂接点（派生宿主把业务派发表接进来时用）
+    ///
+    /// 默认什么都不做（纯 pluginxx 宿主只记注册表）。返回非 0 时调用方会撤销刚加的
+    /// 实现行并把原因返回给插件 —— 用于"这个 id 我认识，但这次登记不合法"这类判定
+    /// （例如钩子只接受同步处理器）。
+    virtual int onCapabilityRowAdded(
+        InstanceT*                    inst,
+        const std::string&            id,
+        const PluginxxCapabilitySpec& spec,
+        std::string*                  error
+    ) {
+        (void)inst;
+        (void)id;
+        (void)spec;
+        (void)error;
+        return PLUGINXX_RESULT_OK;
+    }
+
+    /// 一条能力实现行撤销后的挂接点（与 [onCapabilityRowAdded] 成对）
+    ///
+    /// 实例卸载 / 停用走的是一次性清理（`unregisterInstanceCapabilities`），那里不逐行
+    /// 回调：派生宿主的业务表按实例整体清（musicxx 是 `clearPluginRegistrations`）。
+    virtual void onCapabilityRowRemoved(
+        InstanceT*         inst,
+        const std::string& id,
+        std::string_view   ownerTag
+    ) {
+        (void)inst;
+        (void)id;
+        (void)ownerTag;
+    }
+
+    /// 官方 id（`musicxx.*`）的声明来源（宿主自己有一份权威表时用）
+    ///
+    /// `register_capability` 对官方 id 要求"应用已声明"。宿主在 [out] 里填好声明并
+    /// 返回 true 时，调用方会把它登记成应用声明；返回 false 表示宿主也不知道，
+    /// 按原来的规则拒绝。
+    virtual bool appCapabilityDecl(std::string_view id, CapabilityDecl* out) {
+        (void)id;
+        (void)out;
+        return false;
+    }
 
     /// offload 取消状态: 令牌只在工作调用期间有效, 插件不得保存 token 或 host_ud
     struct OffloadCancelState {
