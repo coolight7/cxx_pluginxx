@@ -156,10 +156,18 @@ public:
 
     /// 注销一条实现行; 行不存在返回 false
     bool unregisterProvider(
-        std::string_view   id,
-        std::string_view   provider,
-        std::string_view   ownerTag = {},
-        CapabilityPhase_e  phase    = CapabilityPhase_e::Impl
+        std::string_view  id,
+        std::string_view  provider,
+        std::string_view  ownerTag,
+        CapabilityPhase_e phase
+    );
+
+    /// 注销该插件在这个 id 上的所有阶段里对得上 `ownerTag` 的行 (ABI 的
+    /// `unregister_capability` 没有阶段参数, 走这个); 命中返回 true
+    bool unregisterProvider(
+        std::string_view id,
+        std::string_view provider,
+        std::string_view ownerTag
     );
 
     /// 兼容入口: 注销该插件在这个 id 上的全部行 (含 before / after)

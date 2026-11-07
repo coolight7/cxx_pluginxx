@@ -3,7 +3,7 @@
 /// 归属: cxx_pluginxx (插件框架)。本头只提供**业务无关**的插件侧能力:
 /// - [PluginStringView] / [PluginString]: 跨边界 ABI 字符串便捷工具与主程序堆字符串 RAII
 /// - [queryInterface] / [PluginIfaceCore]: 通用接口表 (log / json / config / plugins /
-///   events / capabilities / scheduler / coroutine_runtime / tasks / cancel) 查询
+///   broadcasts / capabilities / scheduler / coroutine_runtime / tasks / cancel) 查询
 /// - [Logger] / [pluginLog] / [pluginStrdup] / [ctxGuardLogger] / [jsonEscape]: 实例级
 ///   日志与 JSON 工具
 /// - [CancelRegistry] / [OpCtl]: 框架级取消登记与操作控制对象
@@ -417,7 +417,7 @@ struct PluginIfaceCore {
     const PluginxxJsonIface*         json         = nullptr; ///< "pluginxx.json"
     const PluginxxConfigIface*       config       = nullptr; ///< "pluginxx.config"
     const PluginxxPluginsIface*      plugins      = nullptr; ///< "pluginxx.plugins"
-    const PluginxxEventsIface*       events       = nullptr; ///< "pluginxx.events"
+    const PluginxxBroadcastsIface*   broadcasts   = nullptr; ///< "pluginxx.broadcasts"
     const PluginxxCapabilitiesIface* capabilities = nullptr; ///< "pluginxx.capabilities"
     const PluginxxSchedulerIface*    scheduler    = nullptr; ///< "pluginxx.scheduler"
     /// "pluginxx.coroutine_runtime": 协程驱动 (host driver/wake 协议)
@@ -435,7 +435,8 @@ struct PluginIfaceCore {
         f.json    = queryInterface<PluginxxJsonIface>(host, PLUGINXX_IFACE_JSON);
         f.config  = queryInterface<PluginxxConfigIface>(host, PLUGINXX_IFACE_CONFIG);
         f.plugins = queryInterface<PluginxxPluginsIface>(host, PLUGINXX_IFACE_PLUGINS);
-        f.events  = queryInterface<PluginxxEventsIface>(host, PLUGINXX_IFACE_EVENTS);
+        f.broadcasts
+            = queryInterface<PluginxxBroadcastsIface>(host, PLUGINXX_IFACE_BROADCASTS);
         f.capabilities
             = queryInterface<PluginxxCapabilitiesIface>(host, PLUGINXX_IFACE_CAPABILITIES);
         f.scheduler = queryInterface<PluginxxSchedulerIface>(host, PLUGINXX_IFACE_SCHEDULER);
@@ -3359,7 +3360,6 @@ struct InvokeCapState {
     /// 协程驱动桥 (可空): 完成回调经它投递 continuation 并唤醒 driver。
     PollOneBridge*            bridge = nullptr;
     std::string               capability;
-    std::string               method;
     std::string               argsJson;
     PluginxxOperatorHandle*   opHandle = nullptr;
     int32_t                   status   = PLUGINXX_OPERATOR_OK;
@@ -3376,7 +3376,6 @@ struct InvokeCapAwaiter {
         const PluginxxHost*              in_host,
         const PluginxxCapabilitiesIface* in_caps,
         std::string_view                 in_cap,
-        std::string_view                 in_method,
         std::string_view                 in_args,
         PollOneBridge*                   in_bridge   = nullptr,
         std::string_view                 in_scope    = {},
@@ -3386,7 +3385,6 @@ struct InvokeCapAwaiter {
         st->host       = in_host;
         st->caps       = in_caps;
         st->capability = std::string(in_cap);
-        st->method     = std::string(in_method);
         st->argsJson   = std::string(in_args);
         st->bridge     = in_bridge;
         st->scopeId    = std::string(in_scope);
@@ -3394,7 +3392,7 @@ struct InvokeCapAwaiter {
     }
 
     bool await_ready() const noexcept {
-        return !st || !st->caps || !st->caps->invoke_capability_async;
+        return !st || !st->caps || !st->caps->invoke_capability;
     }
 
     template<typename Promise>
@@ -3405,15 +3403,14 @@ struct InvokeCapAwaiter {
         auto*          holder = new std::shared_ptr<InvokeCapState>(st);
         PluginxxString err{nullptr, 0};
         auto           capSv = PluginStringView::from(st->capability.data(), st->capability.size());
-        auto           methSv = PluginStringView::from(st->method.data(), st->method.size());
         auto           argsSv = PluginStringView::from(st->argsJson.data(), st->argsJson.size());
 
-        st->opHandle = st->caps->invoke_capability_async(
+        st->opHandle = st->caps->invoke_capability(
             st->host,
             st->scopeRef(),
             &capSv,
-            &methSv,
             &argsSv,
+            0, ///< 阶段: 0 = 走完整链 before → impl → after
             [](void* ud, int32_t cbSt, const PluginxxStringView* pl) {
                 auto* hp = static_cast<std::shared_ptr<InvokeCapState>*>(ud);
                 auto  s  = *hp;
@@ -3520,14 +3517,12 @@ template<typename Ctx>
 inline detail::InvokeCapAwaiter invoke_cap(
     const Ctx&       ctx,
     std::string_view capability,
-    std::string_view method,
     std::string_view argsJson = "{}"
 ) {
     return detail::InvokeCapAwaiter{
         ctx.host,
         ctx.iface.capabilities,
         capability,
-        method,
         argsJson,
         &ctx.bridge()
     };
@@ -3539,14 +3534,12 @@ inline detail::InvokeCapAwaiter invoke_cap(
     const Ctx&       ctx,
     const ScopeRef&  scope,
     std::string_view capability,
-    std::string_view method,
     std::string_view argsJson = "{}"
 ) {
     return detail::InvokeCapAwaiter{
         ctx.host,
         ctx.iface.capabilities,
         capability,
-        method,
         argsJson,
         &ctx.bridge(),
         scope.id(),
@@ -3601,12 +3594,9 @@ inline void capability(Ctx& ctx, std::string_view capName, CapFn&& fn) {
 
     auto shim = ctx.storeShim(std::make_unique<CapShim>(CapShim{&ctx, std::forward<CapFn>(fn)}));
 
-    if (ctx.iface.capabilities && ctx.iface.capabilities->register_capability_ex) {
+    if (ctx.iface.capabilities && ctx.iface.capabilities->register_capability) {
         auto capSv = PluginStringView::from(capName.data(), capName.size());
-        ctx.iface.capabilities->register_capability_ex(
-            ctx.host,
-            &capSv,
-            [](void*                         user_data,
+        auto run = [](void*                         user_data,
                const PluginxxHost*           caller_host,
                const PluginxxStringView*     method,
                const PluginxxStringView*     args_json,
@@ -3696,8 +3686,8 @@ inline void capability(Ctx& ctx, std::string_view capName, CapFn&& fn) {
                     });
                     return job;
                 }
-            },
-            [](void* user_data, void* op) {
+            };
+        auto cancel = [](void* user_data, void* op) {
                 (void)user_data;
                 if (!op) {
                     return;
@@ -3712,9 +3702,19 @@ inline void capability(Ctx& ctx, std::string_view capName, CapFn&& fn) {
                     );
                     handle.promise().cancel_outstanding();
                 }
-            },
-            shim
-        );
+            };
+        PluginxxCapabilitySpec spec{};
+        spec.version     = PLUGINXX_API_VERSION;
+        spec.struct_size = sizeof(PluginxxCapabilitySpec);
+        spec.id          = capSv;
+        spec.impls       = PLUGINXX_CAPABILITY_IMPLS_ONE;
+        spec.merge       = PLUGINXX_CAPABILITY_MERGE_NONE;
+        spec.phases      = PLUGINXX_CAPABILITY_PHASE_MASK_IMPL;
+        spec.phase       = PLUGINXX_CAPABILITY_PHASE_IMPL;
+        spec.run_start   = run;
+        spec.cancel      = cancel;
+        spec.user_data   = shim;
+        ctx.iface.capabilities->register_capability(ctx.host, nullptr, &spec, nullptr);
     }
 }
 
@@ -3724,11 +3724,10 @@ inline PluginxxString invoke_capability_blocking(
     const PluginxxSchedulerIface*    sched,
     const PluginxxScopeRef*          scope,
     std::string_view                 capability,
-    std::string_view                 method,
     std::string_view                 args_json,
     PluginxxString*                  error_out
 ) {
-    if (!host || !caps || !caps->invoke_capability_async) {
+    if (!host || !caps || !caps->invoke_capability) {
         if (error_out) {
             *error_out = PluginString::fromCstr(host, "capabilities iface not available");
         }
@@ -3753,15 +3752,14 @@ inline PluginxxString invoke_capability_blocking(
     } state;
 
     auto capSv  = PluginStringView::from(capability.data(), capability.size());
-    auto methSv = PluginStringView::from(method.data(), method.size());
     auto argsSv = PluginStringView::from(args_json.data(), args_json.size());
 
-    PluginxxOperatorHandle* handle = caps->invoke_capability_async(
+    PluginxxOperatorHandle* handle = caps->invoke_capability(
         host,
         scope,
         &capSv,
-        &methSv,
         &argsSv,
+        0,
         [](void* ud, int32_t st, const PluginxxStringView* pl) {
             auto*           s = static_cast<SyncState*>(ud);
             std::lock_guard lk(s->mtx);

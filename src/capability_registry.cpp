@@ -307,6 +307,34 @@ bool CapabilityRegistry::unregisterProvider(
     return true;
 }
 
+bool CapabilityRegistry::unregisterProvider(
+    std::string_view id,
+    std::string_view provider,
+    std::string_view ownerTag
+) {
+    auto it = caps_.find(id);
+    if (it == caps_.end()) {
+        return false;
+    }
+    auto&      rows   = it->second.rows;
+    const auto before = rows.size();
+    rows.erase(
+        std::remove_if(
+            rows.begin(),
+            rows.end(),
+            [&](const CapabilityProvider& row) {
+                return row.provider == provider && row.ownerTag == ownerTag;
+            }
+        ),
+        rows.end()
+    );
+    if (before == rows.size()) {
+        return false;
+    }
+    refreshFirst(it->second);
+    return true;
+}
+
 bool CapabilityRegistry::unregisterCapability(std::string_view name, std::string_view provider) {
     auto it = caps_.find(name);
     if (it == caps_.end()) {

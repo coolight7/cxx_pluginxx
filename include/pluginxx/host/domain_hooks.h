@@ -13,7 +13,7 @@
 /// 实现方无需额外加锁; [postToWorkerThread] 例外, 它把工作投递到工作线程池。
 #pragma once
 
-#include "pluginxx/host/event_bus.h"
+#include "pluginxx/api/abi.h"
 
 #include <functional>
 #include <memory>
@@ -28,20 +28,18 @@ public:
 
     virtual ~DomainHooks() = default;
 
-    // ==================== 事件表 ====================
+    // ==================== 广播 / 能力共用 ====================
 
-    /// 事件后端; 返回 nullptr 表示主程序不支持事件订阅/发布
-    /// - `scope` 为空: 主程序总线 (进程级事件)
-    /// - `scope` 非空: 该作用域的总线 (主程序定义的域内事件); 引用无效时返回 nullptr
-    virtual std::shared_ptr<EventSource> eventSource(const PluginxxScopeRef* scope) {
-        (void)scope;
-        return nullptr;
-    }
-
-    /// 补齐事件主题的命名空间 (订阅与发布都经它, 保证两侧主题一致)
-    /// - 主程序可自行规定前缀 (例如不以 `plugin.` / `client.` 开头时补一个前缀)
+    /// 补齐广播 id 的命名空间 (订阅与发布都经它, 保证两侧 id 一致)
+    /// - 主程序可自行规定前缀 (例如插件短名补成 `plugin.<本插件 id>.<名字>`)
     virtual std::string qualifyEventTopic(std::string_view topic) {
         return std::string{topic};
+    }
+
+    /// 实例名 → 插件 id (默认相同; 主程序有"实例名前缀"时覆盖它)
+    /// - 用途: 插件用短名声明/实现自己的能力时, 宿主拼出 `plugin.<插件 id>.<名字>` 的全名
+    virtual std::string pluginId(std::string_view instanceName) {
+        return std::string{instanceName};
     }
 
     // ==================== 调度表 ====================

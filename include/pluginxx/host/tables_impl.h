@@ -398,76 +398,124 @@ struct GenericTableEntries {
     }
 
     // =====================================================================
-    // events 表
+    // broadcasts 表
     // =====================================================================
 
-    static PluginxxSubscription* PLUGINXX_CALL subscribeEntry(
+    static int32_t PLUGINXX_CALL broadcastDeclareEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* decl_json,
+        PluginxxString*           error_out
+    ) {
+        if (detail::abiViewEmpty(decl_json)) {
+            detail::setErrorString(error_out, "declare_broadcast: missing declaration");
+            return PLUGINXX_RESULT_ERR_ARG;
+        }
+        const std::string decl = svToStr(*decl_json);
+        return detail::onInstanceIo<InstanceT, ManagerT>(
+            host,
+            [decl, error_out](InstanceT* inst, ManagerT* mgr) {
+                std::string reason;
+                const int32_t rc = mgr->declareBroadcast(inst, decl, &reason);
+                if (rc != PLUGINXX_RESULT_OK) {
+                    detail::setErrorString(error_out, reason);
+                }
+                return rc;
+            }
+        );
+    }
+
+    static int32_t PLUGINXX_CALL broadcastPublishEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* broadcast_id,
+        const PluginxxStringView* payload_json,
+        PluginxxString*           error_out
+    ) {
+        if (detail::abiViewEmpty(broadcast_id)) {
+            detail::setErrorString(error_out, "publish_broadcast: missing id");
+            return PLUGINXX_RESULT_ERR_ARG;
+        }
+        const std::string id      = svToStr(*broadcast_id);
+        const std::string payload = payload_json ? svToStr(*payload_json) : std::string{"{}"};
+        return detail::onInstanceIo<InstanceT, ManagerT>(
+            host,
+            [id, payload, error_out](InstanceT* inst, ManagerT* mgr) {
+                std::string reason;
+                const int32_t rc = mgr->publishBroadcastFrom(inst, id, payload, &reason);
+                if (rc != PLUGINXX_RESULT_OK) {
+                    detail::setErrorString(error_out, reason);
+                }
+                return rc;
+            }
+        );
+    }
+
+    static PluginxxSubscription* PLUGINXX_CALL broadcastSubscribeEntry(
         const PluginxxHost*       host,
         const PluginxxScopeRef*   scope,
-        const PluginxxStringView* topic,
-        void(PLUGINXX_CALL* handler)(const PluginxxStringView* event_json, void* ud),
-        void* ud
+        const PluginxxStringView* broadcast_id,
+        void(PLUGINXX_CALL* handler)(const PluginxxStringView* payload_json, void* ud),
+        void*                     ud,
+        PluginxxString*           error_out
     ) {
-        return guardVtableCall(nullptr, [&]() -> PluginxxSubscription* {
+        return guardVtableCall<PluginxxSubscription*>(nullptr, [&]() {
             auto call = enterHost(host);
             auto mgr  = call.manager();
             auto inst = call.instance();
-            if (!mgr || !inst || detail::abiViewEmpty(topic) || !handler) {
+            if (!mgr || !inst || detail::abiViewEmpty(broadcast_id) || !handler) {
+                detail::setErrorString(
+                    error_out,
+                    "subscribe_broadcast: missing instance, id, or handler"
+                );
                 return static_cast<PluginxxSubscription*>(nullptr);
             }
             // 引用含借用视图: 投递前复制为自有的 id/seq (库内部结构)
-            auto              keep      = call;
-            const std::string topicCopy = svToStr(*topic);
+            auto              keep = call;
+            const std::string id   = svToStr(*broadcast_id);
             PluginxxScopeRef  scopeCopy{};
             const bool        hasScope = pluginxx_scope_ref_ok(scope) && scope;
             if (hasScope) {
                 scopeCopy = *scope;
             }
-            return ioCallSyncKeep<PluginxxSubscription*>(
+            auto* sub = ioCallSyncKeep<PluginxxSubscription*>(
                 keep,
                 mgr,
-                [keep, hasScope, scopeCopy, topicCopy, handler, ud]() {
-                    return keep.manager()
-                        ->subscribe(
-                            keep.instance(),
-                            hasScope ? &scopeCopy : nullptr,
-                            topicCopy,
-                            handler,
-                            ud
-                        );
+                [keep, hasScope, scopeCopy, id, handler, ud]() {
+                    return keep.manager()->subscribeBroadcast(
+                        keep.instance(),
+                        hasScope ? &scopeCopy : nullptr,
+                        id,
+                        handler,
+                        ud
+                    );
                 }
             );
+            if (!sub) {
+                detail::setErrorString(error_out, "subscribe_broadcast: rejected");
+            }
+            return sub;
         });
     }
 
-    static void PLUGINXX_CALL unsubscribeEntry(PluginxxSubscription* sub) {
-        guardVtableCallVoid([&] {
-            unsubscribePluginSubscription(sub);
-        });
+    static void PLUGINXX_CALL broadcastUnsubscribeEntry(PluginxxSubscription* sub) {
+        guardVtableCallVoid([&] { unsubscribePluginBroadcast(sub); });
     }
 
-    static int32_t PLUGINXX_CALL publishEntry(
+    static int32_t PLUGINXX_CALL broadcastReadEntry(
         const PluginxxHost*       host,
-        const PluginxxStringView* topic,
-        const PluginxxStringView* event_json
+        const PluginxxStringView* broadcast_id,
+        PluginxxString*           out_json
     ) {
-        return guardVtableCall(-1, [&]() -> int32_t {
-            auto call = enterHost(host);
+        if (!out_json || detail::abiViewEmpty(broadcast_id)) {
+            return PLUGINXX_RESULT_ERR_ARG;
+        }
+        return guardVtableCall<int32_t>(PLUGINXX_RESULT_ERR_ARG, [&]() -> int32_t {
+            auto call = enterHost(host, /*allowClosing=*/true);
             auto mgr  = call.manager();
-            auto inst = call.instance();
-            if (!mgr || !inst || detail::abiViewEmpty(topic) || !event_json) {
-                return -1;
+            if (!mgr) {
+                return PLUGINXX_RESULT_ERR_ARG;
             }
-            if (!inst->enabled) {
-                XX_LOGW("Plugin `{}` publish ignored (disabled)", inst->name);
-                return -1;
-            }
-            auto              keep      = call;
-            const std::string topicCopy = svToStr(*topic);
-            const std::string payload   = svToStr(*event_json);
-            return ioCallSyncKeep<int32_t>(keep, mgr, [keep, topicCopy, payload]() -> int32_t {
-                return keep.manager()->publish(topicCopy, payload);
-            });
+            const std::string id = svToStr(*broadcast_id);
+            return mgr->readBroadcast(id, out_json);
         });
     }
 
@@ -476,104 +524,89 @@ struct GenericTableEntries {
     // =====================================================================
 
     static int32_t PLUGINXX_CALL capabilityRegisterEntry(
-        const PluginxxHost*       host,
-        const PluginxxStringView* capability
+        const PluginxxHost*           host,
+        const PluginxxScopeRef*       scope,
+        const PluginxxCapabilitySpec* spec,
+        PluginxxString*               error_out
     ) {
-        if (detail::abiViewEmpty(capability)) {
-            return -1;
+        if (!spec || spec->struct_size < sizeof(PluginxxCapabilitySpec)) {
+            detail::setErrorString(
+                error_out,
+                "register_capability: spec is missing or too short"
+            );
+            return PLUGINXX_RESULT_ERR_ARG;
         }
-        const std::string capCopy = svToStr(*capability);
+        // 视图只在本次调用内有效: 复制成自有字符串后再投递
+        const std::string id       = svToStr(spec->id);
+        const std::string ownerTag = svToStr(spec->owner_tag);
+        PluginxxCapabilitySpec local = *spec;
+        PluginxxScopeRef       scopeCopy{};
+        const bool             hasScope = pluginxx_scope_ref_ok(scope) && scope;
+        if (hasScope) {
+            scopeCopy = *scope;
+        }
         return detail::onInstanceIo<InstanceT, ManagerT>(
             host,
-            [capCopy](InstanceT* inst, ManagerT* mgr) {
-                return mgr->registerCapability(inst, capCopy);
+            [local, id, ownerTag, hasScope, scopeCopy, error_out](
+                InstanceT* inst,
+                ManagerT*  mgr
+            ) {
+                PluginxxCapabilitySpec resolved = local;
+                resolved.id        = PluginxxStringView{id.data(), id.size()};
+                resolved.owner_tag = PluginxxStringView{ownerTag.data(), ownerTag.size()};
+                std::string reason;
+                const int32_t rc = mgr->registerCapability(
+                    inst,
+                    hasScope ? &scopeCopy : nullptr,
+                    resolved,
+                    &reason
+                );
+                if (rc != PLUGINXX_RESULT_OK) {
+                    detail::setErrorString(error_out, reason);
+                }
+                return rc;
             }
         );
     }
 
     static int32_t PLUGINXX_CALL capabilityUnregisterEntry(
         const PluginxxHost*       host,
-        const PluginxxStringView* capability
+        const PluginxxStringView* capability_id,
+        const PluginxxStringView* owner_tag
     ) {
-        if (detail::abiViewEmpty(capability)) {
-            return -1;
+        if (detail::abiViewEmpty(capability_id)) {
+            return PLUGINXX_RESULT_ERR_ARG;
         }
-        const std::string capCopy = svToStr(*capability);
+        const std::string id  = svToStr(*capability_id);
+        const std::string tag = owner_tag ? svToStr(*owner_tag) : std::string{};
         return detail::onInstanceIo<InstanceT, ManagerT>(
             host,
-            [capCopy](InstanceT* inst, ManagerT* mgr) {
-                return mgr->unregisterCapability(inst, capCopy);
+            [id, tag](InstanceT* inst, ManagerT* mgr) {
+                return mgr->unregisterCapability(inst, id, tag);
             }
         );
     }
 
-    static int32_t PLUGINXX_CALL
-        capabilityHasEntry(const PluginxxHost* host, const PluginxxStringView* capability) {
-        return guardVtableCall(0, [&]() -> int32_t {
-            auto call = enterHost(host, /*allowClosing=*/true);
-            auto mgr  = call.manager();
-            if (!mgr || detail::abiViewEmpty(capability)) {
-                return 0;
-            }
-            auto              keep = call;
-            const std::string cap  = svToStr(*capability);
-            return ioCallSyncKeep<bool>(keep, mgr, [keep, cap]() {
-                return keep.manager()->hasCapability(cap) != 0;
-            })
-                       ? 1
-                       : 0;
-        });
-    }
-
-    static int32_t PLUGINXX_CALL capabilityRegisterExEntry(
-        const PluginxxHost*             host,
-        const PluginxxStringView*       capability,
-        PluginxxCapabilityStartFunction start,
-        PluginxxOperatorCancelFunction  cancel,
-        void*                                ctx
-    ) {
-        return guardVtableCall(-1, [&]() -> int32_t {
-            auto call = enterHost(host);
-            auto mgr  = call.manager();
-            auto inst = call.instance();
-            if (!mgr || !inst || detail::abiViewEmpty(capability) || !start) {
-                return -1;
-            }
-            auto              keep = call;
-            const std::string cap  = svToStr(*capability);
-            return ioCallSyncKeep<int32_t>(keep, mgr, [keep, cap, start, cancel, ctx]() {
-                return keep.manager()->registerCapabilityEx(
-                    keep.instance(),
-                    cap,
-                    start,
-                    cancel,
-                    ctx
-                );
-            });
-        });
-    }
-
-    static PluginxxOperatorHandle* PLUGINXX_CALL invokeCapabilityAsyncEntry(
+    static PluginxxOperatorHandle* PLUGINXX_CALL capabilityInvokeEntry(
         const PluginxxHost*       host,
         const PluginxxScopeRef*   scope,
-        const PluginxxStringView* capability,
-        const PluginxxStringView* method,
+        const PluginxxStringView* capability_id,
         const PluginxxStringView* args_json,
+        int32_t                   phase,
         PluginxxOperatorCallback  cb,
-        void*                          ud,
+        void*                     ud,
         PluginxxString*           error_out
     ) {
         return guardVtableCall<PluginxxOperatorHandle*>(nullptr, [&]() {
             auto call = enterHost(host);
             auto mgr  = call.manager();
             auto inst = call.instance();
-            if (!mgr || !inst || detail::abiViewEmpty(capability) || detail::abiViewEmpty(method)) {
+            if (!mgr || !inst || detail::abiViewEmpty(capability_id)) {
                 return static_cast<PluginxxOperatorHandle*>(nullptr);
             }
             // 跨边界视图只在本次调用内有效: 投递前复制为自有字符串
             auto              keep = call;
-            const std::string cap  = svToStr(*capability);
-            const std::string meth = svToStr(*method);
+            const std::string id   = svToStr(*capability_id);
             const std::string args = args_json ? svToStr(*args_json) : std::string{"{}"};
             PluginxxScopeRef  scopeCopy{};
             const bool        hasScope = pluginxx_scope_ref_ok(scope) && scope;
@@ -583,13 +616,13 @@ struct GenericTableEntries {
             return ioCallSyncKeep<PluginxxOperatorHandle*>(
                 keep,
                 mgr,
-                [keep, hasScope, scopeCopy, cap, meth, args, cb, ud, error_out]() {
+                [keep, hasScope, scopeCopy, id, args, phase, cb, ud, error_out]() {
                     return keep.manager()->invokeCapabilityAsync(
                         keep.instance(),
                         hasScope ? &scopeCopy : nullptr,
-                        cap,
-                        meth,
+                        id,
                         args,
+                        phase,
                         cb,
                         ud,
                         error_out
@@ -597,6 +630,38 @@ struct GenericTableEntries {
                 }
             );
         });
+    }
+
+    static int32_t PLUGINXX_CALL capabilityInfoEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* capability_id,
+        PluginxxString*           out_json
+    ) {
+        if (!out_json || detail::abiViewEmpty(capability_id)) {
+            return PLUGINXX_RESULT_ERR_ARG;
+        }
+        const std::string id = svToStr(*capability_id);
+        return detail::onInstanceIo<InstanceT, ManagerT>(
+            host,
+            [id, out_json](InstanceT*, ManagerT* mgr) {
+                return mgr->capabilityInfo(id, out_json);
+            }
+        );
+    }
+
+    static int32_t PLUGINXX_CALL capabilityListEntry(
+        const PluginxxHost* host,
+        PluginxxString*     out_json
+    ) {
+        if (!out_json) {
+            return PLUGINXX_RESULT_ERR_ARG;
+        }
+        return detail::onInstanceIo<InstanceT, ManagerT>(
+            host,
+            [out_json](InstanceT*, ManagerT* mgr) {
+                return mgr->listCapabilities(out_json);
+            }
+        );
     }
 
     // =====================================================================
@@ -848,13 +913,15 @@ struct GenericTableEntries {
         return iface;
     }
 
-    static const PluginxxEventsIface& eventsIface() {
-        static const PluginxxEventsIface iface{
-            PLUGINXX_IFACE_EVENTS_VERSION,
-            sizeof(PluginxxEventsIface),
-            &subscribeEntry,
-            &unsubscribeEntry,
-            &publishEntry,
+    static const PluginxxBroadcastsIface& broadcastsIface() {
+        static const PluginxxBroadcastsIface iface{
+            PLUGINXX_IFACE_BROADCASTS_VERSION,
+            sizeof(PluginxxBroadcastsIface),
+            &broadcastDeclareEntry,
+            &broadcastPublishEntry,
+            &broadcastSubscribeEntry,
+            &broadcastReadEntry,
+            &broadcastUnsubscribeEntry,
         };
         return iface;
     }
@@ -864,10 +931,10 @@ struct GenericTableEntries {
             PLUGINXX_IFACE_CAPABILITIES_VERSION,
             sizeof(PluginxxCapabilitiesIface),
             &capabilityRegisterEntry,
-            &capabilityRegisterExEntry,
             &capabilityUnregisterEntry,
-            &capabilityHasEntry,
-            &invokeCapabilityAsyncEntry,
+            &capabilityInvokeEntry,
+            &capabilityInfoEntry,
+            &capabilityListEntry,
             &opCancelEntry,
         };
         return iface;
@@ -934,8 +1001,8 @@ const void* queryGenericPluginIface(std::string_view iid) {
     if (iid == PLUGINXX_IFACE_PLUGINS) {
         return &Entries::pluginsIface();
     }
-    if (iid == PLUGINXX_IFACE_EVENTS) {
-        return &Entries::eventsIface();
+    if (iid == PLUGINXX_IFACE_BROADCASTS) {
+        return &Entries::broadcastsIface();
     }
     if (iid == PLUGINXX_IFACE_CAPABILITIES) {
         return &Entries::capabilitiesIface();

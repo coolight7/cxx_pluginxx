@@ -18,7 +18,7 @@
 #include "asio/any_io_executor.hpp"
 #include "pluginxx/api/abi.h"
 #include "pluginxx/host/capability_registry.h"
-#include "pluginxx/host/event_bus.h"
+#include "pluginxx/host/broadcast_registry.h"
 #include "pluginxx/host/loader.h"
 #include "pluginxx/runtime/driver.h"
 #include "pluginxx/runtime/runtime.h"
@@ -162,9 +162,9 @@ struct PluginInstanceBase {
     /// 放在基类: 框架核心 (见 `pluginxx/host/host_core.h`) 只依赖基类即可完成
     /// 撤销与清理, 新增主程序无需重复实现同一套登记。
 
-    /// 活跃事件订阅 (句柄本体由 [subscriptionHandles] 保活; 撤销时从此表移除)
+    /// 活跃广播订阅 (句柄本体由 [subscriptionHandles] 保活; 撤销时从此表移除)
     std::vector<std::shared_ptr<::PluginxxSubscription>> subscriptions;
-    /// 事件订阅句柄保活表: 插件持有的裸指针在实例析构前始终有效
+    /// 广播订阅句柄保活表: 插件持有的裸指针在实例析构前始终有效
     std::vector<std::shared_ptr<::PluginxxSubscription>> subscriptionHandles;
     /// 活跃 sleep 使用 Operation 句柄索引；完成回调开始前移除，取消查询 O(1)。
     std::unordered_map<void*, std::shared_ptr<::PluginxxOperatorHandle>> sleepTimers;
@@ -548,22 +548,22 @@ inline bool PluginInstanceBase::destroyPlugin() noexcept {
 
 namespace detail {
 
-/// 事件订阅撤销的簿记动作 (见 pluginxx/host/event_bus.h 的声明)
-/// - 调用方已把句柄的 `alive` 置 false, 这里只做后端退订与实例订阅表清理;
-/// - 幂等: `subscriptionId` 置 0 后重复调用是空操作。
+/// 事件订阅撤销的簿记动作 (见 pluginxx/host/broadcast_registry.h 的声明)
+/// - 调用方已把句柄的 `alive` 置 false, 这里只做注册表退订与实例订阅表清理;
+/// - 幂等: `token` 置 0 后重复调用是空操作。
 inline void revokeSubscription(PluginxxSubscription* sub) noexcept {
     if (!sub) {
         return;
     }
     try {
-        if (sub->source && sub->subscriptionId != 0) {
-            sub->source->unsubscribe(sub->topic, sub->subscriptionId);
-            sub->subscriptionId = 0;
+        if (sub->registry && sub->token != 0) {
+            sub->registry->unsubscribe(sub->broadcastId, sub->token);
+            sub->token = 0;
         }
     } catch (const std::exception& e) {
-        XX_LOGW("Plugin subscription revoke failed: {}", e.what());
+        XX_LOGW("Plugin broadcast unsubscribe failed: {}", e.what());
     } catch (...) {
-        XX_LOGW("Plugin subscription revoke failed: unknown exception");
+        XX_LOGW("Plugin broadcast unsubscribe failed: unknown exception");
     }
     try {
         if (auto inst = sub->inst.lock()) {

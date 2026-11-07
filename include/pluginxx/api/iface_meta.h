@@ -84,12 +84,12 @@ constexpr bool ifaceHasVersion(const Iface* t, int32_t v) noexcept {
 /* ==================== 通用表元信息特化 (每张表一项) ==================== */
 
 template<>
-struct IfaceMeta<PluginxxEventsIface> {
-    static constexpr int32_t  min_version   = PLUGINXX_IFACE_EVENTS_MIN_VERSION;
-    static constexpr uint32_t baseline_size = PLUGINXX_IFACE_EVENTS_BASELINE_SIZE;
+struct IfaceMeta<PluginxxBroadcastsIface> {
+    static constexpr int32_t  min_version   = PLUGINXX_IFACE_BROADCASTS_MIN_VERSION;
+    static constexpr uint32_t baseline_size = PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE;
 };
-static_assert(PLUGINXX_IFACE_EVENTS_BASELINE_SIZE >= 8u);
-static_assert(PLUGINXX_IFACE_EVENTS_BASELINE_SIZE <= sizeof(PluginxxEventsIface));
+static_assert(PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE >= 8u);
+static_assert(PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE <= sizeof(PluginxxBroadcastsIface));
 
 template<>
 struct IfaceMeta<PluginxxCapabilitiesIface> {
