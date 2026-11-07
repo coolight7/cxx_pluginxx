@@ -51,6 +51,39 @@ extern "C" {
 
 #pragma pack(push, 8)
 
+/* ==================== 能力与广播的枚举值 (v4 / v1 起) ==================== */
+
+/* 一个 id 上有几个实现 (`PluginxxCapabilitySpec.impls`) */
+#define PLUGINXX_CAPABILITY_IMPLS_ONE  0
+#define PLUGINXX_CAPABILITY_IMPLS_MANY 1
+
+/* 实现链的结果怎么合并 (`PluginxxCapabilitySpec.merge`; 0 = 不适用) */
+#define PLUGINXX_CAPABILITY_MERGE_NONE  0
+#define PLUGINXX_CAPABILITY_MERGE_FIRST 1
+#define PLUGINXX_CAPABILITY_MERGE_VETO  2
+
+/* 声明开放的阶段 (`PluginxxCapabilitySpec.phases`, 位或) */
+#define PLUGINXX_CAPABILITY_PHASE_MASK_IMPL   (1u << 0)
+#define PLUGINXX_CAPABILITY_PHASE_MASK_BEFORE (1u << 1)
+#define PLUGINXX_CAPABILITY_PHASE_MASK_AFTER  (1u << 2)
+
+/* 一次登记落在哪个阶段 (`PluginxxCapabilitySpec.phase`, 互斥的一个值) */
+#define PLUGINXX_CAPABILITY_PHASE_IMPL   1
+#define PLUGINXX_CAPABILITY_PHASE_BEFORE 2
+#define PLUGINXX_CAPABILITY_PHASE_AFTER  4
+
+/* 频道有没有当前值 (`PluginxxBroadcastDecl.cache`) */
+#define PLUGINXX_BROADCAST_CACHE_NONE   0
+#define PLUGINXX_BROADCAST_CACHE_LATEST 1
+
+/* 谁能写 (`PluginxxBroadcastDecl.writable`) */
+#define PLUGINXX_BROADCAST_WRITABLE_OWNER  0
+#define PLUGINXX_BROADCAST_WRITABLE_ANYONE 1
+
+/* 频道用途 (`PluginxxBroadcastDecl.scope`) */
+#define PLUGINXX_BROADCAST_SCOPE_APP    0
+#define PLUGINXX_BROADCAST_SCOPE_SYSTEM 1
+
 /* ==================== 接口表: 事件 (pluginxx.events) ==================== */
 
 #define PLUGINXX_IFACE_EVENTS             "pluginxx.events"
