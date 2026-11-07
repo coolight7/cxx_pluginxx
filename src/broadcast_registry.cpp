@@ -243,6 +243,11 @@ bool BroadcastRegistry::unsubscribe(std::string_view id, uint64_t token) {
     return before != subs.size();
 }
 
+bool BroadcastRegistry::removeChannel(std::string_view id) {
+    std::lock_guard lock(mutex_);
+    return channels_.erase(std::string{id}) > 0;
+}
+
 size_t BroadcastRegistry::removeSubscriber(std::string_view owner) {
     std::lock_guard lock(mutex_);
     size_t          removed = 0;

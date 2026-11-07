@@ -139,6 +139,9 @@ public:
     /// 退订某个订阅方的全部订阅 (插件卸载/禁用); 返回撤销数量
     size_t removeSubscriber(std::string_view owner);
 
+    /// 删除一个频道 (变量注销 / 宿主清理); 命中返回 true
+    bool removeChannel(std::string_view id);
+
     /// 删除某个插件的频道并撤销其订阅 (插件卸载); 返回删除的频道数
     size_t removeChannelsOwnedBy(std::string_view owner);
 
