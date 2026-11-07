@@ -154,10 +154,12 @@ typedef struct PluginxxBroadcastsIface {
 
 #define PLUGINXX_IFACE_CAPABILITIES             "pluginxx.capabilities"
 /// v4: 声明 + 多实现行 (阶段 / 优先级 / 合并), 取代 v3 的"唯一提供者"
-#define PLUGINXX_IFACE_CAPABILITIES_VERSION     4
+/// v5: 表尾追加 `invoke_capability_ex` (带本次调用的超时), 基线与最低版本不变
+#define PLUGINXX_IFACE_CAPABILITIES_VERSION     5
 #define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 4
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
-#define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE sizeof(PluginxxCapabilitiesIface)
+#define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE \
+    (offsetof(PluginxxCapabilitiesIface, invoke_capability_ex))
 
 /// 一次能力登记 (插件 → 宿主)
 ///
@@ -236,6 +238,27 @@ typedef struct PluginxxCapabilitiesIface {
 
     /// 取消一次异步能力调用 (与 scheduler / tasks 的取消同语义)
     void(PLUGINXX_CALL* op_cancel)(PluginxxOperatorHandle* op);
+
+    /// 调用能力 (带**这次调用**的超时; 追加成员, 老主程序没有它)
+    ///
+    /// 与 [invoke_capability] 只差一个 `timeout_ms`:
+    /// - `> 0`: 这次调用最多等这么久 (到点按取消终结, 完成回调 status = CANCELED);
+    /// - `0`: 不设超时 (一直等, 由应用自己收尾);
+    /// - `< 0`: 用声明里的值 (等价于 [invoke_capability])。
+    ///
+    /// 用 `pluginxx::ifaceHas<&PluginxxCapabilitiesIface::invoke_capability_ex>` 判定;
+    /// 老主程序没有这个成员时退回 [invoke_capability] (只按声明的超时)。
+    PluginxxOperatorHandle*(PLUGINXX_CALL* invoke_capability_ex)(
+        const PluginxxHost*       host,
+        const PluginxxScopeRef*   scope,
+        const PluginxxStringView* capability_id,
+        const PluginxxStringView* args_json,
+        int32_t                   phase,
+        int32_t                   timeout_ms,
+        PluginxxOperatorCallback  cb,
+        void*                     ud,
+        PluginxxString*           error_out
+    );
 } PluginxxCapabilitiesIface;
 
 /* ==================== 接口表: 任务调度 (pluginxx.scheduler) ==================== */

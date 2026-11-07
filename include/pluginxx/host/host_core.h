@@ -375,6 +375,8 @@ public:
     /// 调用能力 (**IO 线程**; ABI 入口已把跨线程调用投递过来)
     /// - `phase` 为 0: 走完整链 before → impl → after; 否则只跑该阶段;
     /// - `after` 阶段倒序执行; 每一行各自持有提供者的执行 lease;
+    /// - `timeoutMs` 是本次调用的超时 (<0 = 用声明里的值): 只对应用实现的能力生效
+    ///   (插件行各有自己的超时语义);
     /// - 完成通知经 [OpCore] 恒在 IO 线程发布 (即使插件同步 done);
     /// - 真正拒绝 (没有声明 / 没有可用实现) 返回 NULL 并写 `error_out`, 此时不调用 `cb`。
     PluginxxOperatorHandle* invokeCapabilityAsync(
@@ -383,6 +385,7 @@ public:
         std::string_view         capability,
         std::string_view         argsJson,
         int32_t                  phase,
+        int32_t                  timeoutMs,
         PluginxxOperatorCallback cb,
         void*                    ud,
         PluginxxString*          error_out
@@ -436,7 +439,7 @@ public:
                     wanted == CapabilityPhase_e::After
                 );
             }
-            if (rows.empty()) {
+            if (rows.empty() && !slot->decl.declaredBy.empty()) {
                 throw std::runtime_error(
                     "invoke_capability: capability has no implementation: " + cap
                 );
@@ -446,6 +449,34 @@ public:
                 throw std::runtime_error(
                     "invoke_capability: caller instance is unavailable"
                 );
+            }
+            if (rows.empty()) {
+                /// 应用实现的能力（声明由应用给出、没有插件实现行）: 派发前把调用
+                /// 交给派生宿主转给应用（musicxx 的动作就是这种）。完成与取消都
+                /// 复用同一套 Operation 协议。
+                core = OpCore::create(this->runtime(), owner, nullptr, "capability " + cap);
+                core->setCallback(cb, ud);
+                const std::string argsText{argsJson};
+                const int32_t     appTimeoutMs =
+                    timeoutMs >= 0 ? timeoutMs : slot->decl.timeoutMs;
+                OpDrive           appDrive;
+                appDrive.start = [this, caller, cap, argsText, appTimeoutMs](
+                                     const PluginxxOperatorNotify* notify,
+                                     PluginxxString*               errorOut
+                                 ) -> void* {
+                    return this->onAppCapabilityStart(
+                        caller, cap, argsText, appTimeoutMs, notify, errorOut
+                    );
+                };
+                appDrive.cancel = [this, caller, cap](void* handle) {
+                    this->onAppCapabilityCancel(caller, cap, handle);
+                };
+                std::string startError;
+                if (!core->start(std::move(appDrive), startError)) {
+                    detail::setErrorString(error_out, startError);
+                    return nullptr;
+                }
+                return core->handle();
             }
             // 外层操作只持有调用方的 lease: 一次调用是调用方的一次操作, 每一行
             // 在启动时各自持有提供者的 lease (提供者卸载会挡住或跳过它)。
@@ -1001,6 +1032,45 @@ protected:
         (void)id;
         (void)out;
         return false;
+    }
+
+    /// 应用实现的能力被调用时把调用接走（能力由应用声明、没有插件实现行）
+    ///
+    /// 应用实现的能力（musicxx 的动作就是这种）没有插件提供者，所以派发前先把
+    /// 调用交给派生宿主：宿主把它转给应用，应用回答后调 `notify->done` 恰好一次。
+    /// 返回的句柄只用于取消（为空表示不可取消）；返回空、没 done 也没写 `error_out`
+    /// 时调用方按"没人接"拒绝。只在 IO 线程调用。`timeoutMs` 是声明里的超时（0 = 不设）。
+    virtual void* onAppCapabilityStart(
+        InstanceT*                    caller,
+        const std::string&            capability,
+        std::string_view              argsJson,
+        int32_t                       timeoutMs,
+        const PluginxxOperatorNotify* notify,
+        PluginxxString*               error_out
+    ) {
+        (void)caller;
+        (void)argsJson;
+        (void)timeoutMs;
+        (void)notify;
+        if (error_out) {
+            detail::setErrorString(
+                error_out,
+                "capability `" + capability
+                    + "` is declared by the application, but the host did not take the call"
+            );
+        }
+        return nullptr;
+    }
+
+    /// 取消一次应用能力调用（`handle` 是 [onAppCapabilityStart] 的返回值）
+    virtual void onAppCapabilityCancel(
+        InstanceT*         caller,
+        const std::string& capability,
+        void*              handle
+    ) {
+        (void)caller;
+        (void)capability;
+        (void)handle;
     }
 
     /// offload 取消状态: 令牌只在工作调用期间有效, 插件不得保存 token 或 host_ud
