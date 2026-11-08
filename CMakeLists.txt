@@ -39,7 +39,7 @@ set(PLUGINXX_MIN_API_VERSION_VALUE ${PLUGINXX_MIN_API_VERSION})
 
 # 应用名: 主程序名 (接口表 IID 与官方标识的前缀)。默认 `pluginxx` = 库自己就是应用
 # (本库自身的测试与工具不配置也能编、能跑); **主程序必须覆盖**, 例如
-# -DPLUGINXX_APP_NAME=musicxx, 通用表 IID 才会拼成 `musicxx.log` / `musicxx.capabilities`。
+# -DPLUGINXX_APP_NAME=your_app, 通用表 IID 才会拼成 `your_app.log` / `your_app.capabilities`。
 # 与 PLUGINXX_API_VERSION 同一套做法: PUBLIC 编译定义, 宿主与插件看到同一个值。
 set(PLUGINXX_APP_NAME "pluginxx" CACHE STRING "主程序名 (接口表 IID 与官方标识的前缀; 主程序必须覆盖)")
 set(PLUGINXX_APP_NAME_VALUE "${PLUGINXX_APP_NAME}")

@@ -5,7 +5,7 @@
 /// - 应用名由**构建方**给出: CMake 缓存变量 `PLUGINXX_APP_NAME` 以 PUBLIC 编译定义
 ///   下发给本库的所有使用方, 宿主与插件因此看到同一个值;
 /// - 默认值 `pluginxx` 表示"库自己就是应用": 本库自身的测试与工具不配置也能编、能跑;
-///   主程序**必须**覆盖它 (例如 `-DPLUGINXX_APP_NAME=musicxx`);
+///   主程序**必须**覆盖它 (例如 `-DPLUGINXX_APP_NAME=your_app`);
 /// - 运行期还有一次覆盖机会: 宿主拿到预编译库、改不了构建宏时, 在管理器构造后调用
 ///   `pluginxx::PluginHostCore::setOfficialPrefix()` 设置官方标识前缀。
 ///
@@ -16,7 +16,7 @@
 #define PLUGINXX_APP_NAME "pluginxx"
 #endif
 
-/// 应用命名空间下的标识: `PLUGINXX_APP_ID("capabilities")` → `"musicxx.capabilities"`
+/// 应用命名空间下的标识: `PLUGINXX_APP_ID("capabilities")` → `"your_app.capabilities"`
 ///
 /// - 通用接口表 IID 用它拼出 (`PLUGINXX_IFACE_CAPABILITIES` 等), 源码里不再有具体前缀的字面量;
 /// - 应用名与表名都可以含点 (`com.foo` + `capabilities` → `com.foo.capabilities`),

@@ -29,7 +29,7 @@
   `PLUGINXX_IFACE_LOG` 等 10 个 IID 宏都用它拼;
 - 构建侧: CMake 缓存变量 `PLUGINXX_APP_NAME` (默认 `pluginxx` = 库自己就是应用),
   以 PUBLIC 编译定义下发给所有使用方 —— 宿主与插件看到同一个值;
-  **主程序必须覆盖**, 例如 `-DPLUGINXX_APP_NAME=musicxx`;
+  **主程序必须覆盖**, 例如 `-DPLUGINXX_APP_NAME=your_app`;
 - 运行侧: 官方标识前缀还有一个可覆盖入口 `PluginHostCore::setOfficialPrefix()`,
   给"用预编译库、改不了构建宏"的接入方式用;
 - 命名空间分工: `<应用名>.*` 是接口表与应用自己的标识, `plugin.<插件 id>.*` 是插件自己的标识;
