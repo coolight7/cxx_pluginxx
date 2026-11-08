@@ -1,3 +1,5 @@
+#pragma once
+
 /// 应用名与应用命名空间下的标识 (接口表 IID、官方能力 / 广播 id 的前缀)
 ///
 /// - 应用名由**构建方**给出: CMake 缓存变量 `PLUGINXX_APP_NAME` 以 PUBLIC 编译定义
