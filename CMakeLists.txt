@@ -77,6 +77,7 @@ find_package(cxx_utilxx_base REQUIRED)
 
 set(_CXX_PLUGINXX_SOURCES
   src/api_abi_check.c
+  src/broadcast_registry.cpp
   src/capability_registry.cpp
   src/loader.cpp
   src/manifest.cpp

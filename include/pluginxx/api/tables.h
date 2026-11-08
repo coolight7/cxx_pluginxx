@@ -33,13 +33,14 @@
 ///   调到隔壁函数) —— 要改就换新 IID;
 /// - 用 `_MIN_VERSION` 表达"我加了新成员"是错的 (那等于把老主程序全部判死)。
 ///
-/// 本表的当前状态: 通用表 10 张。其中 `events` / `capabilities` / `config` / `cancel`
-/// 为 v3, 其余 6 张仍为 v1。
+/// 本表的当前状态: 通用表 10 张。其中 `capabilities` 为 v4 (声明 + 多实现行),
+/// `broadcasts` 为 v1 (取代旧的事件表), `config` / `cancel` 为 v3, 其余 6 张仍为 v1。
 ///
-/// 接口契约的代次 (全局): v3 = 插件一次加载、可挂到多个作用域 (作用域由主程序定义,
-/// 经 [PluginxxScopeRef] 传递), 且**主程序业务语义不进入通用表** (工具提示词 / 会话
-/// 工作目录 / 会话取消状态一类的成员已交回主程序自己的业务表)。更早的插件由
-/// `PLUGINXX_MIN_API_VERSION` 挡在加载阶段。
+/// 接口契约的代次 (全局): v4 = 能力改成"声明 + 实现行" (阶段 / 优先级 / 覆盖)、
+/// 事件表换成广播表 (频道声明 + 缓存 + 写权限); v3 = 插件一次加载、可挂到多个作用域
+/// (作用域由主程序定义, 经 [PluginxxScopeRef] 传递), 且**主程序业务语义不进入通用表**
+/// (工具提示词 / 会话工作目录 / 会话取消状态一类的成员已交回主程序自己的业务表)。
+/// 更早的插件由 `PLUGINXX_MIN_API_VERSION` 挡在加载阶段。
 #ifndef PLUGINXX_API_TABLES_H
 #define PLUGINXX_API_TABLES_H
 
@@ -51,86 +52,213 @@ extern "C" {
 
 #pragma pack(push, 8)
 
-/* ==================== 接口表: 事件 (pluginxx.events) ==================== */
+/* ==================== 能力与广播的枚举值 (v4 / v1 起) ==================== */
 
-#define PLUGINXX_IFACE_EVENTS             "pluginxx.events"
-/// v3: `subscribe` 的第二个参数是主程序定义的作用域引用 (可空 = 订阅主程序总线)
-#define PLUGINXX_IFACE_EVENTS_VERSION     3
-#define PLUGINXX_IFACE_EVENTS_MIN_VERSION 3
+/* 一个 id 上有几个实现 (`PluginxxCapabilitySpec.impls`) */
+#define PLUGINXX_CAPABILITY_IMPLS_ONE  0
+#define PLUGINXX_CAPABILITY_IMPLS_MANY 1
+
+/* 实现链的结果怎么合并 (`PluginxxCapabilitySpec.merge`; 0 = 不适用) */
+#define PLUGINXX_CAPABILITY_MERGE_NONE  0
+#define PLUGINXX_CAPABILITY_MERGE_FIRST 1
+#define PLUGINXX_CAPABILITY_MERGE_VETO  2
+
+/* 声明开放的阶段 (`PluginxxCapabilitySpec.phases`, 位或) */
+#define PLUGINXX_CAPABILITY_PHASE_MASK_IMPL   (1u << 0)
+#define PLUGINXX_CAPABILITY_PHASE_MASK_BEFORE (1u << 1)
+#define PLUGINXX_CAPABILITY_PHASE_MASK_AFTER  (1u << 2)
+
+/* 一次登记落在哪个阶段 (`PluginxxCapabilitySpec.phase`, 互斥的一个值) */
+#define PLUGINXX_CAPABILITY_PHASE_IMPL   1
+#define PLUGINXX_CAPABILITY_PHASE_BEFORE 2
+#define PLUGINXX_CAPABILITY_PHASE_AFTER  4
+
+/* 频道有没有当前值 (`PluginxxBroadcastDecl.cache`) */
+#define PLUGINXX_BROADCAST_CACHE_NONE   0
+#define PLUGINXX_BROADCAST_CACHE_LATEST 1
+
+/* 谁能写 (`PluginxxBroadcastDecl.writable`) */
+#define PLUGINXX_BROADCAST_WRITABLE_OWNER  0
+#define PLUGINXX_BROADCAST_WRITABLE_ANYONE 1
+
+/* 频道用途 (`PluginxxBroadcastDecl.scope`) */
+#define PLUGINXX_BROADCAST_SCOPE_APP    0
+#define PLUGINXX_BROADCAST_SCOPE_SYSTEM 1
+
+/* ==================== 接口表: 广播 (pluginxx.broadcasts) ==================== */
+
+#define PLUGINXX_IFACE_BROADCASTS             "pluginxx.broadcasts"
+/// v1: 频道声明 + 发布 + 订阅 + 读当前值 (取代 `pluginxx.events` v3)
+#define PLUGINXX_IFACE_BROADCASTS_VERSION     1
+#define PLUGINXX_IFACE_BROADCASTS_MIN_VERSION 1
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
-#define PLUGINXX_IFACE_EVENTS_BASELINE_SIZE sizeof(PluginxxEventsIface)
+#define PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE sizeof(PluginxxBroadcastsIface)
 
-typedef struct PluginxxEventsIface {
-    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_EVENTS_VERSION
+/// 广播的通用结果码 (v1 起; 与主程序自己的错误码分开, 只在 uint 范围内比较)
+#define PLUGINXX_RESULT_OK               0
+#define PLUGINXX_RESULT_ERR_ARG         -1 ///< 参数非法
+#define PLUGINXX_RESULT_ERR_NOT_DECLARED -2 ///< 频道/能力没有声明
+#define PLUGINXX_RESULT_ERR_PERMISSION  -3 ///< 没有写权限 (非属主 / 系统频道)
+#define PLUGINXX_RESULT_ERR_NO_VALUE    -4 ///< 没有当前值 (cache: none 或还没写过)
+
+typedef struct PluginxxBroadcastsIface {
+    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_BROADCASTS_VERSION
     uint32_t struct_size;
 
-    /// 订阅事件
-    /// - `scope` 为空: 订阅主程序总线 (进程级事件; 一般在 `start` 里做);
-    /// - `scope` 非空: 订阅该作用域的总线 (主程序定义的域内事件; 在 `mount` 里做);
-    ///   引用无效返回 NULL 并记警告
-    PluginxxSubscription*(PLUGINXX_CALL* subscribe)(
+    /// 声明频道 (**任意线程**)
+    /// - `decl_json` 形如
+    ///   `{"id": "...", "cache": "latest", "writable": "owner",
+    ///     "pushOnSubscribe": true, "coalesce": true, "scope": "app"}`
+    ///   (`id` 可用短名: 宿主补成 `plugin.<本插件 id>.<名字>`);
+    /// - 应用已声明的 id 不能被插件改写; 插件自己的 id 后声明者覆盖;
+    /// - 失败返回 [PLUGINXX_RESULT_ERR_ARG] / [PLUGINXX_RESULT_ERR_PERMISSION] 并写 `error_out`
+    int32_t(PLUGINXX_CALL* declare_broadcast)(
+        const PluginxxHost*       host,
+        const PluginxxStringView* decl_json,
+        PluginxxString*           error_out
+    );
+
+    /// 发布 (**任意线程**): 属主写 `writable: owner` 的频道, 任何插件写 `writable: anyone` 的频道
+    int32_t(PLUGINXX_CALL* publish_broadcast)(
+        const PluginxxHost*       host,
+        const PluginxxStringView* broadcast_id,
+        const PluginxxStringView* payload_json,
+        PluginxxString*           error_out
+    );
+
+    /// 订阅 (**任意线程**)
+    /// - `pushOnSubscribe` 的频道在返回值之前用当前值回调一次 (没有当前值时不回调);
+    /// - 失败返回 NULL 并写 `error_out` (句柄用 [unsubscribe_broadcast] 撤销)
+    PluginxxSubscription*(PLUGINXX_CALL* subscribe_broadcast)(
         const PluginxxHost*       host,
         const PluginxxScopeRef*   scope,
-        const PluginxxStringView* topic,
-        void(PLUGINXX_CALL* handler)(const PluginxxStringView* event_json, void* ud),
-        void* ud
+        const PluginxxStringView* broadcast_id,
+        void(PLUGINXX_CALL* handler)(const PluginxxStringView* payload_json, void* ud),
+        void*                     ud,
+        PluginxxString*           error_out
     );
-    void(PLUGINXX_CALL* unsubscribe)(PluginxxSubscription* sub);
-    int32_t(PLUGINXX_CALL* publish)(
+
+    /// 读当前值 (同步): 成功返回 [PLUGINXX_RESULT_OK] 并写 `out_json`;
+    /// 没有声明返回 [PLUGINXX_RESULT_ERR_NOT_DECLARED], 没有当前值返回 [PLUGINXX_RESULT_ERR_NO_VALUE]
+    int32_t(PLUGINXX_CALL* read_broadcast)(
         const PluginxxHost*       host,
-        const PluginxxStringView* topic,
-        const PluginxxStringView* event_json
+        const PluginxxStringView* broadcast_id,
+        PluginxxString*           out_json
     );
-} PluginxxEventsIface;
+
+    /// 撤销订阅 (**幂等**, 任意线程)
+    void(PLUGINXX_CALL* unsubscribe_broadcast)(PluginxxSubscription* sub);
+} PluginxxBroadcastsIface;
 
 /* ==================== 接口表: 能力 (pluginxx.capabilities) ==================== */
 
 #define PLUGINXX_IFACE_CAPABILITIES             "pluginxx.capabilities"
-/// v3: `invoke_capability_async` 的第二个参数是主程序定义的作用域引用
-/// (可空 = 发起方不在任何作用域上下文)
-#define PLUGINXX_IFACE_CAPABILITIES_VERSION     3
-#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 3
+/// v4: 声明 + 多实现行 (阶段 / 优先级 / 合并), 取代 v3 的"唯一提供者"
+/// v5: 表尾追加 `invoke_capability_ex` (带本次调用的超时), 基线与最低版本不变
+#define PLUGINXX_IFACE_CAPABILITIES_VERSION     5
+#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 4
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
-#define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE sizeof(PluginxxCapabilitiesIface)
+#define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE \
+    (offsetof(PluginxxCapabilitiesIface, invoke_capability_ex))
 
-/// 成员顺序即契约 (含历史上插在中间的 register_capability_ex): 重排成员不会改变
-/// 结构体大小, `version` 与 `struct_size` 都拦不住旧调用方的静默错调 —— 禁止再动,
-/// 改签名/顺序请换 IID。
+/// 一次能力登记 (插件 → 宿主)
+///
+/// 两种写法 (`id` 只看前缀, 不反解):
+/// 1. 给应用声明过的能力提供实现: 写全名 (`musicxx.*`), `impls` / `merge` / `phases` 忽略;
+/// 2. 声明/实现自己的能力: 写短名 (可含点), 宿主补成 `plugin.<本插件 id>.<名字>`,
+///    `impls` 必填 (以一行的 `phases` 说明开放哪些阶段)。
+typedef struct PluginxxCapabilitySpec {
+    int32_t  version;      ///< 插件填 PLUGINXX_API_VERSION (与宿主一致)
+    uint32_t struct_size;  ///< sizeof(PluginxxCapabilitySpec)
+
+    PluginxxStringView id;        ///< 全名或短名 (见上)
+    PluginxxStringView owner_tag; ///< 同一实例内区分多个处理器 (可空)
+
+    int32_t  impls;      ///< PLUGINXX_CAPABILITY_IMPLS_* (声明自己的名字时必填)
+    int32_t  merge;      ///< PLUGINXX_CAPABILITY_MERGE_* (同上)
+    uint32_t phases;     ///< PLUGINXX_CAPABILITY_PHASE_MASK_* (同上)
+    int32_t  phase;      ///< 这次登记的阶段: PLUGINXX_CAPABILITY_PHASE_*
+    int32_t  priority;   ///< 小者先
+    int32_t  sync;       ///< 1 = 只给同步处理器; 0 = 异步 (hook_start)
+    int32_t  timeout_ms; ///< 0 = 用声明里的值
+
+    /// 处理器 (二者取一; 同步处理器在返回前完成 `notify`, 异步处理器可稍后完成)
+    PluginxxCapabilityStartFunction  run_start;
+    PluginxxOperatorCancelFunction   cancel;
+    void*                            user_data;
+} PluginxxCapabilitySpec;
+
 typedef struct PluginxxCapabilitiesIface {
     int32_t  version; ///< 主程序填 PLUGINXX_IFACE_CAPABILITIES_VERSION
     uint32_t struct_size;
 
+    /// 登记 / 声明 (**任意线程**; 宿主投递到 IO 线程执行)
+    /// - `spec->id` 为空、阶段未开放、`impls` 自相矛盾时拒绝并写 `error_out`;
+    /// - `impls: one` 的 impl 行后登记 (含跨插件) 整体覆盖; `impls: many` 多行共存
     int32_t(PLUGINXX_CALL* register_capability)(
-        const PluginxxHost*       host,
-        const PluginxxStringView* capability
-    );
-    int32_t(PLUGINXX_CALL* register_capability_ex)(
-        const PluginxxHost*             host,
-        const PluginxxStringView*       capability,
-        PluginxxCapabilityStartFunction start,
-        PluginxxOperatorCancelFunction  cancel,
-        void*                           ctx
-    );
-    int32_t(PLUGINXX_CALL* unregister_capability)(
-        const PluginxxHost*       host,
-        const PluginxxStringView* capability
-    );
-    int32_t(PLUGINXX_CALL* has_capability)(
-        const PluginxxHost*       host,
-        const PluginxxStringView* capability
+        const PluginxxHost*            host,
+        const PluginxxScopeRef*        scope,
+        const PluginxxCapabilitySpec*  spec,
+        PluginxxString*                error_out
     );
 
-    PluginxxOperatorHandle*(PLUGINXX_CALL* invoke_capability_async)(
+    /// 注销本插件的一条实现行 (**任意线程**; 行不存在返回 [PLUGINXX_RESULT_ERR_NOT_DECLARED])
+    int32_t(PLUGINXX_CALL* unregister_capability)(
+        const PluginxxHost*       host,
+        const PluginxxStringView* capability_id,
+        const PluginxxStringView* owner_tag
+    );
+
+    /// 调用能力 (**异步; 完成回调恰好一次**)
+    /// - `args_json` 为空按 `{}` 处理; `phase` 为 0 表示走默认链 (before → impl → after);
+    /// - 真正拒绝 (能力不存在 / 没有可用实现) 返回 NULL 并写 `error_out`, 此时不调用 `cb`
+    PluginxxOperatorHandle*(PLUGINXX_CALL* invoke_capability)(
         const PluginxxHost*       host,
         const PluginxxScopeRef*   scope,
-        const PluginxxStringView* capability,
-        const PluginxxStringView* method,
+        const PluginxxStringView* capability_id,
         const PluginxxStringView* args_json,
+        int32_t                   phase,
         PluginxxOperatorCallback  cb,
         void*                     ud,
         PluginxxString*           error_out
     );
+
+    /// 自省: 一条能力的声明与实现行 (JSON); 未声明返回 [PLUGINXX_RESULT_ERR_NOT_DECLARED]
+    int32_t(PLUGINXX_CALL* capability_info)(
+        const PluginxxHost*       host,
+        const PluginxxStringView* capability_id,
+        PluginxxString*           out_json
+    );
+
+    /// 自省: 全部能力与实现行数 (JSON)
+    int32_t(PLUGINXX_CALL* list_capabilities)(
+        const PluginxxHost* host,
+        PluginxxString*     out_json
+    );
+
+    /// 取消一次异步能力调用 (与 scheduler / tasks 的取消同语义)
     void(PLUGINXX_CALL* op_cancel)(PluginxxOperatorHandle* op);
+
+    /// 调用能力 (带**这次调用**的超时; 追加成员, 老主程序没有它)
+    ///
+    /// 与 [invoke_capability] 只差一个 `timeout_ms`:
+    /// - `> 0`: 这次调用最多等这么久 (到点按取消终结, 完成回调 status = CANCELED);
+    /// - `0`: 不设超时 (一直等, 由应用自己收尾);
+    /// - `< 0`: 用声明里的值 (等价于 [invoke_capability])。
+    ///
+    /// 用 `pluginxx::ifaceHas<&PluginxxCapabilitiesIface::invoke_capability_ex>` 判定;
+    /// 老主程序没有这个成员时退回 [invoke_capability] (只按声明的超时)。
+    PluginxxOperatorHandle*(PLUGINXX_CALL* invoke_capability_ex)(
+        const PluginxxHost*       host,
+        const PluginxxScopeRef*   scope,
+        const PluginxxStringView* capability_id,
+        const PluginxxStringView* args_json,
+        int32_t                   phase,
+        int32_t                   timeout_ms,
+        PluginxxOperatorCallback  cb,
+        void*                     ud,
+        PluginxxString*           error_out
+    );
 } PluginxxCapabilitiesIface;
 
 /* ==================== 接口表: 任务调度 (pluginxx.scheduler) ==================== */
