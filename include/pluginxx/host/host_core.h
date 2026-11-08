@@ -90,9 +90,11 @@ inline std::string abiViewToString(const PluginxxStringView& sv) {
     return std::string{sv.data, static_cast<size_t>(sv.size)};
 }
 
-/// `musicxx.*` = 应用声明的标识
-inline bool isOfficialId(std::string_view id) {
-    return id.rfind("musicxx.", 0) == 0;
+/// `id` 是否以给定的官方前缀开头 (前缀形如 `<应用名>.`; 空前缀恒为 false)
+///
+/// 纯函数供测试与工具使用; 宿主内部用 [PluginHostCore::isOfficialId] (前缀可配)。
+inline bool isOfficialIdWithPrefix(std::string_view id, std::string_view prefix) {
+    return !prefix.empty() && id.rfind(prefix, 0) == 0;
 }
 
 /// `plugin.` 开头 = 插件命名空间 (具体归属还要用 [isIdOfPlugin] 判)
@@ -171,6 +173,24 @@ public:
         hooks_ = hooks;
     }
 
+    /// 官方标识前缀 (`<应用名>.`): 官方能力 / 广播 id 都以它开头
+    ///
+    /// - 默认取构建期注入的应用名 (`pluginxx::appIdPrefix()`, 由 CMake 变量
+    ///   `PLUGINXX_APP_NAME` 决定);
+    /// - 宿主拿到预编译库、改不了构建宏时, 在管理器构造时用它覆盖。
+    void setOfficialPrefix(std::string_view prefix) {
+        officialPrefix_.assign(prefix);
+    }
+
+    std::string_view officialPrefix() const noexcept {
+        return officialPrefix_;
+    }
+
+    /// `id` 是否在官方命名空间 (`<应用名>.` 开头)
+    bool isOfficialId(std::string_view id) const {
+        return detail::isOfficialIdWithPrefix(id, officialPrefix_);
+    }
+
     DomainHooks* domainHooks() const noexcept {
         return hooks_;
     }
@@ -202,7 +222,7 @@ public:
     }
 
     /// 登记 / 声明一条能力 (**IO 线程**)
-    /// - `spec.id` 以 `musicxx.` 开头: 给应用声明过的能力提供实现, 阶段必须在声明里开放;
+    /// - `spec.id` 以 `<应用名>.` 开头: 给应用声明过的能力提供实现, 阶段必须在声明里开放;
     /// - 其它写法: 插件自己的名字, 宿主补成 `plugin.<本插件 id>.<名字>`, 未声明时按
     ///   `spec.impls` / `spec.merge` / `spec.phases` 声明;
     /// - `impls: one` 的 impl 行后登记 (含跨插件) 整体覆盖, `impls: many` 多行共存。
@@ -238,7 +258,7 @@ public:
         }
 
         const std::string pluginId = this->pluginIdOf(inst);
-        const bool        appOwned = detail::isOfficialId(rawId);
+        const bool        appOwned = this->isOfficialId(rawId);
         if (!appOwned && detail::isPluginScopedId(rawId)
             && !detail::isIdOfPlugin(rawId, pluginId)) {
             // 写全名时只能占自己的命名空间 (短名由宿主补全, 不会走到这里)
@@ -303,7 +323,7 @@ public:
         if (!capabilities_->addProvider(fullId, row, &rowError)) {
             return fail(PLUGINXX_RESULT_ERR_ARG, rowError);
         }
-        // 派生宿主把这一行接进自己的派发表（例如 musicxx 的钩子引擎）。
+        // 派生宿主把这一行接进自己的派发表（例如主程序的钩子引擎）。
         // 它拒绝时要把刚加的行撤掉，不能留下"注册表有、派发表没有"的半条登记。
         const int32_t attachRc = onCapabilityRowAdded(inst, fullId, spec, &rowError);
         if (attachRc != PLUGINXX_RESULT_OK) {
@@ -335,7 +355,7 @@ public:
         const std::string pluginId = this->pluginIdOf(inst);
         const std::string rawId{capability};
         const std::string fullId
-            = detail::isOfficialId(rawId)
+            = this->isOfficialId(rawId)
                   ? rawId
                   : (detail::isPluginScopedId(rawId)
                          ? rawId
@@ -452,7 +472,7 @@ public:
             }
             if (rows.empty()) {
                 /// 应用实现的能力（声明由应用给出、没有插件实现行）: 派发前把调用
-                /// 交给派生宿主转给应用（musicxx 的动作就是这种）。完成与取消都
+                /// 交给派生宿主转给应用（应用实现的能力就是这种）。完成与取消都
                 /// 复用同一套 Operation 协议。
                 core = OpCore::create(this->runtime(), owner, nullptr, "capability " + cap);
                 core->setCallback(cb, ud);
@@ -563,7 +583,7 @@ public:
         }
         if (inst) {
             const std::string pluginId = this->pluginIdOf(inst);
-            if (!detail::isOfficialId(decl.id) && !detail::isPluginScopedId(decl.id)) {
+            if (!this->isOfficialId(decl.id) && !detail::isPluginScopedId(decl.id)) {
                 decl.id = detail::qualifyOwnedId(pluginId, decl.id);
             } else if (detail::isPluginScopedId(decl.id)
                        && !detail::isIdOfPlugin(decl.id, pluginId)) {
@@ -1012,7 +1032,7 @@ protected:
     /// 一条能力实现行撤销后的挂接点（与 [onCapabilityRowAdded] 成对）
     ///
     /// 实例卸载 / 停用走的是一次性清理（`unregisterInstanceCapabilities`），那里不逐行
-    /// 回调：派生宿主的业务表按实例整体清（musicxx 是 `clearPluginRegistrations`）。
+    /// 回调：派生宿主的业务表按实例整体清（主程序是 `clearPluginRegistrations`）。
     virtual void onCapabilityRowRemoved(
         InstanceT*         inst,
         const std::string& id,
@@ -1023,7 +1043,7 @@ protected:
         (void)ownerTag;
     }
 
-    /// 官方 id（`musicxx.*`）的声明来源（宿主自己有一份权威表时用）
+    /// 官方 id（`<应用名>.*`）的声明来源（宿主自己有一份权威表时用）
     ///
     /// `register_capability` 对官方 id 要求"应用已声明"。宿主在 [out] 里填好声明并
     /// 返回 true 时，调用方会把它登记成应用声明；返回 false 表示宿主也不知道，
@@ -1036,7 +1056,7 @@ protected:
 
     /// 应用实现的能力被调用时把调用接走（能力由应用声明、没有插件实现行）
     ///
-    /// 应用实现的能力（musicxx 的动作就是这种）没有插件提供者，所以派发前先把
+    /// 应用实现的能力（`runner: app`）没有插件提供者，所以派发前先把
     /// 调用交给派生宿主：宿主把它转给应用，应用回答后调 `notify->done` 恰好一次。
     /// 返回的句柄只用于取消（为空表示不可取消）；返回空、没 done 也没写 `error_out`
     /// 时调用方按"没人接"拒绝。只在 IO 线程调用。`timeoutMs` 是声明里的超时（0 = 不设）。
@@ -1326,6 +1346,8 @@ protected:
     };
 
     DomainHooks*                        hooks_        = nullptr;
+    /// 官方标识前缀 (`<应用名>.`): 默认取构建期注入的应用名, 可经 `setOfficialPrefix` 覆盖
+    std::string                         officialPrefix_{pluginxx::appIdPrefix()};
     std::shared_ptr<CapabilityRegistry> capabilities_ = std::make_shared<CapabilityRegistry>();
     std::shared_ptr<BroadcastRegistry>  broadcasts_   = std::make_shared<BroadcastRegistry>();
 };

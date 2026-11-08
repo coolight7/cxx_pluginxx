@@ -25,7 +25,7 @@ cmake_policy(SET CMP0091 NEW)
 cmake_policy(SET CMP0144 NEW)
 cmake_policy(SET CMP0167 OLD)
 
-set(PLUGINXX_VERSION "0.1.0")
+set(PLUGINXX_VERSION "0.2.0")
 project(cxx_pluginxx VERSION ${PLUGINXX_VERSION} LANGUAGES C CXX)
 
 # 插件 API 契约版本: 代码里 (pluginxx/api/abi.h) 的默认值是 1 —— 本库被多个
@@ -36,6 +36,13 @@ set(PLUGINXX_API_VERSION "1" CACHE STRING "插件 API 版本 (代码默认 1)")
 set(PLUGINXX_MIN_API_VERSION "1" CACHE STRING "框架接受的最低插件 API 版本")
 set(PLUGINXX_API_VERSION_VALUE ${PLUGINXX_API_VERSION})
 set(PLUGINXX_MIN_API_VERSION_VALUE ${PLUGINXX_MIN_API_VERSION})
+
+# 应用名: 主程序名 (接口表 IID 与官方标识的前缀)。默认 `pluginxx` = 库自己就是应用
+# (本库自身的测试与工具不配置也能编、能跑); **主程序必须覆盖**, 例如
+# -DPLUGINXX_APP_NAME=musicxx, 通用表 IID 才会拼成 `musicxx.log` / `musicxx.capabilities`。
+# 与 PLUGINXX_API_VERSION 同一套做法: PUBLIC 编译定义, 宿主与插件看到同一个值。
+set(PLUGINXX_APP_NAME "pluginxx" CACHE STRING "主程序名 (接口表 IID 与官方标识的前缀; 主程序必须覆盖)")
+set(PLUGINXX_APP_NAME_VALUE "${PLUGINXX_APP_NAME}")
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -154,6 +161,7 @@ target_compile_definitions(cxx_pluginxx_static PUBLIC CXX_PLUGINXX_STATIC=1)
 foreach (_t ${_CXX_PLUGINXX_TARGETS})
   target_compile_definitions(${_t} PUBLIC
     ${XX_PLATFORM_COMPILE_DEFINITIONS}
+    PLUGINXX_APP_NAME="${PLUGINXX_APP_NAME_VALUE}"
     BOOST_ASIO_STANDALONE=1
     ASIO_STANDALONE=1
     UTILXX_USE_BOOST_ASIO=1

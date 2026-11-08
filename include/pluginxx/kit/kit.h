@@ -413,17 +413,17 @@ const Iface* queryInterface(const PluginxxHost* host, const char* iid) noexcept 
 /// 由主程序在自己的聚合体中补充: 主程序那侧的聚合体是本聚合的超集,
 /// 可直接作为 [PluginBaseT] 的模板实参。
 struct PluginIfaceCore {
-    const PluginxxLogIface*          log          = nullptr; ///< "pluginxx.log"
-    const PluginxxJsonIface*         json         = nullptr; ///< "pluginxx.json"
-    const PluginxxConfigIface*       config       = nullptr; ///< "pluginxx.config"
-    const PluginxxPluginsIface*      plugins      = nullptr; ///< "pluginxx.plugins"
-    const PluginxxBroadcastsIface*   broadcasts   = nullptr; ///< "pluginxx.broadcasts"
-    const PluginxxCapabilitiesIface* capabilities = nullptr; ///< "pluginxx.capabilities"
-    const PluginxxSchedulerIface*    scheduler    = nullptr; ///< "pluginxx.scheduler"
-    /// "pluginxx.coroutine_runtime": 协程驱动 (host driver/wake 协议)
+    const PluginxxLogIface*          log          = nullptr; ///< "<应用名>.log"
+    const PluginxxJsonIface*         json         = nullptr; ///< "<应用名>.json"
+    const PluginxxConfigIface*       config       = nullptr; ///< "<应用名>.config"
+    const PluginxxPluginsIface*      plugins      = nullptr; ///< "<应用名>.plugins"
+    const PluginxxBroadcastsIface*   broadcasts   = nullptr; ///< "<应用名>.broadcasts"
+    const PluginxxCapabilitiesIface* capabilities = nullptr; ///< "<应用名>.capabilities"
+    const PluginxxSchedulerIface*    scheduler    = nullptr; ///< "<应用名>.scheduler"
+    /// "<应用名>.coroutine_runtime": 协程驱动 (host driver/wake 协议)
     const PluginxxCoroutineRuntimeIface* coroutineRuntime = nullptr;
-    const PluginxxTasksIface*            tasks            = nullptr; ///< "pluginxx.tasks"
-    const PluginxxCancelIface*           cancel           = nullptr; ///< "pluginxx.cancel"
+    const PluginxxTasksIface*            tasks            = nullptr; ///< "<应用名>.tasks"
+    const PluginxxCancelIface*           cancel           = nullptr; ///< "<应用名>.cancel"
 
     /// 从主程序查询全部通用接口表 (host 为空时返回全 NULL 聚合)
     static PluginIfaceCore query(const PluginxxHost* host) {

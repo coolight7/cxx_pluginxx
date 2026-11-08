@@ -16,10 +16,28 @@
 
 - 符号名: `<主程序前缀>_plugin_agent_get_info/create/start/stop/destroy`、
   `<主程序前缀>_plugin_client_*` —— 前缀由主程序定义, 不属于插件框架
-- 结构体名 / 宏名 / IID 字符串: `PluginxxHost`、`PluginxxString`、
-  `PLUGINXX_CALL`、`PLUGINXX_EXPORT`、通用表 IID (如 `pluginxx.log` / `pluginxx.json`) 等
+- 结构体名 / 宏名 / 表名: `PluginxxHost`、`PluginxxString`、
+  `PLUGINXX_CALL`、`PLUGINXX_EXPORT`、通用表表名 (`log` / `json` / `broadcasts` …) 等
 - 调用约定与对齐: `PLUGINXX_CALL` (Windows `__stdcall`)、8 字节对齐、定长基础类型
 - 版本: `PLUGINXX_API_VERSION` (接口表 `version` / `struct_size` 自校验)
+
+## 应用名 (接口表 IID 的前缀)
+
+通用表的 IID 不是字面量, 而是 **`<应用名>.<表名>`**: 表名部分冻结, 应用名由**构建方**给出。
+
+- 代码侧: `PLUGINXX_APP_ID("log")` → `PLUGINXX_APP_NAME "." "log"` (见 `pluginxx/api/app.h`),
+  `PLUGINXX_IFACE_LOG` 等 10 个 IID 宏都用它拼;
+- 构建侧: CMake 缓存变量 `PLUGINXX_APP_NAME` (默认 `pluginxx` = 库自己就是应用),
+  以 PUBLIC 编译定义下发给所有使用方 —— 宿主与插件看到同一个值;
+  **主程序必须覆盖**, 例如 `-DPLUGINXX_APP_NAME=musicxx`;
+- 运行侧: 官方标识前缀还有一个可覆盖入口 `PluginHostCore::setOfficialPrefix()`,
+  给"用预编译库、改不了构建宏"的接入方式用;
+- 命名空间分工: `<应用名>.*` 是接口表与应用自己的标识, `plugin.<插件 id>.*` 是插件自己的标识;
+- 应用名与表名都可以含点 (`com.foo` + `capabilities` → `com.foo.capabilities`),
+  **不做格式检查**: IID 只做整串比较, 官方标识只做前缀比较。
+
+宿主与插件用不同应用名编译时, 插件按 `<自己以为的应用名>.<表名>` 查不到表。
+`queryGenericPluginIface` 遇到这种 IID (以 `.<已知表名>` 结尾) 会记一条 "应用名不一致" 的日志。
 
 ## 目录结构
 
@@ -28,7 +46,9 @@ include/pluginxx/
   api/    abi.h    纯 C ABI 契约 (导出宏/调用约定/版本/对齐/StringView/String/
                    Info/统一操作原语/事件订阅前向声明/主程序 vtable/入口符号名/
                    内置合并描述) —— 与主程序业务无关
-          tables.h 通用接口表 (log/json/config/plugins/events/capabilities/
+          app.h    应用名与应用命名空间下的标识: PLUGINXX_APP_NAME /
+                   PLUGINXX_APP_ID(name) / pluginxx::appIdPrefix()
+          tables.h 通用接口表 (log/json/config/plugins/broadcasts/capabilities/
                    scheduler/coroutine_runtime/tasks/cancel)
   kit/    kit.h    插件侧 C++ SDK 通用部分 (header-only): PluginStringView/PluginString、
                    通用表聚合 PluginIfaceCore、Logger、Task<T> 锚定协程与锚定原语
@@ -61,7 +81,10 @@ class MyManager : public pluginxx::PluginHostLifecycle<MyInstance>,   // 含 Plu
                   public std::enable_shared_from_this<MyManager>,
                   public pluginxx::DomainHooks {
 public:
-    MyManager(asio::any_io_executor ex) : PluginHostLifecycle<MyInstance>(ex) { setDomainHooks(this); }
+    MyManager(asio::any_io_executor ex) : PluginHostLifecycle<MyInstance>(ex) {
+        setDomainHooks(this);
+        setOfficialPrefix(pluginxx::appIdPrefix());   // 默认已是构建期的应用名, 写出来更好读
+    }
     // DomainHooks: 事件后端 / 工作线程池 / 配置 JSON / 语言 / 会话工作目录 / 取消状态 / 插件清单
 protected:
     // 生命周期扩展点 (纯虚): 管理器自引用 / 生成业务实例 / 交给自己插件的 vtable
@@ -74,7 +97,7 @@ protected:
 };
 ```
 
-- **通用表 (定义与实现都在本库)**: log / json / config / plugins / events / scheduler /
+- **通用表 (定义与实现都在本库)**: log / json / config / plugins / broadcasts / scheduler /
   coroutine_runtime / tasks / cancel / capabilities —— 主程序经 `DomainHooks` 提供业务数据；
 - **生命周期骨架 (在本库)**: 动态库加载与入口校验、create/start 事务、启用与禁用级联、
   stop 事务补齐、inflight 归零等待、destroy 与动态库卸载、失败回滚、关闭超时重试；

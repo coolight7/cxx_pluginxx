@@ -12,7 +12,7 @@
 /// }
 /// ```
 ///
-/// 覆盖 10 张通用表: log / json / config / plugins / events / scheduler /
+/// 覆盖 10 张通用表: log / json / config / plugins / broadcasts / scheduler /
 /// coroutine_runtime / tasks / cancel / capabilities。入口体只做三件事:
 /// 解析框架控制块 (取实例/管理器 + admission lease) → 投递到 IO 线程 → 调用
 /// [PluginHostCore] 的同名方法; 业务数据一律由 [DomainHooks] 提供。
@@ -1020,8 +1020,32 @@ struct GenericTableEntries {
     }
 };
 
+/// 通用表的表名清单 (IID 里 `<应用名>.` 之后那一段): 应用名不一致时用来给提示
+inline constexpr std::string_view kGenericTableNames[] = {
+    "log",         "json",     "config",    "plugins",    "broadcasts",
+    "capabilities", "scheduler", "coroutine_runtime", "tasks", "cancel",
+};
+
+/// `iid` 是否以 `.<已知通用表名>` 结尾
+///
+/// 只做后缀比较, 不按点切分 (应用名 / 表名都可以含点)。
+inline bool looksLikeGenericTableIid(std::string_view iid) {
+    for (const auto name : kGenericTableNames) {
+        if (iid.size() <= name.size() + 1) {
+            continue;
+        }
+        const auto suffixAt = iid.size() - name.size();
+        if (iid[suffixAt - 1] == '.' && iid.compare(suffixAt, name.size(), name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// 按 IID 查询**通用表** (未命中返回 nullptr, 主程序继续查自己的业务表)
 /// - 覆盖 10 张通用表; IID 为编译期常量字符串, 比较用 string_view (不构造临时串)
+/// - 未命中但形如 `<别的应用名>.<通用表名>` 时记一条日志: 宿主与插件必须用同一个
+///   应用名 (`PLUGINXX_APP_NAME`) 编译, 否则插件拿不到表 (只提示, 不改行为)
 template<typename InstanceT, typename ManagerT>
 const void* queryGenericPluginIface(std::string_view iid) {
     using Entries = GenericTableEntries<InstanceT, ManagerT>;
@@ -1054,6 +1078,15 @@ const void* queryGenericPluginIface(std::string_view iid) {
     }
     if (iid == PLUGINXX_IFACE_CANCEL) {
         return &Entries::cancelIface();
+    }
+    if (looksLikeGenericTableIid(iid)) {
+        utilxx_base::xxLogPrint(
+            utilxx_base::LogLevel::Warn,
+            "pluginxx",
+            "query_interface: `" + std::string{iid} + "` 未命中; 本进程的通用表 IID 以 `"
+                + std::string{pluginxx::appIdPrefix()}
+                + "` 开头 —— 宿主与插件必须用同一个应用名 (PLUGINXX_APP_NAME) 编译"
+        );
     }
     return nullptr;
 }
