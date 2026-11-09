@@ -4,12 +4,12 @@
 /// scheduler / coroutine_runtime / tasks / cancel) 的实现从各主程序的管理器里统一到
 /// 一处, 主程序只需:
 /// 1. 管理器继承本类 (`class MyManager : public pluginxx::PluginHostCore<MyInstance>`);
-/// 2. 实现 [DomainHooks] 并调用 [PluginHostCore::setDomainHooks];
+/// 2. 实现 [DomainServices] 并调用 [PluginHostCore::setDomainServices];
 /// 3. 用 `pluginxx/host/tables_impl.h` 的 `queryGenericPluginIface` 加载 vtable 的
 ///    `query_interface` (通用表由插件框架提供, 业务表由主程序自己提供)。
 ///
 /// 归属判据: 通用 = 与"会话/模型/工具/提示词/图"无关的表; 需要主程序语义的数据一律
-/// 经 [DomainHooks] 取, 因此本头不包含任何主程序类型。
+/// 经 [DomainServices] 取, 因此本头不包含任何主程序类型。
 ///
 /// 线程约定: 除明确标注的方法外, 全部方法**只在主程序 IO 线程调用** (ABI 入口由
 /// `tables_impl.h` 的 trampoline 先投递到 IO 线程); 实例的登记表 (订阅/能力/睡眠
@@ -20,7 +20,7 @@
 #include "asio/steady_timer.hpp"
 #include "pluginxx/host/abi_util.h"
 #include "pluginxx/host/capability_registry.h"
-#include "pluginxx/host/domain_hooks.h"
+#include "pluginxx/host/domain_services.h"
 #include "pluginxx/host/broadcast_registry.h"
 #include "pluginxx/host/capability_chain.h"
 #include "pluginxx/runtime/manager_base.h"
@@ -182,10 +182,10 @@ public:
         Base(std::move(ex)) {}
 
     /// 注入业务数据入口
-    /// - 主程序管理器实现 [DomainHooks] 后在构造函数体内调用
-    ///   (`this->setDomainHooks(this)`), 必须在任何通用表入口被调用之前完成
-    void setDomainHooks(DomainHooks* hooks) noexcept {
-        hooks_ = hooks;
+    /// - 主程序管理器实现 [DomainServices] 后在构造函数体内调用
+    ///   (`this->setDomainServices(this)`), 必须在任何通用表入口被调用之前完成
+    void setDomainServices(DomainServices* services) noexcept {
+        services_ = services;
     }
 
     /// 官方标识前缀 (`<应用名>.`): 官方能力 / 广播 id 都以它开头
@@ -206,8 +206,8 @@ public:
         return detail::isOfficialIdWithPrefix(id, officialPrefix_);
     }
 
-    DomainHooks* domainHooks() const noexcept {
-        return hooks_;
+    DomainServices* domainServices() const noexcept {
+        return services_;
     }
 
     /// 能力注册表 (主程序其它代码可直接查询)
@@ -666,7 +666,7 @@ public:
     }
 
     /// 订阅广播 (**IO 线程**)
-    /// - `id` 经 [DomainHooks::qualifyEventTopic] 补齐命名空间;
+    /// - `id` 经 [DomainServices::qualifyEventTopic] 补齐命名空间;
     /// - `optionsJson` 是这个订阅方自己的通知频率 (`{"intervalMs": 200, "mode": "delay"}`,
     ///   空 = 不限频);
     /// - 回调在发布线程执行, 每次回调都在实例执行 lease 保护下调用插件
@@ -691,7 +691,7 @@ public:
             return nullptr;
         }
         const std::string fullId
-            = hooks_ ? hooks_->qualifyEventTopic(broadcastId)
+            = services_ ? services_->qualifyEventTopic(broadcastId)
                      : std::string{broadcastId};
         if (fullId.empty()) {
             XX_LOGW(
@@ -940,7 +940,7 @@ public:
             });
 
             const bool queued = [&]() {
-                if (!hooks_ || !hooks_->postToWorkerThread([core, result, cancelState, work, ud]() {
+                if (!services_ || !services_->postToWorkerThread([core, result, cancelState, work, ud]() {
                         PluginxxCancelToken token{&isOffloadCanceled, cancelState.get()};
                         PluginxxString      workError{};
                         int32_t             status = PLUGINXX_OPERATOR_OK;
@@ -1141,7 +1141,7 @@ protected:
         if (!inst) {
             return {};
         }
-        return hooks_ ? hooks_->pluginId(inst->name) : inst->name;
+        return services_ ? services_->pluginId(inst->name) : inst->name;
     }
 
     /// 一次能力调用的阶段链状态 (内部类型)
@@ -1378,7 +1378,7 @@ protected:
         }
     };
 
-    DomainHooks*                        hooks_        = nullptr;
+    DomainServices*                        services_        = nullptr;
     /// 官方标识前缀 (`<应用名>.`): 默认取构建期注入的应用名, 可经 `setOfficialPrefix` 覆盖
     std::string                         officialPrefix_{pluginxx::appIdPrefix()};
     std::shared_ptr<CapabilityRegistry> capabilities_ = std::make_shared<CapabilityRegistry>();

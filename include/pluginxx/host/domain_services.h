@@ -7,7 +7,7 @@
 /// 不进入本接口。
 ///
 /// 主程序侧用法: 主程序管理器实现本接口, 并在任何通用表入口可能被调用之前
-/// 经 [PluginHostCore::setDomainHooks] 注入 (通常在管理器构造函数体内完成)。
+/// 经 [PluginHostCore::setDomainServices] 注入 (通常在管理器构造函数体内完成)。
 ///
 /// 线程约定: 下列方法都在主程序 IO 线程被调用 (通用表入口先投递到 IO 线程),
 /// 实现方无需额外加锁; [postToWorkerThread] 例外, 它把工作投递到工作线程池。
@@ -23,10 +23,10 @@
 namespace pluginxx {
 
 /// 主程序业务数据入口 (纯虚接口部分为必需项; 带默认实现的为可选项)
-class DomainHooks {
+class DomainServices {
 public:
 
-    virtual ~DomainHooks() = default;
+    virtual ~DomainServices() = default;
 
     // ==================== 广播 / 能力共用 ====================
 

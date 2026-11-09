@@ -14,8 +14,8 @@
 /// ```cpp
 /// class MyManager : public pluginxx::PluginHostLifecycle<MyInstance>,
 ///                   public std::enable_shared_from_this<MyManager>,
-///                   public pluginxx::DomainHooks {
-///     // 1. 构造体内 setDomainHooks(this) (通用表取数);
+///                   public pluginxx::DomainServices {
+///     // 1. 构造体内 setDomainServices(this) (通用表取数);
 ///     // 2. 覆写下方"主程序扩展点"里的纯虚函数与需要的可选项;
 ///     // 3. query_interface 里用 pluginxx::queryGenericPluginIface 加载通用表。
 /// };
@@ -31,7 +31,7 @@
 #include "asio/post.hpp"
 #include "pluginxx/api/entry.h"
 #include "pluginxx/host/abi_util.h"
-#include "pluginxx/host/domain_hooks.h"
+#include "pluginxx/host/domain_services.h"
 #include "pluginxx/host/host_core.h"
 #include "pluginxx/host/loader.h"
 #include "pluginxx/host/manifest.h"

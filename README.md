@@ -61,7 +61,7 @@ include/pluginxx/
           abi_util.h (C 串转换/异常保护/io 线程同步投递)、
           capability_registry.h (能力注册表: 能力名 → 提供者插件 + 启动/取消回调)、
           event_bus.h (事件后端抽象 EventSource + 订阅句柄 PluginxxSubscription)、
-          domain_hooks.h (业务数据入口 DomainHooks: 通用表需要主程序数据的入口)、
+          domain_services.h (业务数据入口 DomainServices: 通用表需要主程序数据的入口)、
           host_core.h (框架核心 PluginHostCore<InstanceT>: 通用表状态与方法实现)、
           tables_impl.h (十张通用表的 vtable 入口 + queryGenericPluginIface<I,M>)、
           lifecycle.h (框架生命周期骨架 PluginHostLifecycle<InstanceT>: 加载/启停/
@@ -79,13 +79,13 @@ class MyInstance : public pluginxx::PluginInstanceBase {
 
 class MyManager : public pluginxx::PluginHostLifecycle<MyInstance>,   // 含 PluginHostCore
                   public std::enable_shared_from_this<MyManager>,
-                  public pluginxx::DomainHooks {
+                  public pluginxx::DomainServices {
 public:
     MyManager(asio::any_io_executor ex) : PluginHostLifecycle<MyInstance>(ex) {
-        setDomainHooks(this);
+        setDomainServices(this);
         setOfficialPrefix(pluginxx::appIdPrefix());   // 默认已是构建期的应用名, 写出来更好读
     }
-    // DomainHooks: 事件后端 / 工作线程池 / 配置 JSON / 语言 / 会话工作目录 / 取消状态 / 插件清单
+    // DomainServices: 事件后端 / 工作线程池 / 配置 JSON / 语言 / 会话工作目录 / 取消状态 / 插件清单
 protected:
     // 生命周期扩展点 (纯虚): 管理器自引用 / 生成业务实例 / 交给自己插件的 vtable
     std::shared_ptr<pluginxx::PluginHostLifecycle<MyInstance>> selfRef() override;
@@ -98,7 +98,7 @@ protected:
 ```
 
 - **通用表 (定义与实现都在本库)**: log / json / config / plugins / broadcasts / scheduler /
-  coroutine_runtime / tasks / cancel / capabilities —— 主程序经 `DomainHooks` 提供业务数据；
+  coroutine_runtime / tasks / cancel / capabilities —— 主程序经 `DomainServices` 提供业务数据；
 - **生命周期骨架 (在本库)**: 动态库加载与入口校验、create/start 事务、启用与禁用级联、
   stop 事务补齐、inflight 归零等待、destroy 与动态库卸载、失败回滚、关闭超时重试；
   主程序只提供少量扩展点 (见上)，因此新接入的主程序不必重写这套纪律；

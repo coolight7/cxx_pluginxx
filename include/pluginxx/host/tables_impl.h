@@ -15,7 +15,7 @@
 /// 覆盖 10 张通用表: log / json / config / plugins / broadcasts / scheduler /
 /// coroutine_runtime / tasks / cancel / capabilities。入口体只做三件事:
 /// 解析框架控制块 (取实例/管理器 + admission lease) → 投递到 IO 线程 → 调用
-/// [PluginHostCore] 的同名方法; 业务数据一律由 [DomainHooks] 提供。
+/// [PluginHostCore] 的同名方法; 业务数据一律由 [DomainServices] 提供。
 ///
 /// 线程约定: 入口可在任意线程调用 (内部投递并同步等待); 表结构体首次查询时构造,
 /// 之后只读, 因此可安全被多个插件线程并发查询。
@@ -239,9 +239,9 @@ struct GenericTableEntries {
             host,
             out,
             [](InstanceT* inst, ManagerT* mgr) -> std::string {
-                auto* hooks = mgr->domainHooks();
+                auto* services = mgr->domainServices();
                 (void)inst;
-                return hooks ? hooks->configJson() : std::string{};
+                return services ? services->configJson() : std::string{};
             }
         );
     }
@@ -294,8 +294,8 @@ struct GenericTableEntries {
             }
             auto keep = call;
             auto lang = ioCallSyncKeep<std::string>(keep, mgr, [keep]() {
-                auto* hooks = keep.manager()->domainHooks();
-                return hooks ? hooks->language() : std::string{};
+                auto* services = keep.manager()->domainServices();
+                return services ? services->language() : std::string{};
             });
             if (lang.empty()) {
                 lang = "en";
@@ -318,8 +318,8 @@ struct GenericTableEntries {
             auto              keep = call;
             const std::string lang = language ? svToStr(*language) : std::string{};
             ioCallSyncVoidKeep(keep, mgr, [keep, lang]() {
-                if (auto* hooks = keep.manager()->domainHooks()) {
-                    hooks->setLanguage(lang);
+                if (auto* services = keep.manager()->domainServices()) {
+                    services->setLanguage(lang);
                 }
             });
             return 0;
@@ -337,8 +337,8 @@ struct GenericTableEntries {
             out,
             [](InstanceT* inst, ManagerT* mgr) -> std::string {
                 (void)inst;
-                auto* hooks = mgr->domainHooks();
-                return hooks ? hooks->pluginsJson() : std::string{};
+                auto* services = mgr->domainServices();
+                return services ? services->pluginsJson() : std::string{};
             }
         );
     }
@@ -360,8 +360,8 @@ struct GenericTableEntries {
             auto              keep      = call;
             const std::string pluginName = svToStr(*name);
             auto              json      = ioCallSyncKeep<std::string>(keep, mgr, [keep, pluginName]() {
-                auto* hooks = keep.manager()->domainHooks();
-                return hooks ? hooks->pluginJson(pluginName) : std::string{};
+                auto* services = keep.manager()->domainServices();
+                return services ? services->pluginJson(pluginName) : std::string{};
             });
             if (json.empty()) {
                 return -1;
@@ -386,8 +386,8 @@ struct GenericTableEntries {
             auto              keep     = call;
             const std::string ownName  = inst->name;
             auto              json     = ioCallSyncKeep<std::string>(keep, mgr, [keep, ownName]() {
-                auto* hooks = keep.manager()->domainHooks();
-                return hooks ? hooks->pluginJson(ownName) : std::string{};
+                auto* services = keep.manager()->domainServices();
+                return services ? services->pluginJson(ownName) : std::string{};
             });
             if (json.empty()) {
                 return -1;
