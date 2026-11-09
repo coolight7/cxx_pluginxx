@@ -3,7 +3,7 @@
 /// 归属: cxx_pluginxx (插件框架)。
 ///
 /// 定位: 广播是"属主改了东西, 通知所有关心的人":
-/// - 声明 ([BroadcastDecl]): 这个频道有没有当前值 (`cache`)、谁能写 (`writable`)、
+/// - 声明 ([BroadcastDecl]): 这个频道有没有当前值 (`cache`)、谁能发布 (`publish`)、
 ///   订阅时是否立刻收到当前值 (`pushOnSubscribe`)、允许合并 (`coalesce`)、
 ///   是不是调试频道 (`scope`);
 /// - 频道 ([BroadcastChannel]): 一份缓存 + 订阅者。
@@ -11,9 +11,13 @@
 /// 三条语义:
 /// 1. `cache: latest` 只保证"最后一次到达": 同一频道重复发布时缓存只留最后一份,
 ///    订阅方拿到的是最新值 (中间值不再补发); `cache: none` 没有当前值, 也不能 `read`。
-/// 2. **广播的缓存不等于能力的值缓存**: 这里是"这个频道现在是什么值"(一份),
-///    能力的 `byIdentity` 是"这个请求身份的结果"(多份), 两者分开存放。
+/// 2. **广播只有读与订阅**: 没有"给别人的频道写值"这个操作, 也没有回执; 要改属主的状态
+///    由属主暴露成能力 (调用方发请求、属主给结果)。
 /// 3. 订阅互不等待: 一个订阅抛异常只记日志, 不影响属主与其它订阅。
+///
+/// 订阅频率限制 ([BroadcastSubscribeOptions]): 每个订阅方自己声明通知间隔与模式,
+/// 互不影响。状态存在 [BroadcastSub] 上, 补发由 [BroadcastRegistry::flushPending] 完成
+/// (注册表自己不会计时: 主程序用 [BroadcastRegistry::setScheduler] 注入一个定时器)。
 ///
 /// 线程约定: 订阅登记与发布都可能来自不同线程 (IO 线程 / 事件线程), 内部用互斥保护
 /// 频道表; 回调一律在锁外执行, 因此订阅方可以在回调里再次发布或退订。
@@ -26,6 +30,7 @@
 #include "utilxx_base/log.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -48,54 +53,87 @@ enum class BroadcastCache_e : int32_t {
     Latest = 1,
 };
 
-/// 谁能写 (`PLUGINXX_BROADCAST_WRITABLE_*`)
-enum class BroadcastWritable_e : int32_t {
-    Owner  = 0, ///< 只有声明的属主能写 (状态镜像)
-    Anyone = 1, ///< 任何已连接的插件都能写 (变量)
+/// 谁能发布 (`PLUGINXX_BROADCAST_PUBLISH_*`)
+enum class BroadcastPublisher_e : int32_t {
+    Owner  = 0, ///< 只有声明的属主能发布 (官方频道 / 插件自己的频道)
+    Anyone = 1, ///< 任何已连接的插件都能发布 (共享频道)
 };
 
 /// 频道用途 (`PLUGINXX_BROADCAST_SCOPE_*`)
 enum class BroadcastScope_e : int32_t {
     App    = 0,
-    System = 1, ///< 调试 / 自省频道: 插件不能写
+    System = 1, ///< 调试 / 自省频道: 插件不能发布
+};
+
+/// 订阅间隔内的处理方式 (`PLUGINXX_BROADCAST_LIMIT_*`)
+enum class BroadcastLimitMode_e : int32_t {
+    /// 间隔期间只保留最新一条, 间隔到点补发一次
+    Delay = 0,
+    /// 间隔期间的通知直接丢掉
+    Drop = 1,
+};
+
+/// 订阅时的频率选项
+///
+/// - `intervalMs` <= 0 表示不限频 (每次发布都通知);
+/// - 订阅后的第一条通知立即到达 (`pushOnSubscribe` 补的当前值也算第一条, 作为窗口起点)。
+struct BroadcastSubscribeOptions {
+    int64_t              intervalMs = 0;
+    BroadcastLimitMode_e mode       = BroadcastLimitMode_e::Delay;
 };
 
 /// 广播声明
 struct BroadcastDecl {
-    std::string           id;
-    BroadcastCache_e      cache           = BroadcastCache_e::None;
-    BroadcastWritable_e   writable        = BroadcastWritable_e::Owner;
-    bool                  pushOnSubscribe = false;
-    bool                  coalesce        = true;
-    BroadcastScope_e      scope           = BroadcastScope_e::App;
+    std::string          id;
+    BroadcastCache_e     cache           = BroadcastCache_e::None;
+    BroadcastPublisher_e publish         = BroadcastPublisher_e::Owner;
+    bool                 pushOnSubscribe = false;
+    bool                 coalesce        = true;
+    BroadcastScope_e     scope           = BroadcastScope_e::App;
     /// 属主: 空 = 应用 (Dart 下发); 非空 = 插件名 (插件自建频道)
-    std::string           owner;
+    std::string          owner;
 
     bool isAppChannel() const noexcept {
         return owner.empty();
     }
 };
 
-/// 一个订阅
+/// 一个订阅 (含这个订阅方自己的限频状态)
 struct BroadcastSub {
     uint64_t                              token = 0;
     std::string                           owner; ///< 订阅方 (插件名; 空 = 宿主)
     std::function<void(std::string_view)> handler;
+
+    // ---- 限频状态 (每个订阅一份, 互不影响) ----
+    int64_t              intervalMs  = 0;                  ///< 0 = 不限频
+    BroadcastLimitMode_e mode        = BroadcastLimitMode_e::Delay;
+    bool                 hasNotified = false;              ///< 通知过没有 (没有 = 下一条立刻通知)
+    int64_t              lastNotifyMs = 0;                 ///< 上次通知的 steady 毫秒
+    std::string          pending;                          ///< 等待补发的最新载荷 (delay 用)
+    bool                 hasPending = false;
 };
 
 /// 一个频道: 声明 + 当前值 + 订阅者
 struct BroadcastChannel {
-    BroadcastDecl           decl;
-    std::string             latest;    ///< 最后一个值 (cache: latest)
-    bool                    hasLatest = false;
-    std::string             lastWriter; ///< 最近一次写入的属主 (自省用)
-    uint64_t                nextToken = 0;
+    BroadcastDecl             decl;
+    std::string               latest;    ///< 最后一个值 (cache: latest)
+    bool                      hasLatest = false;
+    std::string               lastPublisher; ///< 最近一次发布的属主 (自省用)
+    uint64_t                  nextToken = 0;
     std::vector<BroadcastSub> subs;
+    /// 这个频道还有等补发的订阅, 且已经排进这一轮补发
+    bool                      flushScheduled = false;
 };
 
 /// 广播注册表: id → 频道
 class PLUGINXX_API BroadcastRegistry {
 public:
+
+    /// 补发任务的调度器: `delayMs` 之后在主程序线程上执行 `task`
+    ///
+    /// 注册表自己不计时: 没有注入调度器时 (库被单独使用 / 单元测试) `delay` 模式的补发
+    /// 退化为"下一次发布时顺便补", 主程序 (宿主) 一定会注入 (`asio::steady_timer`)。
+    using BroadcastScheduler = std::function<void(int64_t delayMs, std::function<void()> task)>;
 
     /// 声明一个频道
     /// - 重复声明: 应用声明不能被插件覆盖; 同为插件声明时后声明者覆盖;
@@ -109,13 +147,14 @@ public:
     const BroadcastDecl* declOf(std::string_view id) const;
 
     /// 发布
-    /// - 未声明的 id、`scope: system` 的插件写、`writable: owner` 的非属主写都拒绝,
+    /// - 未声明的 id、`scope: system` 的插件发布、`publish: owner` 的非属主发布都拒绝,
     ///   并把原因写进 `error` (可为空);
-    /// - 成功时缓存与投递都在本次调用内完成 (同步)。
+    /// - 成功时缓存与投递都在本次调用内完成 (同步); 被限频挡住的载荷进订阅方的 `pending`,
+    ///   到点由 [flushPending] 补发。没有注入调度器时, 下一次发布顺带补一次。
     bool publish(
         std::string_view id,
         std::string_view payload,
-        std::string_view writer,
+        std::string_view publisher,
         std::string*     error = nullptr
     );
 
@@ -124,13 +163,15 @@ public:
 
     /// 订阅
     /// - 返回订阅令牌 (0 = 失败); `pushOnSubscribe` 且已有当前值时,
-    ///   在返回前用当前值回调一次 (锁外);
-    /// - `owner` 只用于按属主批量退订与自省。
+    ///   在返回前用当前值回调一次 (锁外, 算这个订阅的第一条通知);
+    /// - `owner` 只用于按属主批量退订与自省;
+    /// - `options` 给出这个订阅方自己的通知频率。
     uint64_t subscribe(
         std::string_view                      id,
         std::string_view                      owner,
         std::function<void(std::string_view)> handler,
-        std::string*                          error = nullptr
+        const BroadcastSubscribeOptions&      options = {},
+        std::string*                          error   = nullptr
     );
 
     /// 退订 (幂等); 命中返回 true
@@ -139,7 +180,7 @@ public:
     /// 退订某个订阅方的全部订阅 (插件卸载/禁用); 返回撤销数量
     size_t removeSubscriber(std::string_view owner);
 
-    /// 删除一个频道 (变量注销 / 宿主清理); 命中返回 true
+    /// 删除一个频道 (插件撤销声明 / 宿主清理); 命中返回 true
     bool removeChannel(std::string_view id);
 
     /// 删除某个插件的频道并撤销其订阅 (插件卸载); 返回删除的频道数
@@ -154,6 +195,15 @@ public:
     /// 自省: 全部频道 (JSON)
     std::string listJson() const;
 
+    /// 注入补发定时器 (主程序在启动时调用一次; 见 [BroadcastScheduler])
+    void setScheduler(BroadcastScheduler scheduler);
+
+    /// 到点补发: 把已到间隔的 `pending` 投出去, 再按最近的到期时间排下一次
+    ///
+    /// 由注入的调度器调用 (任意线程, 内部加锁); 没有调度器时也会在下次发布里被调用,
+    /// 保证 `delay` 模式的订阅最终能拿到最新值。
+    void flushPending();
+
     /// 清空 (单元测试用)
     void reset();
 
@@ -163,14 +213,20 @@ public:
 private:
 
     /// 投递 (锁外); 单个回调抛异常只记日志
-    static void deliver(
-        const std::vector<BroadcastSub>& subs,
-        std::string_view                 payload,
-        std::string_view                 id
+    static void deliverOne(
+        const std::function<void(std::string_view)>& handler,
+        std::string_view                             payload,
+        std::string_view                             id
     );
+
+    /// 排一次补发 (锁外调用; `delayMs` <= 0 时按 0)
+    void scheduleFlush(int64_t delayMs);
 
     mutable std::mutex                                          mutex_;
     std::map<std::string, BroadcastChannel, std::less<>>        channels_;
+    BroadcastScheduler                                          scheduler_;
+    /// 有没有已经排进调度器的一次补发
+    bool                                                        flushArmed_ = false;
 };
 
 } // namespace pluginxx

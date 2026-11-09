@@ -455,6 +455,7 @@ struct GenericTableEntries {
         const PluginxxStringView* broadcast_id,
         void(PLUGINXX_CALL* handler)(const PluginxxStringView* payload_json, void* ud),
         void*                     ud,
+        const PluginxxStringView* options_json,
         PluginxxString*           error_out
     ) {
         return guardVtableCall<PluginxxSubscription*>(nullptr, [&]() {
@@ -469,8 +470,11 @@ struct GenericTableEntries {
                 return static_cast<PluginxxSubscription*>(nullptr);
             }
             // 引用含借用视图: 投递前复制为自有的 id/seq (库内部结构)
-            auto              keep = call;
-            const std::string id   = svToStr(*broadcast_id);
+            auto              keep    = call;
+            const std::string id      = svToStr(*broadcast_id);
+            const std::string options = pluginxx_scope_ref_ok(options_json)
+                                            ? svToStr(*options_json)
+                                            : std::string{};
             PluginxxScopeRef  scopeCopy{};
             const bool        hasScope = pluginxx_scope_ref_ok(scope) && scope;
             if (hasScope) {
@@ -479,13 +483,14 @@ struct GenericTableEntries {
             auto* sub = ioCallSyncKeep<PluginxxSubscription*>(
                 keep,
                 mgr,
-                [keep, hasScope, scopeCopy, id, handler, ud]() {
+                [keep, hasScope, scopeCopy, id, options, handler, ud]() {
                     return keep.manager()->subscribeBroadcast(
                         keep.instance(),
                         hasScope ? &scopeCopy : nullptr,
                         id,
                         handler,
-                        ud
+                        ud,
+                        options
                     );
                 }
             );

@@ -652,6 +652,8 @@ public:
 
     /// 订阅广播 (**IO 线程**)
     /// - `id` 经 [DomainHooks::qualifyEventTopic] 补齐命名空间;
+    /// - `optionsJson` 是这个订阅方自己的通知频率 (`{"intervalMs": 200, "mode": "delay"}`,
+    ///   空 = 不限频);
     /// - 回调在发布线程执行, 每次回调都在实例执行 lease 保护下调用插件
     ///   (因此卸载的 idle 等待覆盖它);
     /// - 实例正在关闭/已禁用, 或 id 非法时返回 nullptr。
@@ -660,7 +662,8 @@ public:
         const PluginxxScopeRef*  scope,
         std::string_view         broadcastId,
         void(PLUGINXX_CALL* handler)(const PluginxxStringView* payload_json, void* ud),
-        void* ud
+        void*                    ud,
+        std::string_view         optionsJson = {}
     ) {
         if (!inst || broadcastId.empty() || !handler) {
             return nullptr;
@@ -695,6 +698,20 @@ public:
             sub->scopeId.assign(scope->id.data, static_cast<size_t>(scope->id.size));
         }
 
+        BroadcastSubscribeOptions options;
+        if (!optionsJson.empty()) {
+            detail::ParsedJson parsed = detail::parseJson(optionsJson);
+            if (parsed.ok) {
+                options = detail::broadcastSubscribeOptionsOf(parsed.value);
+            } else {
+                XX_LOGW(
+                    "Plugin `{}` subscribe_broadcast: bad options `{}`, using defaults",
+                    inst->name,
+                    optionsJson
+                );
+            }
+        }
+
         const uint64_t token = broadcasts_->subscribe(
             fullId,
             std::string{},
@@ -719,7 +736,8 @@ public:
                 } catch (...) {
                     XX_LOGW("Plugin `{}` broadcast handler threw unknown exception", inst->name);
                 }
-            }
+            },
+            options
         );
         if (token == 0) {
             XX_LOGW(

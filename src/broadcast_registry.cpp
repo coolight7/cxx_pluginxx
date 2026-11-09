@@ -15,12 +15,24 @@ const char* cacheName(BroadcastCache_e cache) noexcept {
     return cache == BroadcastCache_e::Latest ? "latest" : "none";
 }
 
-const char* writableName(BroadcastWritable_e writable) noexcept {
-    return writable == BroadcastWritable_e::Anyone ? "anyone" : "owner";
+const char* publisherName(BroadcastPublisher_e publish) noexcept {
+    return publish == BroadcastPublisher_e::Anyone ? "anyone" : "owner";
 }
 
 const char* scopeName(BroadcastScope_e scope) noexcept {
     return scope == BroadcastScope_e::System ? "system" : "app";
+}
+
+const char* limitModeName(BroadcastLimitMode_e mode) noexcept {
+    return mode == BroadcastLimitMode_e::Drop ? "drop" : "delay";
+}
+
+/// 单调时钟毫秒 (系统时间被调整不影响限频)
+int64_t steadyNowMs() noexcept {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()
+    )
+        .count();
 }
 
 } // namespace
@@ -32,15 +44,17 @@ std::string BroadcastRegistry::validateDecl(const BroadcastDecl& decl) {
     if (decl.cache != BroadcastCache_e::None && decl.cache != BroadcastCache_e::Latest) {
         return "broadcast `" + decl.id + "`: unknown cache value";
     }
-    if (decl.writable != BroadcastWritable_e::Owner && decl.writable != BroadcastWritable_e::Anyone) {
-        return "broadcast `" + decl.id + "`: unknown writable value";
+    if (decl.publish != BroadcastPublisher_e::Owner
+        && decl.publish != BroadcastPublisher_e::Anyone) {
+        return "broadcast `" + decl.id + "`: unknown publish value";
     }
     if (decl.scope != BroadcastScope_e::App && decl.scope != BroadcastScope_e::System) {
         return "broadcast `" + decl.id + "`: unknown scope value";
     }
-    if (decl.scope == BroadcastScope_e::System && decl.writable != BroadcastWritable_e::Owner) {
-        // 调试/自省频道只由宿主写, 插件写成 anyone 只会在发布时被拒
-        return "broadcast `" + decl.id + "`: system scope requires writable: owner";
+    if (decl.scope == BroadcastScope_e::System
+        && decl.publish != BroadcastPublisher_e::Owner) {
+        // 调试/自省频道只由宿主发布, 插件写成 anyone 只会在发布时被拒
+        return "broadcast `" + decl.id + "`: system scope requires publish: owner";
     }
     if (decl.pushOnSubscribe && decl.cache != BroadcastCache_e::Latest) {
         // 订阅时没有当前值可推, 声明自相矛盾 (生成物也会拦, 这里兜住运行期声明)
@@ -107,10 +121,16 @@ const BroadcastDecl* BroadcastRegistry::declOf(std::string_view id) const {
 bool BroadcastRegistry::publish(
     std::string_view id,
     std::string_view payload,
-    std::string_view writer,
+    std::string_view publisher,
     std::string*     error
 ) {
-    std::vector<BroadcastSub> subs;
+    /// 这一轮要立刻投递的通知 (回调在锁外执行)
+    struct Delivery {
+        std::function<void(std::string_view)> handler;
+        std::string                           payload;
+    };
+    std::vector<Delivery> deliveries;
+    int64_t               nextDelayMs = -1;
     {
         std::lock_guard lock(mutex_);
         auto            it = channels_.find(id);
@@ -121,27 +141,28 @@ bool BroadcastRegistry::publish(
             return false;
         }
         BroadcastChannel& channel = it->second;
-        if (channel.decl.scope == BroadcastScope_e::System && !writer.empty()) {
+        if (channel.decl.scope == BroadcastScope_e::System && !publisher.empty()) {
             if (error) {
                 *error = "broadcast `" + std::string{id} + "` is a system channel";
             }
             XX_LOGW(
-                "BroadcastRegistry: plugin `{}` cannot write system broadcast `{}`",
-                writer,
+                "BroadcastRegistry: plugin `{}` cannot publish system broadcast `{}`",
+                publisher,
                 id
             );
             return false;
         }
-        if (channel.decl.writable == BroadcastWritable_e::Owner
-            && channel.decl.owner != writer) {
+        if (channel.decl.publish == BroadcastPublisher_e::Owner
+            && channel.decl.owner != publisher) {
             if (error) {
                 *error = "broadcast `" + std::string{id} + "` is owned by `"
-                         + (channel.decl.owner.empty() ? std::string{"app"} : channel.decl.owner)
+                         + (channel.decl.owner.empty() ? std::string{"app"}
+                                                       : channel.decl.owner)
                          + "`";
             }
             XX_LOGW(
-                "BroadcastRegistry: plugin `{}` cannot write broadcast `{}` owned by `{}`",
-                writer,
+                "BroadcastRegistry: plugin `{}` cannot publish broadcast `{}` owned by `{}`",
+                publisher,
                 id,
                 channel.decl.owner.empty() ? "app" : channel.decl.owner
             );
@@ -151,10 +172,51 @@ bool BroadcastRegistry::publish(
             channel.latest.assign(payload.data(), payload.size());
             channel.hasLatest = true;
         }
-        channel.lastWriter.assign(writer.data(), writer.size());
-        subs = channel.subs;
+        channel.lastPublisher.assign(publisher.data(), publisher.size());
+
+        const int64_t now = steadyNowMs();
+        for (BroadcastSub& sub : channel.subs) {
+            if (!sub.handler) {
+                continue;
+            }
+            const int64_t interval = sub.intervalMs;
+            const bool    due      = interval <= 0 || !sub.hasNotified
+                                || now - sub.lastNotifyMs >= interval;
+            if (due) {
+                deliveries.push_back(Delivery{sub.handler, std::string{payload}});
+                sub.hasNotified  = true;
+                sub.lastNotifyMs = now;
+                sub.hasPending   = false;
+                sub.pending.clear();
+                continue;
+            }
+            if (sub.mode != BroadcastLimitMode_e::Delay) {
+                continue; // drop: 间隔内的通知直接丢掉
+            }
+            // delay: 只留最新一条, 到点补发 (due 一定 > 0, 因为上面判过还在间隔内)
+            sub.pending.assign(payload.data(), payload.size());
+            sub.hasPending = true;
+            const int64_t waitMs = sub.lastNotifyMs + interval - now;
+            if (nextDelayMs < 0 || waitMs < nextDelayMs) {
+                nextDelayMs = waitMs;
+            }
+        }
+        if (nextDelayMs >= 0) {
+            channel.flushScheduled = true;
+            if (!flushArmed_) {
+                flushArmed_ = true;
+            } else {
+                // 已经排过一轮: 不重复排, 那一轮会处理全部频道
+                nextDelayMs = -1;
+            }
+        }
     }
-    deliver(subs, payload, id);
+    for (Delivery& item : deliveries) {
+        deliverOne(item.handler, item.payload, id);
+    }
+    if (nextDelayMs >= 0) {
+        scheduleFlush(nextDelayMs);
+    }
     return true;
 }
 
@@ -175,6 +237,7 @@ uint64_t BroadcastRegistry::subscribe(
     std::string_view                      id,
     std::string_view                      owner,
     std::function<void(std::string_view)> handler,
+    const BroadcastSubscribeOptions&      options,
     std::string*                          error
 ) {
     if (!handler) {
@@ -201,23 +264,24 @@ uint64_t BroadcastRegistry::subscribe(
         BroadcastSub added;
         added.token = token;
         added.owner.assign(owner.data(), owner.size());
-        added.handler = handler;
-        channel.subs.push_back(std::move(added));
+        added.handler    = handler;
+        added.intervalMs = options.intervalMs > 0 ? options.intervalMs : 0;
+        added.mode       = options.mode == BroadcastLimitMode_e::Drop
+                               ? BroadcastLimitMode_e::Drop
+                               : BroadcastLimitMode_e::Delay;
         if (channel.decl.pushOnSubscribe && channel.hasLatest) {
-            pushNow     = true;
-            current     = channel.latest;
-            pushHandler = handler;
+            // 订阅即推的当前值算这个订阅的第一条通知, 也是限频窗口的起点
+            added.hasNotified   = true;
+            added.lastNotifyMs  = steadyNowMs();
+            pushNow             = true;
+            current             = channel.latest;
+            pushHandler         = handler;
         }
+        channel.subs.push_back(std::move(added));
     }
     // 订阅即推: 用当前值回调一次 (锁外, 回调里可以再次发布/退订)
     if (pushNow && pushHandler) {
-        try {
-            pushHandler(current);
-        } catch (const std::exception& e) {
-            XX_LOGW("Broadcast `{}` subscriber threw on subscribe: {}", id, e.what());
-        } catch (...) {
-            XX_LOGW("Broadcast `{}` subscriber threw on subscribe: unknown exception", id);
-        }
+        deliverOne(pushHandler, current, id);
     }
     return token;
 }
@@ -240,7 +304,16 @@ bool BroadcastRegistry::unsubscribe(std::string_view id, uint64_t token) {
         ),
         subs.end()
     );
-    return before != subs.size();
+    if (before == subs.size()) {
+        return false;
+    }
+    // 没有等补发的订阅了: 这一频道不必再参于补发
+    if (std::none_of(subs.begin(), subs.end(), [](const BroadcastSub& sub) {
+            return sub.hasPending;
+        })) {
+        it->second.flushScheduled = false;
+    }
+    return true;
 }
 
 bool BroadcastRegistry::removeChannel(std::string_view id) {
@@ -266,6 +339,12 @@ size_t BroadcastRegistry::removeSubscriber(std::string_view owner) {
             subs.end()
         );
         removed += before - subs.size();
+        if (before != subs.size()
+            && std::none_of(subs.begin(), subs.end(), [](const BroadcastSub& sub) {
+                   return sub.hasPending;
+               })) {
+            channel.flushScheduled = false;
+        }
     }
     return removed;
 }
@@ -305,16 +384,26 @@ std::string BroadcastRegistry::infoJson(std::string_view id) const {
     auto        j       = utilxx_base::Json::object();
     j["id"]             = channel.decl.id;
     j["cache"]          = cacheName(channel.decl.cache);
-    j["writable"]       = writableName(channel.decl.writable);
+    j["publish"]        = publisherName(channel.decl.publish);
     j["pushOnSubscribe"] = channel.decl.pushOnSubscribe;
     j["coalesce"]       = channel.decl.coalesce;
     j["scope"]          = scopeName(channel.decl.scope);
     j["owner"] = channel.decl.isAppChannel() ? std::string{"app"} : channel.decl.owner;
     j["subscribers"] = static_cast<int64_t>(channel.subs.size());
     j["hasValue"]    = channel.hasLatest;
-    if (!channel.lastWriter.empty()) {
-        j["lastWriter"] = channel.lastWriter;
+    if (!channel.lastPublisher.empty()) {
+        j["lastPublisher"] = channel.lastPublisher;
     }
+    auto subs = utilxx_base::Json::array();
+    for (const BroadcastSub& sub : channel.subs) {
+        auto item          = utilxx_base::Json::object();
+        item["owner"]      = sub.owner;
+        item["intervalMs"] = sub.intervalMs;
+        item["mode"]       = limitModeName(sub.mode);
+        item["pending"]    = sub.hasPending;
+        subs.push_back(item);
+    }
+    j["subs"] = subs;
     return j.dump();
 }
 
@@ -326,7 +415,7 @@ std::string BroadcastRegistry::listJson() const {
         auto item            = utilxx_base::Json::object();
         item["id"]           = id;
         item["cache"]        = cacheName(channel.decl.cache);
-        item["writable"]     = writableName(channel.decl.writable);
+        item["publish"]      = publisherName(channel.decl.publish);
         item["scope"]        = scopeName(channel.decl.scope);
         item["subscribers"]  = static_cast<int64_t>(channel.subs.size());
         item["hasValue"]     = channel.hasLatest;
@@ -336,27 +425,107 @@ std::string BroadcastRegistry::listJson() const {
     return out.dump();
 }
 
+void BroadcastRegistry::setScheduler(BroadcastScheduler scheduler) {
+    std::lock_guard lock(mutex_);
+    scheduler_ = std::move(scheduler);
+}
+
+void BroadcastRegistry::flushPending() {
+    struct Delivery {
+        std::function<void(std::string_view)> handler;
+        std::string                           payload;
+        std::string                           id;
+    };
+    std::vector<Delivery> deliveries;
+    int64_t               nextDelayMs = -1;
+    {
+        std::lock_guard lock(mutex_);
+        flushArmed_       = false;
+        const int64_t now = steadyNowMs();
+        for (auto& [id, channel] : channels_) {
+            if (!channel.flushScheduled) {
+                continue;
+            }
+            channel.flushScheduled = false;
+            bool    anyPending     = false;
+            int64_t minWait        = -1;
+            for (BroadcastSub& sub : channel.subs) {
+                if (!sub.hasPending) {
+                    continue;
+                }
+                const int64_t due = sub.lastNotifyMs + sub.intervalMs;
+                if (sub.intervalMs <= 0 || now >= due) {
+                    if (sub.handler) {
+                        deliveries.push_back(Delivery{sub.handler, sub.hasPending ? sub.pending : std::string{}, id});
+                    }
+                    sub.hasPending   = false;
+                    sub.pending.clear();
+                    sub.hasNotified  = true;
+                    sub.lastNotifyMs = now;
+                    continue;
+                }
+                anyPending          = true;
+                const int64_t waitMs = due - now;
+                if (minWait < 0 || waitMs < minWait) {
+                    minWait = waitMs;
+                }
+            }
+            if (anyPending) {
+                channel.flushScheduled = true;
+                if (minWait >= 0 && (nextDelayMs < 0 || minWait < nextDelayMs)) {
+                    nextDelayMs = minWait;
+                }
+            }
+        }
+        if (nextDelayMs >= 0) {
+            flushArmed_ = true;
+        }
+    }
+    for (Delivery& item : deliveries) {
+        deliverOne(item.handler, item.payload, item.id);
+    }
+    if (nextDelayMs >= 0) {
+        scheduleFlush(nextDelayMs);
+    }
+}
+
 void BroadcastRegistry::reset() {
     std::lock_guard lock(mutex_);
     channels_.clear();
+    flushArmed_ = false;
 }
 
-void BroadcastRegistry::deliver(
-    const std::vector<BroadcastSub>& subs,
-    std::string_view                 payload,
-    std::string_view                 id
+void BroadcastRegistry::scheduleFlush(int64_t delayMs) {
+    BroadcastScheduler   scheduler;
+    {
+        std::lock_guard lock(mutex_);
+        scheduler = scheduler_;
+    }
+    if (!scheduler) {
+        // 没有调度器: 补发退化为"下一次发布时顺便补" (由 publish 的 flushArmed_ 兜住)
+        std::lock_guard lock(mutex_);
+        flushArmed_ = false;
+        return;
+    }
+    scheduler(delayMs > 0 ? delayMs : 0, [this]() {
+        flushPending();
+    });
+}
+
+void BroadcastRegistry::deliverOne(
+    const std::function<void(std::string_view)>& handler,
+    std::string_view                             payload,
+    std::string_view                             id
 ) {
-    for (const auto& sub : subs) {
-        if (!sub.handler) {
-            continue;
-        }
-        try {
-            sub.handler(payload);
-        } catch (const std::exception& e) {
-            XX_LOGW("Broadcast `{}` subscriber threw: {}", id, e.what());
-        } catch (...) {
-            XX_LOGW("Broadcast `{}` subscriber threw: unknown exception", id);
-        }
+    if (!handler) {
+        return;
+    }
+    try {
+        handler(payload);
+    } catch (const std::exception& e) {
+        XX_LOGW("Broadcast `{}` subscriber threw: {}", id, e.what());
+    } catch (...) {
+        XX_LOGW("Broadcast `{}` subscriber threw: unknown exception", id);
     }
 }
 

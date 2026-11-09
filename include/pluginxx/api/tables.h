@@ -81,9 +81,9 @@ extern "C" {
 #define PLUGINXX_BROADCAST_CACHE_NONE   0
 #define PLUGINXX_BROADCAST_CACHE_LATEST 1
 
-/* 谁能写 (`PluginxxBroadcastDecl.writable`) */
-#define PLUGINXX_BROADCAST_WRITABLE_OWNER  0
-#define PLUGINXX_BROADCAST_WRITABLE_ANYONE 1
+/* 谁能发布 (`PluginxxBroadcastDecl.publish`) */
+#define PLUGINXX_BROADCAST_PUBLISH_OWNER  0
+#define PLUGINXX_BROADCAST_PUBLISH_ANYONE 1
 
 /* 频道用途 (`PluginxxBroadcastDecl.scope`) */
 #define PLUGINXX_BROADCAST_SCOPE_APP    0
@@ -93,8 +93,10 @@ extern "C" {
 
 #define PLUGINXX_IFACE_BROADCASTS         PLUGINXX_APP_ID("broadcasts")
 /// v1: 频道声明 + 发布 + 订阅 + 读当前值 (取代 `pluginxx.events` v3)
-#define PLUGINXX_IFACE_BROADCASTS_VERSION     1
-#define PLUGINXX_IFACE_BROADCASTS_MIN_VERSION 1
+/// v2: `subscribe_broadcast` 多一个 `options_json` (每个订阅方自己声明通知频率);
+///     声明字段 `writable` 改名 `publish`, 宏改成 `PLUGINXX_BROADCAST_PUBLISH_*`
+#define PLUGINXX_IFACE_BROADCASTS_VERSION     2
+#define PLUGINXX_IFACE_BROADCASTS_MIN_VERSION 2
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
 #define PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE sizeof(PluginxxBroadcastsIface)
 
@@ -102,7 +104,7 @@ extern "C" {
 #define PLUGINXX_RESULT_OK               0
 #define PLUGINXX_RESULT_ERR_ARG         -1 ///< 参数非法
 #define PLUGINXX_RESULT_ERR_NOT_DECLARED -2 ///< 频道/能力没有声明
-#define PLUGINXX_RESULT_ERR_PERMISSION  -3 ///< 没有写权限 (非属主 / 系统频道)
+#define PLUGINXX_RESULT_ERR_PERMISSION  -3 ///< 没有发布权限 (非属主 / 系统频道)
 #define PLUGINXX_RESULT_ERR_NO_VALUE    -4 ///< 没有当前值 (cache: none 或还没写过)
 
 typedef struct PluginxxBroadcastsIface {
@@ -111,7 +113,7 @@ typedef struct PluginxxBroadcastsIface {
 
     /// 声明频道 (**任意线程**)
     /// - `decl_json` 形如
-    ///   `{"id": "...", "cache": "latest", "writable": "owner",
+    ///   `{"id": "...", "cache": "latest", "publish": "owner",
     ///     "pushOnSubscribe": true, "coalesce": true, "scope": "app"}`
     ///   (`id` 可用短名: 宿主补成 `plugin.<本插件 id>.<名字>`);
     /// - 应用已声明的 id 不能被插件改写; 插件自己的 id 后声明者覆盖;
@@ -122,7 +124,7 @@ typedef struct PluginxxBroadcastsIface {
         PluginxxString*           error_out
     );
 
-    /// 发布 (**任意线程**): 属主写 `writable: owner` 的频道, 任何插件写 `writable: anyone` 的频道
+    /// 发布 (**任意线程**): 属主发 `publish: owner` 的频道, 任何插件发 `publish: anyone` 的频道
     int32_t(PLUGINXX_CALL* publish_broadcast)(
         const PluginxxHost*       host,
         const PluginxxStringView* broadcast_id,
@@ -131,7 +133,11 @@ typedef struct PluginxxBroadcastsIface {
     );
 
     /// 订阅 (**任意线程**)
-    /// - `pushOnSubscribe` 的频道在返回值之前用当前值回调一次 (没有当前值时不回调);
+    /// - `pushOnSubscribe` 的频道在返回值之前用当前值回调一次 (没有当前值时不回调),
+    ///   这次回调算该订阅的第一条通知, 也是限频窗口的起点;
+    /// - `options_json` 可空, 形如 `{"intervalMs": 200, "mode": "delay|drop"}`:
+    ///   `intervalMs` = 通知间隔 (毫秒, 0 / 缺省 = 不限频), `mode` = 间隔内只留最新 (delay) /
+    ///   直接丢掉 (drop);
     /// - 失败返回 NULL 并写 `error_out` (句柄用 [unsubscribe_broadcast] 撤销)
     PluginxxSubscription*(PLUGINXX_CALL* subscribe_broadcast)(
         const PluginxxHost*       host,
@@ -139,6 +145,7 @@ typedef struct PluginxxBroadcastsIface {
         const PluginxxStringView* broadcast_id,
         void(PLUGINXX_CALL* handler)(const PluginxxStringView* payload_json, void* ud),
         void*                     ud,
+        const PluginxxStringView* options_json,
         PluginxxString*           error_out
     );
 
