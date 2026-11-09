@@ -36,7 +36,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <coroutine>
 #include <cstddef>
@@ -45,6 +48,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2044,8 +2048,151 @@ inline T jsonGet(const utilxx_base::Json& j) {
         return j.get<T>();
     }
 }
+
+/// 参数文本里允许忽略的空白 (ASCII)
+inline bool isArgSpace(char c) noexcept {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+}
+
+/// 去掉首尾 ASCII 空白
+inline std::string_view trimArgSpace(std::string_view s) noexcept {
+    size_t b = 0, e = s.size();
+    while (b < e && isArgSpace(s[b])) {
+        ++b;
+    }
+    while (e > b && isArgSpace(s[e - 1])) {
+        --e;
+    }
+    return s.substr(b, e - b);
+}
+
+/// 严格整数文本解析: 要求**整个**字符串 (允许首尾空白与一个前导 '+') 都是十进制整数
+/// - 与 `std::stoll` 的区别: 不接受前缀匹配, `"100 lines"` 解析失败而不是得 100
+/// - 溢出同样算失败 (不做回绕截断)
+inline bool parseWholeInteger(std::string_view s, long long& out) {
+    s = trimArgSpace(s);
+    if (s.empty()) {
+        return false;
+    }
+    if (s.front() == '+') {
+        s.remove_prefix(1);
+    }
+    if (s.empty()) {
+        return false;
+    }
+    long long  v = 0;
+    const auto r = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (r.ec != std::errc{} || r.ptr != s.data() + s.size()) {
+        return false;
+    }
+    out = v;
+    return true;
+}
+
+/// 严格浮点文本解析: 要求**整个**字符串 (允许首尾空白与一个前导 '+') 都是十进制数值
+/// - 不接受前缀匹配 (`"1.5 kg"` 解析失败), 也不接受 `0x` 十六进制浮点写法
+/// - `inf`/`nan`/溢出与下溢均算失败
+inline bool parseWholeDouble(std::string_view s, double& out) {
+    s = trimArgSpace(s);
+    if (s.empty()) {
+        return false;
+    }
+    // 拒绝 0x 十六进制浮点 (strtod 支持 "0x1p3" 这类写法, 但参数里出现它多半是模型写错)
+    auto body = s;
+    if (body.front() == '+' || body.front() == '-') {
+        body.remove_prefix(1);
+    }
+    if (body.size() >= 2 && body[0] == '0' && (body[1] == 'x' || body[1] == 'X')) {
+        return false;
+    }
+    std::string tmp(s);
+    char*       end = nullptr;
+    errno           = 0;
+    const double v  = std::strtod(tmp.c_str(), &end);
+    if (end != tmp.c_str() + tmp.size() || errno != 0 || !std::isfinite(v)) {
+        return false;
+    }
+    out = v;
+    return true;
+}
+
+/// 布尔文本解析 (忽略首尾空白与 ASCII 大小写)
+/// - 真: `true` / `yes` / `y` / `on` / `enable` / `enabled` / `1`
+/// - 假: `false` / `no` / `n` / `off` / `disable` / `disabled` / `0`
+/// - 其它文本 (如 `"ok"`) 返回 false 表示“读不到”: 调用方的
+///   `value(k, fallback)` 用默认值、`require<bool>` 报参数错误, 不再静默当成 false
+inline bool parseBoolText(std::string_view s, bool& out) {
+    s = trimArgSpace(s);
+    if (s.empty()) {
+        return false;
+    }
+    std::string lower;
+    lower.reserve(s.size());
+    for (char c : s) {
+        lower.push_back((c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c);
+    }
+    if (lower == "true" || lower == "yes" || lower == "y" || lower == "on"
+        || lower == "enable" || lower == "enabled" || lower == "1") {
+        out = true;
+        return true;
+    }
+    if (lower == "false" || lower == "no" || lower == "n" || lower == "off"
+        || lower == "disable" || lower == "disabled" || lower == "0") {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+/// 浮点 JSON 值 -> 整数目标的取整
+/// - 与向上取整相差不超过 1e-6 时取向上取整 (4.999999999 -> 5), 否则向下取整
+///   (3.7 -> 3, -3.7 -> -4)
+/// - NaN/Inf 与超出 long long 表示范围时返回 false
+inline bool doubleToWholeInteger(double v, long long& out) {
+    if (!std::isfinite(v)) {
+        return false;
+    }
+    constexpr double kRoundEps = 1e-6;
+    const auto       up        = std::ceil(v);
+    const double     rounded   = (up - v <= kRoundEps) ? up : std::floor(v);
+    constexpr double kInt64Min   = -9223372036854775808.0;
+    constexpr double kInt64MaxP1 = 9223372036854775808.0;
+    if (!(rounded >= kInt64Min && rounded < kInt64MaxP1)) {
+        return false;
+    }
+    out = static_cast<long long>(rounded);
+    return true;
+}
+
+/// long long 能否无损放进 T (整数目标类型): 越界时不做强制转换 (避免静默回绕)
+template<typename T>
+inline bool fitsInType(long long v) {
+    if constexpr (std::is_signed_v<T>) {
+        return v >= static_cast<long long>(std::numeric_limits<T>::min())
+               && v <= static_cast<long long>(std::numeric_limits<T>::max());
+    } else {
+        return v >= 0
+               && static_cast<unsigned long long>(v)
+                      <= static_cast<unsigned long long>(std::numeric_limits<T>::max());
+    }
+}
 } // namespace detail
 
+/// 强类型参数提取器: 把工具参数 JSON 按调用方要的类型读出来
+///
+/// 读取时的转换规则 (参数本身不会被改写):
+/// - 字符串 -> 整数/浮点: **整个**字符串都必须是数值 (允许首尾空白与一个前导 '+'),
+///   不接受前缀匹配 (`"100 lines"` 读不到整数); 整数还要落在目标类型范围内
+/// - 字符串 -> 布尔: 忽略大小写与首尾空白, `true`/`yes`/`y`/`on`/`enable`/`enabled`/`1`
+///   为真, `false`/`no`/`n`/`off`/`disable`/`disabled`/`0` 为假; 其它文本“读不到”
+///   (调用方的 `value(k, fallback)` 用默认值、`require<T>` 报参数错误)
+/// - 布尔/数值 -> 其它数值: 按 C++ 隐式转换读; 浮点 -> 整数取“相近整数”
+///   (与向上取整相差不超过 1e-6 时向上取整, 否则向下取整: 3.7 -> 3, -3.7 -> -4), 越界不读
+/// - 任意值 -> 字符串: 非字符串按 `dump()` 文本返回
+/// - 单字符串 -> `std::vector<std::string>`: 包成单元素列表; 数组逐项取 (非字符串项 `dump()`)
+///
+/// 读不到时 `get` 返回 `std::nullopt`、`require` 记一条参数错误 (`ok()` 为 false),
+/// 都不会抛异常出 SDK 边界。
 class ArgReader {
 public:
 
@@ -2098,25 +2245,56 @@ public:
                     return detail::jsonGet<long long>(val) != 0;
                 }
                 if (val.is_string()) {
-                    auto s = detail::jsonGet<std::string>(val);
-                    return s == "true" || s == "1" || s == "yes";
+                    // 忽略大小写认 true/false/1/0; 其它文本视为"读不到"
+                    // (以前一律当 false, 会把 "True"/"enable" 静默变成 false)
+                    bool b = false;
+                    if (detail::parseBoolText(detail::jsonGet<std::string>(val), b)) {
+                        return b;
+                    }
                 }
             } else if constexpr (std::is_integral_v<T>) {
                 if (val.is_number_integer()) {
-                    return static_cast<T>(detail::jsonGet<long long>(val));
+                    const auto v = detail::jsonGet<long long>(val);
+                    if (!detail::fitsInType<T>(v)) {
+                        return std::nullopt;
+                    }
+                    return static_cast<T>(v);
                 }
                 if (val.is_number()) {
-                    return static_cast<T>(detail::jsonGet<double>(val));
+                    // 浮点值 -> 整数: 取相近整数 (3.7 -> 3, 4.999999999 -> 5),
+                    // 越界/NaN 视为读不到 (以前是 static_cast 直接截断/回绕)
+                    long long rounded = 0;
+                    if (!detail::doubleToWholeInteger(detail::jsonGet<double>(val), rounded)
+                        || !detail::fitsInType<T>(rounded)) {
+                        return std::nullopt;
+                    }
+                    return static_cast<T>(rounded);
                 }
                 if (val.is_string()) {
-                    return static_cast<T>(std::stoll(detail::jsonGet<std::string>(val)));
+                    // 严格解析: 整个字符串都必须是整数, 且要落在 T 的取值范围内
+                    // (以前用 std::stoll, "100 lines" 会解析成 100)
+                    long long  parsed = 0;
+                    const auto s      = detail::jsonGet<std::string>(val);
+                    if (!detail::parseWholeInteger(s, parsed) || !detail::fitsInType<T>(parsed)) {
+                        return std::nullopt;
+                    }
+                    return static_cast<T>(parsed);
                 }
             } else if constexpr (std::is_floating_point_v<T>) {
                 if (val.is_number()) {
                     return static_cast<T>(detail::jsonGet<double>(val));
                 }
                 if (val.is_string()) {
-                    return static_cast<T>(std::stod(detail::jsonGet<std::string>(val)));
+                    // 严格解析: 整个字符串都必须是数值 (不允许 "1.5 kg" 这类前缀匹配)
+                    double parsed = 0;
+                    if (!detail::parseWholeDouble(detail::jsonGet<std::string>(val), parsed)) {
+                        return std::nullopt;
+                    }
+                    const auto out = static_cast<T>(parsed);
+                    if (!std::isfinite(static_cast<double>(out))) {
+                        return std::nullopt;
+                    }
+                    return out;
                 }
             } else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
                 if (val.is_array()) {
