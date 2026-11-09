@@ -193,7 +193,18 @@ public:
     std::string infoJson(std::string_view id) const;
 
     /// 自省: 全部频道 (JSON)
-    std::string listJson() const;
+    ///
+    /// `prefix` 非空时只列以它开头的 id。每项带声明、当前值、订阅数与每个订阅的频率。
+    std::string listJson(std::string_view prefix = {}) const;
+
+    /// 订阅数变化的回调: `id` = 频道 id, `subscribers` = 变化后的订阅方数量
+    ///
+    /// 宿主用它发一条只读通知 (订阅 / 退订 / 插件卸载 / 删频道都能看到),
+    /// 应用据此知道"有没有插件在听这个频道"。回调在锁外执行, 可以再发布 / 订阅。
+    using SubscriberChangeCallback = std::function<void(std::string_view id, size_t subscribers)>;
+
+    /// 注入订阅数变化回调 (可空: 传空函数表示取消)
+    void setSubscriberChangeCallback(SubscriberChangeCallback callback);
 
     /// 注入补发定时器 (主程序在启动时调用一次; 见 [BroadcastScheduler])
     void setScheduler(BroadcastScheduler scheduler);
@@ -222,9 +233,13 @@ private:
     /// 排一次补发 (锁外调用; `delayMs` <= 0 时按 0)
     void scheduleFlush(int64_t delayMs);
 
+    /// 把订阅数变化交给回调 (锁外调用)
+    void notifySubscribers(std::string_view id, size_t subscribers) const;
+
     mutable std::mutex                                          mutex_;
     std::map<std::string, BroadcastChannel, std::less<>>        channels_;
     BroadcastScheduler                                          scheduler_;
+    SubscriberChangeCallback                                    subscriberCallback_;
     /// 有没有已经排进调度器的一次补发
     bool                                                        flushArmed_ = false;
 };

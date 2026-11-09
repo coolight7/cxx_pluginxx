@@ -140,9 +140,24 @@ inline BroadcastCache_e broadcastCacheOf(const utilxx_base::Json& j) {
                                               : BroadcastCache_e::None;
 }
 
-inline BroadcastWritable_e broadcastWritableOf(const utilxx_base::Json& j) {
-    return jsonString(j, "writable") == "anyone" ? BroadcastWritable_e::Anyone
-                                                 : BroadcastWritable_e::Owner;
+inline BroadcastPublisher_e broadcastPublishOf(const utilxx_base::Json& j) {
+    return jsonString(j, "publish") == "anyone" ? BroadcastPublisher_e::Anyone
+                                                 : BroadcastPublisher_e::Owner;
+}
+
+/// 订阅频率选项 (`{"intervalMs": 200, "mode": "delay"}`, 缺省 / 非法都退回不限频)
+inline BroadcastSubscribeOptions broadcastSubscribeOptionsOf(const utilxx_base::Json& j) {
+    BroadcastSubscribeOptions out;
+    if (!j.is_object()) {
+        return out;
+    }
+    if (j.contains("intervalMs") && j["intervalMs"].is_number()) {
+        const auto ms = static_cast<int64_t>(j["intervalMs"].get<double>());
+        out.intervalMs = ms > 0 ? ms : 0;
+    }
+    out.mode = jsonString(j, "mode") == "drop" ? BroadcastLimitMode_e::Drop
+                                               : BroadcastLimitMode_e::Delay;
+    return out;
 }
 
 inline BroadcastScope_e broadcastScopeOf(const utilxx_base::Json& j) {
@@ -548,7 +563,7 @@ public:
     // =====================================================================
 
     /// 声明频道 (**IO 线程 / 启动阶段**; JSON 形如
-    /// `{"id": "...", "cache": "latest", "writable": "owner",
+    /// `{"id": "...", "cache": "latest", "publish": "owner",
     ///   "pushOnSubscribe": true, "coalesce": true, "scope": "app"}`)
     int declareBroadcast(InstanceT* inst, std::string_view declJson, std::string* error) {
         detail::ParsedJson parsed = detail::parseJson(declJson);
@@ -596,7 +611,7 @@ public:
             decl.owner = pluginId;
         }
         decl.cache           = detail::broadcastCacheOf(spec);
-        decl.writable        = detail::broadcastWritableOf(spec);
+        decl.publish         = detail::broadcastPublishOf(spec);
         decl.pushOnSubscribe = detail::jsonBool(spec, "pushOnSubscribe", false);
         decl.coalesce        = detail::jsonBool(spec, "coalesce", true);
         decl.scope           = detail::broadcastScopeOf(spec);

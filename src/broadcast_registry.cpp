@@ -124,6 +124,17 @@ bool BroadcastRegistry::publish(
     std::string_view publisher,
     std::string*     error
 ) {
+    // 没有注入调度器 (库被单独使用 / 单元测试): delay 的补发退化为"下一次发布时顺便补"
+    {
+        bool hasScheduler = false;
+        {
+            std::lock_guard lock(mutex_);
+            hasScheduler = static_cast<bool>(scheduler_);
+        }
+        if (!hasScheduler) {
+            flushPending();
+        }
+    }
     /// 这一轮要立刻投递的通知 (回调在锁外执行)
     struct Delivery {
         std::function<void(std::string_view)> handler;
@@ -283,82 +294,119 @@ uint64_t BroadcastRegistry::subscribe(
     if (pushNow && pushHandler) {
         deliverOne(pushHandler, current, id);
     }
+    size_t subscribers = 0;
+    {
+        std::lock_guard lock(mutex_);
+        auto            it = channels_.find(id);
+        if (it != channels_.end()) {
+            subscribers = it->second.subs.size();
+        }
+    }
+    // 订阅数变化 (只读通知; 回调在锁外, 可以再订阅 / 发布)
+    notifySubscribers(id, subscribers);
     return token;
 }
 
 bool BroadcastRegistry::unsubscribe(std::string_view id, uint64_t token) {
-    std::lock_guard lock(mutex_);
-    auto            it = channels_.find(id);
-    if (it == channels_.end()) {
-        return false;
-    }
-    auto&      subs   = it->second.subs;
-    const auto before = subs.size();
-    subs.erase(
-        std::remove_if(
-            subs.begin(),
-            subs.end(),
-            [token](const BroadcastSub& sub) {
-                return sub.token == token;
-            }
-        ),
-        subs.end()
-    );
-    if (before == subs.size()) {
-        return false;
-    }
-    // 没有等补发的订阅了: 这一频道不必再参于补发
-    if (std::none_of(subs.begin(), subs.end(), [](const BroadcastSub& sub) {
-            return sub.hasPending;
-        })) {
-        it->second.flushScheduled = false;
-    }
-    return true;
-}
-
-bool BroadcastRegistry::removeChannel(std::string_view id) {
-    std::lock_guard lock(mutex_);
-    return channels_.erase(std::string{id}) > 0;
-}
-
-size_t BroadcastRegistry::removeSubscriber(std::string_view owner) {
-    std::lock_guard lock(mutex_);
-    size_t          removed = 0;
-    for (auto& [id, channel] : channels_) {
-        (void)id;
-        auto&      subs   = channel.subs;
+    size_t subscribers = 0;
+    {
+        std::lock_guard lock(mutex_);
+        auto            it = channels_.find(id);
+        if (it == channels_.end()) {
+            return false;
+        }
+        auto&      subs   = it->second.subs;
         const auto before = subs.size();
         subs.erase(
             std::remove_if(
                 subs.begin(),
                 subs.end(),
-                [owner](const BroadcastSub& sub) {
-                    return sub.owner == owner;
+                [token](const BroadcastSub& sub) {
+                    return sub.token == token;
                 }
             ),
             subs.end()
         );
-        removed += before - subs.size();
-        if (before != subs.size()
-            && std::none_of(subs.begin(), subs.end(), [](const BroadcastSub& sub) {
-                   return sub.hasPending;
-               })) {
-            channel.flushScheduled = false;
+        if (before == subs.size()) {
+            return false;
         }
+        // 没有等补发的订阅了: 这一频道不必再参于补发
+        if (std::none_of(subs.begin(), subs.end(), [](const BroadcastSub& sub) {
+                return sub.hasPending;
+            })) {
+            it->second.flushScheduled = false;
+        }
+        subscribers = subs.size();
+    }
+    notifySubscribers(id, subscribers);
+    return true;
+}
+
+bool BroadcastRegistry::removeChannel(std::string_view id) {
+    const std::string key{id};
+    {
+        std::lock_guard lock(mutex_);
+        if (channels_.erase(key) == 0) {
+            return false;
+        }
+    }
+    notifySubscribers(key, 0);
+    return true;
+}
+
+size_t BroadcastRegistry::removeSubscriber(std::string_view owner) {
+    size_t                                    removed = 0;
+    std::vector<std::pair<std::string, size_t>> changed;
+    {
+        std::lock_guard lock(mutex_);
+        for (auto& [id, channel] : channels_) {
+            auto&      subs   = channel.subs;
+            const auto before = subs.size();
+            subs.erase(
+                std::remove_if(
+                    subs.begin(),
+                    subs.end(),
+                    [owner](const BroadcastSub& sub) {
+                        return sub.owner == owner;
+                    }
+                ),
+                subs.end()
+            );
+            if (before == subs.size()) {
+                continue;
+            }
+            removed += before - subs.size();
+            if (std::none_of(subs.begin(), subs.end(), [](const BroadcastSub& sub) {
+                    return sub.hasPending;
+                })) {
+                channel.flushScheduled = false;
+            }
+            changed.emplace_back(id, subs.size());
+        }
+    }
+    for (const auto& [id, subscribers] : changed) {
+        notifySubscribers(id, subscribers);
     }
     return removed;
 }
 
 size_t BroadcastRegistry::removeChannelsOwnedBy(std::string_view owner) {
-    std::lock_guard lock(mutex_);
-    size_t          removed = 0;
-    for (auto it = channels_.begin(); it != channels_.end();) {
-        if (!it->second.decl.isAppChannel() && it->second.decl.owner == owner) {
-            it = channels_.erase(it);
-            ++removed;
-            continue;
+    size_t                   removed = 0;
+    std::vector<std::string> removedIds;
+    {
+        std::lock_guard lock(mutex_);
+        for (auto it = channels_.begin(); it != channels_.end();) {
+            if (!it->second.decl.isAppChannel() && it->second.decl.owner == owner) {
+                removedIds.push_back(it->first);
+                it = channels_.erase(it);
+                ++removed;
+                continue;
+            }
+            ++it;
         }
-        ++it;
+    }
+    for (const std::string& id : removedIds) {
+        notifySubscribers(id, 0);
     }
     return removed;
 }
@@ -407,18 +455,30 @@ std::string BroadcastRegistry::infoJson(std::string_view id) const {
     return j.dump();
 }
 
-std::string BroadcastRegistry::listJson() const {
+std::string BroadcastRegistry::listJson(std::string_view prefix) const {
     std::lock_guard lock(mutex_);
     auto            out   = utilxx_base::Json::object();
     auto            items = utilxx_base::Json::array();
     for (const auto& [id, channel] : channels_) {
+        if (!prefix.empty() && id.rfind(prefix, 0) != 0) {
+            continue;
+        }
         auto item            = utilxx_base::Json::object();
         item["id"]           = id;
         item["cache"]        = cacheName(channel.decl.cache);
         item["publish"]      = publisherName(channel.decl.publish);
         item["scope"]        = scopeName(channel.decl.scope);
+        item["owner"]        = channel.decl.isAppChannel() ? std::string{"app"} : channel.decl.owner;
         item["subscribers"]  = static_cast<int64_t>(channel.subs.size());
         item["hasValue"]     = channel.hasLatest;
+        if (channel.decl.cache == BroadcastCache_e::Latest && channel.hasLatest) {
+            // 当前值原样嵌进 JSON; 不是合法 JSON 的载荷按文本给出
+            try {
+                item["value"] = utilxx_base::Json::parse(channel.latest);
+            } catch (...) {
+                item["value"] = channel.latest;
+            }
+        }
         items.push_back(item);
     }
     out["broadcasts"] = items;
@@ -428,6 +488,29 @@ std::string BroadcastRegistry::listJson() const {
 void BroadcastRegistry::setScheduler(BroadcastScheduler scheduler) {
     std::lock_guard lock(mutex_);
     scheduler_ = std::move(scheduler);
+}
+
+void BroadcastRegistry::setSubscriberChangeCallback(SubscriberChangeCallback callback) {
+    std::lock_guard lock(mutex_);
+    subscriberCallback_ = std::move(callback);
+}
+
+void BroadcastRegistry::notifySubscribers(std::string_view id, size_t subscribers) const {
+    SubscriberChangeCallback callback;
+    {
+        std::lock_guard lock(mutex_);
+        callback = subscriberCallback_;
+    }
+    if (!callback) {
+        return;
+    }
+    try {
+        callback(id, subscribers);
+    } catch (const std::exception& e) {
+        XX_LOGW("Broadcast `{}` subscriber callback threw: {}", id, e.what());
+    } catch (...) {
+        XX_LOGW("Broadcast `{}` subscriber callback threw: unknown exception", id);
+    }
 }
 
 void BroadcastRegistry::flushPending() {

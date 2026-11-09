@@ -472,7 +472,7 @@ struct GenericTableEntries {
             // 引用含借用视图: 投递前复制为自有的 id/seq (库内部结构)
             auto              keep    = call;
             const std::string id      = svToStr(*broadcast_id);
-            const std::string options = pluginxx_scope_ref_ok(options_json)
+            const std::string options = (options_json && options_json->data)
                                             ? svToStr(*options_json)
                                             : std::string{};
             PluginxxScopeRef  scopeCopy{};
