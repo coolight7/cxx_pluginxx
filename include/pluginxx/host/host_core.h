@@ -219,7 +219,7 @@ public:
     // capabilities 表 (声明 / 登记 / 撤销 / 调用 / 自省)
     // =====================================================================
 
-    /// 广播注册表 (主程序把状态镜像 / 业务事件写进它)
+    /// 广播注册表 (主程序把自己的状态与业务通知发布到它)
     std::shared_ptr<BroadcastRegistry> broadcasts() const {
         return broadcasts_;
     }
