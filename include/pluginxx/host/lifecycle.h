@@ -1219,6 +1219,8 @@ protected:
         }
 
         // 注册由插件 start 事务重新声明: 主程序只负责投递并处理结果 (失败则回到 Disabled)。
+        // 依赖本插件的那些实例在本次 start 完成后才启用 —— 它们的 start 往往
+        // 直接用本插件的能力/工具, 早跑会拿到“能力不存在” (见 [requestStartForEnable])。
         requestStartForEnable(inst);
         XX_LOGI(
             "{}Plugin `{}` enabled ({})",
@@ -1226,8 +1228,14 @@ protected:
             inst->name,
             userInitiated ? "user" : "dependency"
         );
+    }
 
-        // 级联恢复因本插件被禁用的依赖者（不覆盖用户显式禁用）。
+    /// 级联恢复因本插件被禁用而跟着停用的依赖者 (不覆盖用户显式禁用)
+    /// - 必须在被依赖那一方 start 成功之后调: 子插件的 start 通常就要用它的能力
+    void resumeDependents(const InstancePtr& inst) {
+        if (!inst || !inst->enabled) {
+            return;
+        }
         for (const auto& child :
              collectReverseRequiredDeps(this->plugins_, inst->name, /*onlyEnabled=*/false)) {
             enableImpl(child, /*userInitiated=*/false);
@@ -1273,8 +1281,16 @@ protected:
     }
 
     /// 按需投递启用事务（导出 start 的插件）。
+    ///
+    /// 依赖本插件的实例在本事务结束后才级联启用: 它们的 start 往往直接使用
+    /// 本插件的能力/工具, 在本插件重新声明之前就跑会拿到“能力不存在”。
     void requestStartForEnable(const InstancePtr& inst) {
-        if (!inst || !inst->lifecycleStart) {
+        if (!inst) {
+            return;
+        }
+        if (!inst->lifecycleStart) {
+            // 没有 start 可投: 直接级联
+            resumeDependents(inst);
             return;
         }
         auto self = selfRef();
@@ -1287,6 +1303,8 @@ protected:
                     if (inst->enabled) {
                         co_await self->onInstanceEnabledAsync(inst);
                     }
+                    // start 成功才级联: 失败时本插件的注册已撤净, 子插件跟着启用也只会失败
+                    self->resumeDependents(inst);
                 },
                 [inst, tag = std::string{logTag()}](std::exception_ptr e) {
                     if (!e) {

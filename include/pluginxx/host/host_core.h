@@ -92,7 +92,7 @@ inline std::string abiViewToString(const PluginxxStringView& sv) {
 
 /// `id` 是否以给定的官方前缀开头 (前缀形如 `<应用名>.`; 空前缀恒为 false)
 ///
-/// 纯函数供测试与工具使用; 宿主内部用 [PluginHostCore::isOfficialId] (前缀可配)。
+/// 纯函数供测试与工具使用; 主程序内部用 [PluginHostCore::isOfficialId] (前缀可配)。
 inline bool isOfficialIdWithPrefix(std::string_view id, std::string_view prefix) {
     return !prefix.empty() && id.rfind(prefix, 0) == 0;
 }
@@ -167,13 +167,13 @@ inline BroadcastScope_e broadcastScopeOf(const utilxx_base::Json& j) {
 
 } // namespace detail
 
-/// 一条功能埋点的声明 (点 = 能力 id + 同名广播频道)
+/// 一条功能扩展点的声明 (点 = 能力 id + 同名广播频道)
 ///
-/// 埋点是比“能力”更宽的一层说法: 核心走到一个位置时
+/// 扩展点是比“能力”更宽的一层说法: 核心走到一个位置时
 /// - 调用能力链拿结果 / 补丁 (`impl = true`, 声明为 `impls: many` + `merge: first`);
 /// - 往同名频道发一条广播 (`notify = true`), 只看不影响的订阅方靠它。
 ///
-/// 两边都可以关: 只取值的埋点把 `notify` 关掉, 只通知的埋点把 `impl` 关掉。
+/// 两边都可以关: 只取值的扩展点把 `notify` 关掉, 只通知的扩展点把 `impl` 关掉。
 struct PluginPointDecl {
     std::string          id;                    ///< 全名 (`<应用名>.…` 或 `plugin.<插件>.…`)
     bool                 impl           = true; ///< 开放实现行
@@ -209,7 +209,7 @@ public:
     ///
     /// - 默认取构建期注入的应用名 (`pluginxx::appIdPrefix()`, 由 CMake 变量
     ///   `PLUGINXX_APP_NAME` 决定);
-    /// - 宿主拿到预编译库、改不了构建宏时, 在管理器构造时用它覆盖。
+    /// - 主程序拿到预编译库、改不了构建宏时, 在管理器构造时用它覆盖。
     void setOfficialPrefix(std::string_view prefix) {
         officialPrefix_.assign(prefix);
     }
@@ -241,7 +241,7 @@ public:
         return broadcasts_;
     }
 
-    /// 换成主程序自己的广播注册表 (应用侧预声明频道时用; 不换就用默认的一份)
+    /// 换成主程序自己的广播注册表 (主程序预声明频道时用; 不换就用默认的一份)
     void setBroadcastRegistry(std::shared_ptr<BroadcastRegistry> registry) {
         if (registry) {
             broadcasts_ = std::move(registry);
@@ -255,7 +255,7 @@ public:
 
     /// 登记 / 声明一条能力 (**IO 线程**)
     /// - `spec.id` 以 `<应用名>.` 开头: 给应用声明过的能力提供实现, 阶段必须在声明里开放;
-    /// - 其它写法: 插件自己的名字, 宿主补成 `plugin.<本插件 id>.<名字>`, 未声明时按
+    /// - 其它写法: 插件自己的名字, 主程序补成 `plugin.<本插件 id>.<名字>`, 未声明时按
     ///   `spec.impls` / `spec.merge` / `spec.phases` 声明;
     /// - `impls: one` 的 impl 行后登记 (含跨插件) 整体覆盖, `impls: many` 多行共存。
     int registerCapability(
@@ -292,7 +292,7 @@ public:
         const bool        appOwned = this->isOfficialId(rawId);
         if (!appOwned && detail::isPluginScopedId(rawId)
             && !detail::isIdOfPlugin(rawId, pluginId)) {
-            // 写全名时只能占自己的命名空间 (短名由宿主补全, 不会走到这里)
+            // 写全名时只能占自己的命名空间 (短名由主程序补全, 不会走到这里)
             return fail(
                 PLUGINXX_RESULT_ERR_PERMISSION,
                 "register_capability: `" + rawId + "` is not in `plugin." + pluginId + ".`"
@@ -306,7 +306,7 @@ public:
 
         std::string declError;
         if (!capabilities_->declares(fullId) && appOwned) {
-            // 官方 id 的声明由应用负责。宿主自己有一份权威声明表时（本项目是生成物
+            // 官方 id 的声明由应用负责。主程序自己有一份权威声明表时（本项目是生成物
             // `capability_ids.g.h`）先补一条应用声明，免得再开一条"应用下发声明"的通道。
             CapabilityDecl appDecl;
             if (appCapabilityDecl(fullId, &appDecl)) {
@@ -358,7 +358,7 @@ public:
         if (!capabilities_->addProvider(fullId, row, &rowError)) {
             return fail(PLUGINXX_RESULT_ERR_ARG, rowError);
         }
-        // 派生宿主把这一行接进自己的派发表（例如主程序的钩子引擎）。
+        // 派生主程序把这一行接进自己的派发表（例如主程序的钩子引擎）。
         // 它拒绝时要把刚加的行撤掉，不能留下"注册表有、派发表没有"的半条登记。
         const int32_t attachRc = onCapabilityRowAdded(inst, fullId, spec, &rowError);
         if (attachRc != PLUGINXX_RESULT_OK) {
@@ -550,13 +550,24 @@ public:
                 }
             }
             // 调用方为空 = 主程序（应用）自己发起: 不挂任何实例租约
+            //
+            // 调用方是插件时，这里挂的就是调用方自己的租约，且**允许它处于关闭中**:
+            // 插件在 stop 事务里仍要能调能力 (通知另一个插件撤销自己的资源)。
+            // 被调一方由每一行各自把关，不受此开关影响。
             const auto newOperation = [&](std::string label) {
-                return owner ? OpCore::create(this->runtime(), owner, nullptr, std::move(label))
+                return owner ? OpCore::create(
+                                   this->runtime(),
+                                   owner,
+                                   nullptr,
+                                   std::move(label),
+                                   /*lifecycle=*/false,
+                                   /*callerMayStop=*/true
+                               )
                              : OpCore::createDetached(this->runtime(), std::move(label));
             };
             if (rows.empty()) {
                 /// 应用实现的能力（声明由应用给出、没有插件实现行）: 派发前把调用
-                /// 交给派生宿主转给应用（应用实现的能力就是这种）。完成与取消都
+                /// 交给派生主程序转给应用（应用实现的能力就是这种）。完成与取消都
                 /// 复用同一套 Operation 协议。
                 core = newOperation("capability " + cap);
                 core->setCallback(cb, ud);
@@ -628,10 +639,10 @@ public:
     }
 
     // =====================================================================
-    // 功能埋点 (point): 能力声明 + 同名广播频道
+    // 功能扩展点 (point): 能力声明 + 同名广播频道
     // =====================================================================
 
-    /// 声明一个功能埋点 (**启动阶段 / IO 线程**)
+    /// 声明一个功能扩展点 (**启动阶段 / IO 线程**)
     ///
     /// - `impl`: 声明为 `impls: many` + `merge: first` + 只开放 `impl` 阶段
     ///   (第一个给出非空结果的行生效; 没有行 = 没意见);
@@ -680,7 +691,7 @@ public:
         return ok;
     }
 
-    /// 结束一个埋点的流 (**IO 线程**; 没有同名频道时视为已经结束)
+    /// 结束一个扩展点的流 (**IO 线程**; 没有同名频道时视为已经结束)
     bool endPoint(std::string_view pointId, std::string_view reasonJson, std::string* error = nullptr) {
         if (!broadcasts_->declares(pointId)) {
             return true;
@@ -688,14 +699,14 @@ public:
         return broadcasts_->end(pointId, reasonJson, std::string{}, error);
     }
 
-    /// 发一次埋点 (**IO 线程**; 完成回调恰好一次)
+    /// 发一次扩展点 (**IO 线程**; 完成回调恰好一次)
     ///
     /// 顺序:
     /// 1. 通知面: 往同名频道发一条广播 (未声明该频道就跳过; 失败只记日志);
     /// 2. 实现面: 按 `scope` 调能力链 (只跑 `impl` 阶段; `merge: first`)。
     ///    没有任何实现行时直接按 `OK` + `null` 完成 ("没人实现 = 没意见"),
     ///    不把“没声明”和“没人实现”两种情形推给调用方去区分;
-    /// 3. 埋点本身没声明时返回 nullptr 并写 `error_out`。
+    /// 3. 扩展点本身没声明时返回 nullptr 并写 `error_out`。
     ///
     /// 调用方是主程序自己: 不挂任何实例租约 (见 [OpCore::createDetached])。
     PluginxxOperatorHandle* emitPointAsync(
@@ -1307,9 +1318,9 @@ public:
 
 protected:
 
-    /// 一条能力实现行登记成功后的挂接点（派生宿主把业务派发表接进来时用）
+    /// 一条能力实现行登记成功后的挂接点（派生主程序把业务派发表接进来时用）
     ///
-    /// 默认什么都不做（纯 pluginxx 宿主只记注册表）。返回非 0 时调用方会撤销刚加的
+    /// 默认什么都不做（纯 pluginxx 主程序只记注册表）。返回非 0 时调用方会撤销刚加的
     /// 实现行并把原因返回给插件 —— 用于"这个 id 我认识，但这次登记不合法"这类判定
     /// （例如钩子只接受同步处理器）。
     virtual int onCapabilityRowAdded(
@@ -1328,7 +1339,7 @@ protected:
     /// 一条能力实现行撤销后的挂接点（与 [onCapabilityRowAdded] 成对）
     ///
     /// 实例卸载 / 停用走的是一次性清理（`unregisterInstanceCapabilities`），那里不逐行
-    /// 回调：派生宿主的业务表按实例整体清（主程序是 `clearPluginRegistrations`）。
+    /// 回调：派生主程序的业务表按实例整体清（主程序是 `clearPluginRegistrations`）。
     virtual void onCapabilityRowRemoved(
         InstanceT*         inst,
         const std::string& id,
@@ -1339,10 +1350,10 @@ protected:
         (void)ownerTag;
     }
 
-    /// 官方 id（`<应用名>.*`）的声明来源（宿主自己有一份权威表时用）
+    /// 官方 id（`<应用名>.*`）的声明来源（主程序自己有一份权威表时用）
     ///
-    /// `register_capability` 对官方 id 要求"应用已声明"。宿主在 [out] 里填好声明并
-    /// 返回 true 时，调用方会把它登记成应用声明；返回 false 表示宿主也不知道，
+    /// `register_capability` 对官方 id 要求"应用已声明"。主程序在 [out] 里填好声明并
+    /// 返回 true 时，调用方会把它登记成应用声明；返回 false 表示主程序也不知道，
     /// 按原来的规则拒绝。
     virtual bool appCapabilityDecl(std::string_view id, CapabilityDecl* out) {
         (void)id;
@@ -1353,7 +1364,7 @@ protected:
     /// 应用实现的能力被调用时把调用接走（能力由应用声明、没有插件实现行）
     ///
     /// 应用实现的能力（`runner: app`）没有插件提供者，所以派发前先把
-    /// 调用交给派生宿主：宿主把它转给应用，应用回答后调 `notify->done` 恰好一次。
+    /// 调用交给派生主程序：主程序把它转给应用，应用回答后调 `notify->done` 恰好一次。
     /// 返回的句柄只用于取消（为空表示不可取消）；返回空、没 done 也没写 `error_out`
     /// 时调用方按"没人接"拒绝。只在 IO 线程调用。`timeoutMs` 是声明里的超时（0 = 不设）。
     virtual void* onAppCapabilityStart(
@@ -1466,7 +1477,9 @@ protected:
                         host->runtime(),
                         provider,
                         caller,
-                        "capability " + capability
+                        "capability " + capability,
+                        /*lifecycle=*/false,
+                        /*callerMayStop=*/true
                     );
                 } catch (const std::exception& e) {
                     XX_LOGW(
@@ -1498,14 +1511,18 @@ protected:
                     input = wrapper.dump();
                 }
                 const std::string capCopy = capability;
+                // 调用方的主程序视图: 提供者要“代表调用方”做事时必须用它
+                // (典型场景: JS 引擎把脚本里的注册挂到调用方插件实例上)。
+                // 主程序自己发起时为 nullptr。
+                const PluginxxHost* callerHost = caller ? caller->hostView() : nullptr;
                 OpDrive           drive;
-                drive.start = [row, input, capCopy](
+                drive.start = [row, input, capCopy, callerHost](
                                   const PluginxxOperatorNotify* notify,
                                   PluginxxString*               error
                               ) -> void* {
                     const auto idView   = detail::abiView(capCopy);
                     const auto argsView = detail::abiView(input);
-                    return row.start(row.ctx, nullptr, &idView, &argsView, notify, error);
+                    return row.start(row.ctx, callerHost, &idView, &argsView, notify, error);
                 };
                 drive.cancel = [row](void* opHandle) {
                     if (row.cancel) {

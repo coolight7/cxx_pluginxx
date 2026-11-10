@@ -145,7 +145,7 @@ public:
     /// 补发任务的调度器: `delayMs` 之后在主程序线程上执行 `task`
     ///
     /// 注册表自己不计时: 没有注入调度器时 (库被单独使用 / 单元测试) `delay` 模式的补发
-    /// 退化为"下一次发布时顺便补", 主程序 (宿主) 一定会注入 (`asio::steady_timer`)。
+    /// 退化为"下一次发布时顺便补", 主程序 (主程序) 一定会注入 (`asio::steady_timer`)。
     using BroadcastScheduler = std::function<void(int64_t delayMs, std::function<void()> task)>;
 
     /// 声明一个频道
@@ -206,7 +206,7 @@ public:
     /// 退订某个订阅方的全部订阅 (插件卸载/禁用); 返回撤销数量
     size_t removeSubscriber(std::string_view owner);
 
-    /// 删除一个频道 (插件撤销声明 / 宿主清理); 命中返回 true
+    /// 删除一个频道 (插件撤销声明 / 主程序清理); 命中返回 true
     bool removeChannel(std::string_view id);
 
     /// 结束一条流 (属主或应用可结束)
@@ -241,7 +241,7 @@ public:
 
     /// 订阅数变化的回调: `id` = 频道 id, `subscribers` = 变化后的订阅方数量
     ///
-    /// 宿主用它发一条只读通知 (订阅 / 退订 / 插件卸载 / 删频道都能看到),
+    /// 主程序用它发一条只读通知 (订阅 / 退订 / 插件卸载 / 删频道都能看到),
     /// 应用据此知道"有没有插件在听这个频道"。回调在锁外执行, 可以再发布 / 订阅。
     using SubscriberChangeCallback = std::function<void(std::string_view id, size_t subscribers)>;
 

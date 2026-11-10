@@ -28,7 +28,7 @@
 - 代码侧: `PLUGINXX_APP_ID("log")` → `PLUGINXX_APP_NAME "." "log"` (见 `pluginxx/api/app.h`),
   `PLUGINXX_IFACE_LOG` 等 10 个 IID 宏都用它拼;
 - 构建侧: CMake 缓存变量 `PLUGINXX_APP_NAME` (默认 `pluginxx` = 库自己就是应用),
-  以 PUBLIC 编译定义下发给所有使用方 —— 宿主与插件看到同一个值;
+  以 PUBLIC 编译定义下发给所有使用方 —— 主程序与插件看到同一个值;
   **主程序必须覆盖**, 例如 `-DPLUGINXX_APP_NAME=your_app`;
 - 运行侧: 官方标识前缀还有一个可覆盖入口 `PluginHostCore::setOfficialPrefix()`,
   给"用预编译库、改不了构建宏"的接入方式用;
@@ -36,7 +36,7 @@
 - 应用名与表名都可以含点 (`com.foo` + `capabilities` → `com.foo.capabilities`),
   **不做格式检查**: IID 只做整串比较, 官方标识只做前缀比较。
 
-宿主与插件用不同应用名编译时, 插件按 `<自己以为的应用名>.<表名>` 查不到表。
+主程序与插件用不同应用名编译时, 插件按 `<自己以为的应用名>.<表名>` 查不到表。
 `queryGenericPluginIface` 遇到这种 IID (以 `.<已知表名>` 结尾) 会记一条 "应用名不一致" 的日志。
 
 ## 目录结构

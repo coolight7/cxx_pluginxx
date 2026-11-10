@@ -119,7 +119,7 @@ typedef struct PluginxxBroadcastsIface {
     /// - `decl_json` 形如
     ///   `{"id": "...", "cache": "latest", "publish": "owner",
     ///     "pushOnSubscribe": true, "coalesce": true, "scope": "app"}`
-    ///   (`id` 可用短名: 宿主补成 `plugin.<本插件 id>.<名字>`);
+    ///   (`id` 可用短名: 主程序补成 `plugin.<本插件 id>.<名字>`);
     /// - 应用已声明的 id 不能被插件改写; 插件自己的 id 后声明者覆盖;
     /// - 失败返回 [PLUGINXX_RESULT_ERR_ARG] / [PLUGINXX_RESULT_ERR_PERMISSION] 并写 `error_out`
     int32_t(PLUGINXX_CALL* declare_broadcast)(
@@ -205,14 +205,14 @@ typedef struct PluginxxBroadcastsIface {
 #define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE \
     (offsetof(PluginxxCapabilitiesIface, invoke_capability_ex))
 
-/// 一次能力登记 (插件 → 宿主)
+/// 一次能力登记 (插件 → 主程序)
 ///
 /// 两种写法 (`id` 只看前缀, 不反解):
 /// 1. 给应用声明过的能力提供实现: 写全名 (`<应用名>.*`), `impls` / `merge` / `phases` 忽略;
-/// 2. 声明/实现自己的能力: 写短名 (可含点), 宿主补成 `plugin.<本插件 id>.<名字>`,
+/// 2. 声明/实现自己的能力: 写短名 (可含点), 主程序补成 `plugin.<本插件 id>.<名字>`,
 ///    `impls` 必填 (以一行的 `phases` 说明开放哪些阶段)。
 typedef struct PluginxxCapabilitySpec {
-    int32_t  version;      ///< 插件填 PLUGINXX_API_VERSION (与宿主一致)
+    int32_t  version;      ///< 插件填 PLUGINXX_API_VERSION (与主程序一致)
     uint32_t struct_size;  ///< sizeof(PluginxxCapabilitySpec)
 
     PluginxxStringView id;        ///< 全名或短名 (见上)
@@ -236,7 +236,7 @@ typedef struct PluginxxCapabilitiesIface {
     int32_t  version; ///< 主程序填 PLUGINXX_IFACE_CAPABILITIES_VERSION
     uint32_t struct_size;
 
-    /// 登记 / 声明 (**任意线程**; 宿主投递到 IO 线程执行)
+    /// 登记 / 声明 (**任意线程**; 主程序投递到 IO 线程执行)
     /// - `spec->id` 为空、阶段未开放、`impls` 自相矛盾时拒绝并写 `error_out`;
     /// - `impls: one` 的 impl 行后登记 (含跨插件) 整体覆盖; `impls: many` 多行共存
     int32_t(PLUGINXX_CALL* register_capability)(

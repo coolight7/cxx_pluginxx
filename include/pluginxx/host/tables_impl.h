@@ -750,7 +750,10 @@ struct GenericTableEntries {
         PluginxxString*           error_out
     ) {
         return guardVtableCall<PluginxxOperatorHandle*>(nullptr, [&]() {
-            auto call = enterHost(host);
+            // 插件在 stop 事务里也要能调能力 (典型场景: 通知另一个插件卸载自己的资源);
+            // 因此允许调用方实例处于关闭中 —— 租约仍由 OpCore 把关
+            // (调用方租约按 callerMayStop 放宽, 被调一方仍按严格判定)
+            auto call = enterHost(host, /*allowClosing=*/true);
             auto mgr  = call.manager();
             auto inst = call.instance();
             if (!mgr || !inst || detail::abiViewEmpty(capability_id)) {
@@ -1165,7 +1168,7 @@ inline bool looksLikeGenericTableIid(std::string_view iid) {
 
 /// 按 IID 查询**通用表** (未命中返回 nullptr, 主程序继续查自己的业务表)
 /// - 覆盖 10 张通用表; IID 为编译期常量字符串, 比较用 string_view (不构造临时串)
-/// - 未命中但形如 `<别的应用名>.<通用表名>` 时记一条日志: 宿主与插件必须用同一个
+/// - 未命中但形如 `<别的应用名>.<通用表名>` 时记一条日志: 主程序与插件必须用同一个
 ///   应用名 (`PLUGINXX_APP_NAME`) 编译, 否则插件拿不到表 (只提示, 不改行为)
 template<typename InstanceT, typename ManagerT>
 const void* queryGenericPluginIface(std::string_view iid) {
@@ -1206,7 +1209,7 @@ const void* queryGenericPluginIface(std::string_view iid) {
             "pluginxx",
             "query_interface: `" + std::string{iid} + "` 未命中; 本进程的通用表 IID 以 `"
                 + std::string{pluginxx::appIdPrefix()}
-                + "` 开头 —— 宿主与插件必须用同一个应用名 (PLUGINXX_APP_NAME) 编译"
+                + "` 开头 —— 主程序与插件必须用同一个应用名 (PLUGINXX_APP_NAME) 编译"
         );
     }
     return nullptr;

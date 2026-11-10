@@ -53,7 +53,7 @@ std::string BroadcastRegistry::validateDecl(const BroadcastDecl& decl) {
     }
     if (decl.scope == BroadcastScope_e::System
         && decl.publish != BroadcastPublisher_e::Owner) {
-        // 调试/自省频道只由宿主发布, 插件写成 anyone 只会在发布时被拒
+        // 调试/自省频道只由主程序发布, 插件写成 anyone 只会在发布时被拒
         return "broadcast `" + decl.id + "`: system scope requires publish: owner";
     }
     if (decl.pushOnSubscribe && decl.cache != BroadcastCache_e::Latest) {

@@ -107,33 +107,44 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
     };
 
     /// 创建时先登记到 runtime，再交给插件。等待者取消不影响 runtime 的持有。
+    ///
+    /// - `lifecycle`: 生命周期操作 (start/stop)。停用中的实例仍必须能收到 stop，
+    ///   关闭中的实例仍必须能收到 stop，因此两侧都放行"关闭中"，Closed 仍拒绝；
+    /// - `callerMayStop`: 调用方可能正在自己的 stop 事务里 (典型场景: 插件在 stop 中
+    ///   调能力通知另一个插件撤销自己的资源)。此时**只**放行调用方，被调一方仍按
+    ///   严格判定；调用方为空时 [provider] 就是发起方自己，按调用方处理。
+    ///
+    /// 两个开关都只放宽到"关闭中"：实例进入 Closed 后 lease 仍拿不到，避免 operator
+    /// 落到已经 dlclose 的插件代码上。
     static std::shared_ptr<OpCore> create(
         std::shared_ptr<PluginRuntime>             runtime,
         const std::shared_ptr<PluginInstanceBase>& provider,
         const std::shared_ptr<PluginInstanceBase>& caller,
         std::string                                label,
-        bool                                       lifecycle = false
+        bool                                       lifecycle     = false,
+        bool                                       callerMayStop = false
     ) {
-        // 生命周期操作 (start/stop) 正是状态切换本身：停用中的实例仍必须能收到
-        // stop，关闭中的实例仍必须能收到 stop。因此这里只对业务操作检查
-        // `enabled`/可注册状态，生命周期操作交给 enable_closing 的 lease 把关
-        // (Closed 仍会拒绝)，见 InstanceLifetime::tryAcquire。
+        // 没有独立调用方时，provider 就是发起方 (能力调用的外层操作只挂调用方租约)
+        const bool relaxProvider = lifecycle || (callerMayStop && !caller);
         if (!runtime || !runtime->executor || !provider
-            || (!lifecycle
+            || (!relaxProvider
                 && (!provider->enabled
                     || (provider->lifetime && !provider->lifetime->acceptsRegistration())))) {
             throw std::runtime_error("plugin operation rejected: provider is closed or disabled");
         }
-        auto core       = std::shared_ptr<OpCore>(new OpCore(std::move(runtime), std::move(label)));
-        core->provider_ = std::make_shared<PluginInstanceBase::InflightGuard>(provider, lifecycle);
+        auto core = std::shared_ptr<OpCore>(new OpCore(std::move(runtime), std::move(label)));
+        core->provider_
+            = std::make_shared<PluginInstanceBase::InflightGuard>(provider, relaxProvider);
         if (!*core->provider_) {
             throw std::runtime_error("plugin operation rejected: provider is closing");
         }
         if (caller) {
-            if (!caller->enabled) {
+            const bool relaxCaller = lifecycle || callerMayStop;
+            if (!relaxCaller && !caller->enabled) {
                 throw std::runtime_error("plugin operation rejected: caller is disabled");
             }
-            core->caller_ = std::make_shared<PluginInstanceBase::InflightGuard>(caller, lifecycle);
+            core->caller_
+                = std::make_shared<PluginInstanceBase::InflightGuard>(caller, relaxCaller);
             if (!*core->caller_) {
                 throw std::runtime_error("plugin operation rejected: caller is closing");
             }

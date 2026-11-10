@@ -37,7 +37,7 @@ public:
     }
 
     /// 实例名 → 插件 id (默认相同; 主程序有"实例名前缀"时覆盖它)
-    /// - 用途: 插件用短名声明/实现自己的能力时, 宿主拼出 `plugin.<插件 id>.<名字>` 的全名
+    /// - 用途: 插件用短名声明/实现自己的能力时, 主程序拼出 `plugin.<插件 id>.<名字>` 的全名
     virtual std::string pluginId(std::string_view instanceName) {
         return std::string{instanceName};
     }
