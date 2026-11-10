@@ -95,10 +95,13 @@ extern "C" {
 /// v1: 频道声明 + 发布 + 订阅 + 读当前值 (取代 `pluginxx.events` v3)
 /// v2: `subscribe_broadcast` 多一个 `options_json` (每个订阅方自己声明通知频率);
 ///     声明字段 `writable` 改名 `publish`, 宏改成 `PLUGINXX_BROADCAST_PUBLISH_*`
-#define PLUGINXX_IFACE_BROADCASTS_VERSION     2
+/// v3: 表尾追加 `end_broadcast` (属主结束一条流) 与 `subscribe_broadcast_ex`
+///     (订阅时带结束回调); 基线不变, 调用点用 `ifaceHas` 判定
+#define PLUGINXX_IFACE_BROADCASTS_VERSION     3
 #define PLUGINXX_IFACE_BROADCASTS_MIN_VERSION 2
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
-#define PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE sizeof(PluginxxBroadcastsIface)
+#define PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE \
+    (offsetof(PluginxxBroadcastsIface, end_broadcast))
 
 /// 广播的通用结果码 (v1 起; 与主程序自己的错误码分开, 只在 uint 范围内比较)
 #define PLUGINXX_RESULT_OK               0
@@ -106,6 +109,7 @@ extern "C" {
 #define PLUGINXX_RESULT_ERR_NOT_DECLARED -2 ///< 频道/能力没有声明
 #define PLUGINXX_RESULT_ERR_PERMISSION  -3 ///< 没有发布权限 (非属主 / 系统频道)
 #define PLUGINXX_RESULT_ERR_NO_VALUE    -4 ///< 没有当前值 (cache: none 或还没写过)
+#define PLUGINXX_RESULT_ERR_ENDED       -5 ///< 流已结束 (发布 / 读取 / 订阅都被拒)
 
 typedef struct PluginxxBroadcastsIface {
     int32_t  version; ///< 主程序填 PLUGINXX_IFACE_BROADCASTS_VERSION
@@ -159,6 +163,34 @@ typedef struct PluginxxBroadcastsIface {
 
     /// 撤销订阅 (**幂等**, 任意线程)
     void(PLUGINXX_CALL* unsubscribe_broadcast)(PluginxxSubscription* sub);
+
+    /// 结束一条流 (追加成员, v3)
+    ///
+    /// - `writer` 由框架按调用实例的插件 id 代; 应用自己结束走 C++ 层
+    ///   (`PluginHostCore::endBroadcast`) 或传空的 writer;
+    /// - 结束后: 发布返回 [PLUGINXX_RESULT_ERR_ENDED]、`read` 也返回它、
+    ///   全部订阅按 `on_end` 回调一次并摧除;
+    /// - 重复结束是幂等成功; 再次 `declare` 同一个 id = 开一条新流。
+    int32_t(PLUGINXX_CALL* end_broadcast)(
+        const PluginxxHost*       host,
+        const PluginxxStringView* broadcast_id,
+        const PluginxxStringView* reason_json,
+        PluginxxString*           error_out
+    );
+
+    /// 订阅 (带流结束回调; 追加成员, v3)
+    ///
+    /// 与 [subscribe_broadcast] 只差 `on_end`: 频道被结束时用 reason JSON 回调一次。
+    PluginxxSubscription*(PLUGINXX_CALL* subscribe_broadcast_ex)(
+        const PluginxxHost*       host,
+        const PluginxxScopeRef*   scope,
+        const PluginxxStringView* broadcast_id,
+        void(PLUGINXX_CALL* handler)(const PluginxxStringView* payload_json, void* ud),
+        void(PLUGINXX_CALL* on_end)(const PluginxxStringView* reason_json, void* ud),
+        void*                     ud,
+        const PluginxxStringView* options_json,
+        PluginxxString*           error_out
+    );
 } PluginxxBroadcastsIface;
 
 /* ==================== 接口表: 能力 (<应用名>.capabilities) ==================== */
@@ -166,7 +198,8 @@ typedef struct PluginxxBroadcastsIface {
 #define PLUGINXX_IFACE_CAPABILITIES       PLUGINXX_APP_ID("capabilities")
 /// v4: 声明 + 多实现行 (阶段 / 优先级 / 合并), 取代 v3 的"唯一提供者"
 /// v5: 表尾追加 `invoke_capability_ex` (带本次调用的超时), 基线与最低版本不变
-#define PLUGINXX_IFACE_CAPABILITIES_VERSION     5
+/// v6: 表尾追加 `unregister_capability_ex` (按作用域注销一条实现行), 基线不变
+#define PLUGINXX_IFACE_CAPABILITIES_VERSION     6
 #define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 4
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
 #define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE \
@@ -269,6 +302,17 @@ typedef struct PluginxxCapabilitiesIface {
         PluginxxOperatorCallback  cb,
         void*                     ud,
         PluginxxString*           error_out
+    );
+
+    /// 注销**指定作用域**上的一条实现行 (追加成员, v6)
+    ///
+    /// 与 [unregister_capability] 的差别: 那个是本实例的全部作用域, 这个是给定作用域的
+    /// 那一行 —— 同一个插件被多个作用域各挂载一次时用它只撤其中一份。
+    int32_t(PLUGINXX_CALL* unregister_capability_ex)(
+        const PluginxxHost*       host,
+        const PluginxxScopeRef*   scope,
+        const PluginxxStringView* capability_id,
+        const PluginxxStringView* owner_tag
     );
 } PluginxxCapabilitiesIface;
 

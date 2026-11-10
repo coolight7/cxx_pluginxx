@@ -9,11 +9,17 @@
 ///   同步还是异步、启动回调、取消回调与上下文。
 ///
 /// 覆盖规则 (后登记的覆盖先登记的):
-/// - `impls: one` 的 **impl 行**只有一个: 跨插件也覆盖, 并记一条日志写清谁覆盖了谁;
+/// - `impls: one` 的 **impl 行**每个作用域只有一个: 同作用域内跨插件也覆盖, 并记一条日志
+///   写清谁覆盖了谁; 不同作用域各留一行 (一个插件被多个 agent 挂载时, 每个 agent 自己一份);
 ///   `before` / `after` 是干预链, 多个插件可以各登记一行, 只有同 `provider` +
-///   `ownerTag` + 阶段重复登记才覆盖 (否则"只让插件改输入/输出"的埋点就只能有一个插件用)。
-/// - `impls: many` 的所有阶段都可多行共存, 只有同 `provider` + `ownerTag` + 阶段重复登记才覆盖。
+///   `scopeId` + `ownerTag` + 阶段重复登记才覆盖 (否则"只让插件改输入/输出"的埋点就只能有一个插件用)。
+/// - `impls: many` 的所有阶段都可多行共存, 覆盖键同上。
 /// - 归属跟着新登记行走: 卸载时按行里的 `provider` 筛, 不会删掉覆盖者的行。
+///
+/// 作用域 ([CapabilityProvider::scopeId]): 登记时带的作用域标识 (主程序定义, 例如 agent id)。
+/// - 空 = 进程级, 对所有作用域生效;
+/// - 非空 = 只在"调用方给的 scope 相同"时参与 (见 [CapabilityRegistry::rowsOf] 的三参形态);
+/// - 一个作用域拆除时用 [CapabilityRegistry::removeScope] 一次清完。
 ///
 /// 线程约定: 仅主程序 IO 线程读写 (与插件注册事务同一串行上下文), 因此内部不加锁。
 ///
@@ -95,6 +101,7 @@ struct CapabilityDecl {
 /// 一条实现行
 struct CapabilityProvider {
     std::string                     provider; ///< 插件实例名 (与 manifest 的 name 一致)
+    std::string                     scopeId;  ///< 登记时的作用域 (空 = 进程级, 对所有作用域生效)
     std::string                     ownerTag; ///< 同一插件内区分多个处理器 (可空)
     CapabilityPhase_e               phase    = CapabilityPhase_e::Impl;
     int32_t                         priority = 0; ///< 小者先
@@ -170,6 +177,17 @@ public:
         std::string_view ownerTag
     );
 
+    /// 注销一条 (provider, 作用域, ownerTag) 的行, 不限阶段
+    ///
+    /// ABI 的 `unregister_capability_ex` 走这里: 同一个插件被多个作用域各挂载一次时,
+    /// 只撤指定作用域那一行。命中返回 true。
+    bool unregisterScopedProvider(
+        std::string_view id,
+        std::string_view provider,
+        std::string_view scopeId,
+        std::string_view ownerTag
+    );
+
     /// 兼容入口: 注销该插件在这个 id 上的全部行 (含 before / after)
     /// - 槽位没有行之后: 插件声明的删掉, 应用声明的保留 (声明是权威来源)
     bool unregisterCapability(std::string_view name, std::string_view provider);
@@ -198,6 +216,18 @@ public:
         CapabilityPhase_e phase
     ) const;
 
+    /// 某阶段的行, 只保留"对这个作用域生效"的 (空作用域的行 + 同作用域的行)
+    ///
+    /// `scopeId` 为空 = 不过滤 (与两参形态相同)。
+    std::vector<const CapabilityProvider*> rowsOf(
+        std::string_view  id,
+        CapabilityPhase_e phase,
+        std::string_view  scopeId
+    ) const;
+
+    /// 移除某个作用域登记的全部行 (挂载拆除时一次清完); 返回移除的行数
+    size_t removeScope(std::string_view scopeId);
+
     /// 自省: 一条能力的声明与实现行 (JSON)
     std::string infoJson(std::string_view id) const;
 
@@ -221,6 +251,9 @@ private:
     /// 按 (阶段顺序, priority, seq) 排序; after 与 before 都保持"登记链顺序",
     /// 执行方决定 before 正序 / after 逆序
     static void sortRows(std::vector<CapabilityProvider>& rows);
+
+    /// 一行是否对给定作用域生效 (空作用域的行对谁都生效; 给空 scope 表示不过滤)
+    static bool rowInScope(const CapabilityProvider& row, std::string_view scopeId);
 
     /// 重算 `CapabilitySlot::first` (行变化后调用)
     static void refreshFirst(CapabilitySlot& slot);

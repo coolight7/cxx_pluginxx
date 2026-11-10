@@ -22,6 +22,27 @@ _Static_assert(
     "PluginxxStringView::size 必须是 8 字节定长类型"
 );
 
+/* 追加成员必须真的在表尾: 基线（老主程序可见的部分）止于第一个追加成员。
+   改动布局时这里会先报错, 比运行期“读到别人的内存”更早发现。 */
+_Static_assert(
+    PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE
+        == offsetof(PluginxxBroadcastsIface, end_broadcast),
+    "broadcasts 基线必须止于第一个追加成员"
+);
+_Static_assert(
+    PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE
+        == offsetof(PluginxxCapabilitiesIface, invoke_capability_ex),
+    "capabilities 基线必须止于第一个追加成员"
+);
+_Static_assert(
+    PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE < sizeof(PluginxxBroadcastsIface),
+    "broadcasts 必须真的追加了成员"
+);
+_Static_assert(
+    PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE < sizeof(PluginxxCapabilitiesIface),
+    "capabilities 必须真的追加了成员"
+);
+
 /* 入口符号名由主程序提供 (插件框架不定义主程序专名, 见 pluginxx/api/entry.h):
    这里不再校验具体符号名, 改为在 C++ 侧校验主程序扩展点 (entrySymbols) 的语义 */
 

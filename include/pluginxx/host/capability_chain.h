@@ -58,14 +58,17 @@ inline void mergeJsonPatch(utilxx_base::Json& target, const utilxx_base::Json& p
 }
 
 /// 把某个阶段的行按执行顺序追加到 `out` (after 倒序; 同一阶段内按 priority、登记顺序)
+///
+/// `scopeId` 非空时只取对它有作用的行 (空作用域的行 + 同作用域的行); 空 = 不过滤。
 inline void appendStage(
     std::vector<CapabilityProvider>& out,
     const CapabilityRegistry&        registry,
     std::string_view                 id,
     CapabilityPhase_e                phase,
-    bool                             reverse
+    bool                             reverse,
+    std::string_view                 scopeId = {}
 ) {
-    auto rows = registry.rowsOf(id, phase);
+    auto rows = registry.rowsOf(id, phase, scopeId);
     if (reverse) {
         for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
             out.push_back(**it);

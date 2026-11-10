@@ -104,6 +104,14 @@ bool BroadcastRegistry::declare(const BroadcastDecl& inDecl, std::string* error)
         channel.latest.clear();
         channel.hasLatest = false;
     }
+    if (channel.ended) {
+        // 再声明同一个 id = 开一条新流: 清掉结束标记与上一段的值
+        channel.ended = false;
+        channel.endReason.clear();
+        channel.latest.clear();
+        channel.hasLatest = false;
+        XX_LOGI("BroadcastRegistry: broadcast `{}` re-opened after end", inDecl.id);
+    }
     return true;
 }
 
@@ -152,6 +160,12 @@ bool BroadcastRegistry::publish(
             return false;
         }
         BroadcastChannel& channel = it->second;
+        if (channel.ended) {
+            if (error) {
+                *error = "broadcast `" + std::string{id} + "` is ended";
+            }
+            return false;
+        }
         if (channel.decl.scope == BroadcastScope_e::System && !publisher.empty()) {
             if (error) {
                 *error = "broadcast `" + std::string{id} + "` is a system channel";
@@ -234,8 +248,8 @@ bool BroadcastRegistry::publish(
 bool BroadcastRegistry::read(std::string_view id, std::string* out) const {
     std::lock_guard lock(mutex_);
     auto            it = channels_.find(id);
-    if (it == channels_.end() || it->second.decl.cache != BroadcastCache_e::Latest
-        || !it->second.hasLatest) {
+    if (it == channels_.end() || it->second.ended
+        || it->second.decl.cache != BroadcastCache_e::Latest || !it->second.hasLatest) {
         return false;
     }
     if (out) {
@@ -248,6 +262,17 @@ uint64_t BroadcastRegistry::subscribe(
     std::string_view                      id,
     std::string_view                      owner,
     std::function<void(std::string_view)> handler,
+    const BroadcastSubscribeOptions&      options,
+    std::string*                          error
+) {
+    return subscribe(id, owner, std::move(handler), {}, options, error);
+}
+
+uint64_t BroadcastRegistry::subscribe(
+    std::string_view                      id,
+    std::string_view                      owner,
+    std::function<void(std::string_view)> handler,
+    std::function<void(std::string_view)> onEnd,
     const BroadcastSubscribeOptions&      options,
     std::string*                          error
 ) {
@@ -271,11 +296,18 @@ uint64_t BroadcastRegistry::subscribe(
             return 0;
         }
         BroadcastChannel& channel = it->second;
+        if (channel.ended) {
+            if (error) {
+                *error = "broadcast `" + std::string{id} + "` is ended";
+            }
+            return 0;
+        }
         token                     = ++channel.nextToken;
         BroadcastSub added;
         added.token = token;
         added.owner.assign(owner.data(), owner.size());
         added.handler    = handler;
+        added.onEnd      = std::move(onEnd);
         added.intervalMs = options.intervalMs > 0 ? options.intervalMs : 0;
         added.mode       = options.mode == BroadcastLimitMode_e::Drop
                                ? BroadcastLimitMode_e::Drop
@@ -305,6 +337,80 @@ uint64_t BroadcastRegistry::subscribe(
     // 订阅数变化 (只读通知; 回调在锁外, 可以再订阅 / 发布)
     notifySubscribers(id, subscribers);
     return token;
+}
+
+bool BroadcastRegistry::end(
+    std::string_view id,
+    std::string_view reasonJson,
+    std::string_view writer,
+    std::string*     error
+) {
+    std::vector<std::function<void(std::string_view)>> endings;
+    const std::string                                  reason{reasonJson};
+    {
+        std::lock_guard lock(mutex_);
+        auto            it = channels_.find(id);
+        if (it == channels_.end()) {
+            if (error) {
+                *error = "broadcast `" + std::string{id} + "` is not declared";
+            }
+            return false;
+        }
+        BroadcastChannel& channel = it->second;
+        // 属主或应用才能结束; 插件不能结束别人的频道 (含应用频道)
+        if (!writer.empty() && channel.decl.owner != writer) {
+            if (error) {
+                *error = "broadcast `" + std::string{id} + "` is owned by `"
+                         + (channel.decl.owner.empty() ? std::string{"app"}
+                                                       : channel.decl.owner)
+                         + "`";
+            }
+            XX_LOGW(
+                "BroadcastRegistry: `{}` cannot end broadcast `{}` owned by `{}`",
+                writer,
+                id,
+                channel.decl.owner.empty() ? "app" : channel.decl.owner
+            );
+            return false;
+        }
+        if (channel.ended) {
+            return true; // 幂等
+        }
+        channel.ended    = true;
+        channel.endReason = reason;
+        channel.latest.clear();
+        channel.hasLatest      = false;
+        channel.flushScheduled = false;
+        endings.reserve(channel.subs.size());
+        for (BroadcastSub& sub : channel.subs) {
+            if (sub.onEnd) {
+                endings.push_back(std::move(sub.onEnd));
+            }
+        }
+        channel.subs.clear();
+        XX_LOGI("BroadcastRegistry: broadcast `{}` ended ({} subscriber(s))", id, endings.size());
+    }
+    // 结束回调在锁外执行 (回调里可以再声明 / 订阅)
+    for (auto& callback : endings) {
+        if (!callback) {
+            continue;
+        }
+        try {
+            callback(std::string_view{reason});
+        } catch (const std::exception& e) {
+            XX_LOGW("Broadcast `{}` end handler threw: {}", id, e.what());
+        } catch (...) {
+            XX_LOGW("Broadcast `{}` end handler threw unknown exception", id);
+        }
+    }
+    notifySubscribers(id, 0);
+    return true;
+}
+
+bool BroadcastRegistry::isEnded(std::string_view id) const {
+    std::lock_guard lock(mutex_);
+    auto            it = channels_.find(id);
+    return it != channels_.end() && it->second.ended;
 }
 
 bool BroadcastRegistry::unsubscribe(std::string_view id, uint64_t token) {
@@ -439,6 +545,10 @@ std::string BroadcastRegistry::infoJson(std::string_view id) const {
     j["owner"] = channel.decl.isAppChannel() ? std::string{"app"} : channel.decl.owner;
     j["subscribers"] = static_cast<int64_t>(channel.subs.size());
     j["hasValue"]    = channel.hasLatest;
+    j["ended"]       = channel.ended;
+    if (!channel.endReason.empty()) {
+        j["endReason"] = channel.endReason;
+    }
     if (!channel.lastPublisher.empty()) {
         j["lastPublisher"] = channel.lastPublisher;
     }
@@ -471,6 +581,9 @@ std::string BroadcastRegistry::listJson(std::string_view prefix) const {
         item["owner"]        = channel.decl.isAppChannel() ? std::string{"app"} : channel.decl.owner;
         item["subscribers"]  = static_cast<int64_t>(channel.subs.size());
         item["hasValue"]     = channel.hasLatest;
+        if (channel.ended) {
+            item["ended"] = true;
+        }
         if (channel.decl.cache == BroadcastCache_e::Latest && channel.hasLatest) {
             // 当前值原样嵌进 JSON; 不是合法 JSON 的载荷按文本给出
             try {

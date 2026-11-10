@@ -38,6 +38,8 @@
 
 namespace pluginxx {
 
+/// 一次 Operation 的 ABI 句柄 (定义在 `pluginxx/runtime/op_driver.h`)
+struct PluginxxOperatorHandle;
 using RuntimeErrorCode = utilxx_base::AsioErrorCode;
 
 struct PluginRuntime;
@@ -385,6 +387,14 @@ struct PluginRuntime {
     std::deque<std::shared_ptr<RuntimeAction>>  pendingActions;
     uint64_t                                    nextOperationId = 1;
     uint64_t                                    nextGeneration  = 1;
+
+    /// 无主操作 (主程序自己发起、没有实例租约) 的句柄保活表
+    ///
+    /// 普通的 Operation 由所属实例的 `operatorHandles` 保活; 无主操作没有实例, 而调用方
+    /// 手里的裸指针要能安全地再传给取消入口 (已完成时是空操作), 所以由运行时自己保活。
+    /// 只在 IO 线程读写; 长度超过 [kDetachedHandleKeep] 时先清已完成项。
+    std::vector<std::shared_ptr<PluginxxOperatorHandle>> detachedHandles;
+    static constexpr size_t                              kDetachedHandleKeep = 512;
 
     /// 尚未终结（未提交完成）的 Operation 摘要，形如 `label#id, label#id`。
     ///

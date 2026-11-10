@@ -25,7 +25,7 @@ cmake_policy(SET CMP0091 NEW)
 cmake_policy(SET CMP0144 NEW)
 cmake_policy(SET CMP0167 OLD)
 
-set(PLUGINXX_VERSION "0.2.0")
+set(PLUGINXX_VERSION "0.3.0")
 project(cxx_pluginxx VERSION ${PLUGINXX_VERSION} LANGUAGES C CXX)
 
 # 插件 API 契约版本: 代码里 (pluginxx/api/abi.h) 的默认值是 1 —— 本库被多个

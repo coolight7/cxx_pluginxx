@@ -175,6 +175,50 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
         return handle_.get();
     }
 
+    /// 创一个**没有实例租约**的操作 (主程序自己发起的调用用)
+    ///
+    /// 与 [create] 的区别: 不挂 provider / caller 的 InflightGuard, 因此:
+    /// - 不受任何插件实例的启停影响 (不会因为某插件被禁用而中途断掉);
+    /// - 调用方负责在停机前先取消它们, 不能留下"没人等也没人取消"的操作;
+    /// - 仍然登记到 `runtime->operations` (以便统计与取消), 且完成/取消仍恒在 IO 线程。
+    static std::shared_ptr<OpCore> createDetached(
+        std::shared_ptr<PluginRuntime> runtime,
+        std::string                    label
+    ) {
+        if (!runtime || !runtime->executor) {
+            throw std::runtime_error("detached operation rejected: runtime is not available");
+        }
+        auto core = std::shared_ptr<OpCore>(new OpCore(std::move(runtime), std::move(label)));
+        core->handle_             = std::make_shared<PluginxxOperatorHandle>();
+        core->completionEndpoint_ = std::make_shared<PluginxxOperationCompletionEndpoint>();
+        core->completionEndpoint_->operation = core;
+        core->handle_->completionEndpoint    = core->completionEndpoint_;
+        core->handle_->runtime               = core->runtime_;
+        core->handle_->executor              = core->runtime_->executor;
+        core->handle_->cancelFn              = [weak = std::weak_ptr<OpCore>(core)] {
+            if (auto operation = weak.lock()) {
+                operation->cancel();
+            }
+        };
+        core->id_ = core->runtime_->nextOperationId++;
+        try {
+            std::lock_guard runtimeLock(core->runtime_->operationsMutex);
+            core->runtime_->operations.emplace(core->id_, core);
+        } catch (...) {
+            core->releaseRecords();
+            throw;
+        }
+        // 没有实例替它保活句柄: 放进运行时的保活表 (已完成项在下一次扩展时清掉)
+        auto& keep = core->runtime_->detachedHandles;
+        if (keep.size() >= PluginRuntime::kDetachedHandleKeep) {
+            std::erase_if(keep, [](const std::shared_ptr<PluginxxOperatorHandle>& handle) {
+                return handle && handle->completed.load(std::memory_order_acquire);
+            });
+        }
+        keep.push_back(core->handle_);
+        return core;
+    }
+
     uint64_t id() const noexcept {
         return id_;
     }

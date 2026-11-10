@@ -505,6 +505,89 @@ struct GenericTableEntries {
         guardVtableCallVoid([&] { unsubscribePluginBroadcast(sub); });
     }
 
+    /// `end_broadcast` (追加成员, v3): 属主结束一条流
+    static int32_t PLUGINXX_CALL broadcastEndEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* broadcast_id,
+        const PluginxxStringView* reason_json,
+        PluginxxString*           error_out
+    ) {
+        if (detail::abiViewEmpty(broadcast_id)) {
+            detail::setErrorString(error_out, "end_broadcast: missing id");
+            return PLUGINXX_RESULT_ERR_ARG;
+        }
+        const std::string id     = svToStr(*broadcast_id);
+        const std::string reason = reason_json ? svToStr(*reason_json) : std::string{};
+        return detail::onInstanceIo<InstanceT, ManagerT>(
+            host,
+            [id, reason, error_out](InstanceT* inst, ManagerT* mgr) {
+                std::string local;
+                const int32_t rc = mgr->endBroadcastFrom(inst, id, reason, &local);
+                if (rc != PLUGINXX_RESULT_OK) {
+                    detail::setErrorString(error_out, local);
+                }
+                return rc;
+            }
+        );
+    }
+
+    /// `subscribe_broadcast_ex` (追加成员, v3): 多一个结束回调
+    ///
+    /// 结束回调的租赁保护与普通回调一致: `on_end` 在注册表锁外、在实例执行 lease 下调用
+    /// (句柄的 `alive` 标志在摧销后立即失活, 不再回调已卸载的插件)。
+    static PluginxxSubscription* PLUGINXX_CALL broadcastSubscribeExEntry(
+        const PluginxxHost*       host,
+        const PluginxxScopeRef*   scope,
+        const PluginxxStringView* broadcast_id,
+        void(PLUGINXX_CALL* handler)(const PluginxxStringView* payload_json, void* ud),
+        void(PLUGINXX_CALL* on_end)(const PluginxxStringView* reason_json, void* ud),
+        void*                     ud,
+        const PluginxxStringView* options_json,
+        PluginxxString*           error_out
+    ) {
+        return guardVtableCall<PluginxxSubscription*>(nullptr, [&]() {
+            auto call = enterHost(host);
+            auto mgr  = call.manager();
+            auto inst = call.instance();
+            if (!mgr || !inst || detail::abiViewEmpty(broadcast_id) || !handler) {
+                detail::setErrorString(
+                    error_out,
+                    "subscribe_broadcast: missing instance, id, or handler"
+                );
+                return static_cast<PluginxxSubscription*>(nullptr);
+            }
+            auto              keep    = call;
+            const std::string id      = svToStr(*broadcast_id);
+            const std::string options = (options_json && options_json->data)
+                                            ? svToStr(*options_json)
+                                            : std::string{};
+            PluginxxScopeRef  scopeCopy{};
+            const bool        hasScope = pluginxx_scope_ref_ok(scope) && scope;
+            if (hasScope) {
+                scopeCopy = *scope;
+            }
+            auto* sub = ioCallSyncKeep<PluginxxSubscription*>(
+                keep,
+                mgr,
+                [keep, hasScope, scopeCopy, id, options, handler, on_end, ud]() {
+                    return keep.manager()->subscribeBroadcast(
+                        keep.instance(),
+                        hasScope ? &scopeCopy : nullptr,
+                        id,
+                        handler,
+                        ud,
+                        options,
+                        on_end
+                    );
+                }
+            );
+            if (!sub) {
+                detail::setErrorString(error_out, "subscribe_broadcast: rejected");
+            }
+            return sub;
+        });
+    }
+
     static int32_t PLUGINXX_CALL broadcastReadEntry(
         const PluginxxHost*       host,
         const PluginxxStringView* broadcast_id,
@@ -588,6 +671,36 @@ struct GenericTableEntries {
             host,
             [id, tag](InstanceT* inst, ManagerT* mgr) {
                 return mgr->unregisterCapability(inst, id, tag);
+            }
+        );
+    }
+
+    /// `unregister_capability_ex` (追加成员, v6): 按作用域注销一条实现行
+    static int32_t PLUGINXX_CALL capabilityUnregisterExEntry(
+        const PluginxxHost*       host,
+        const PluginxxScopeRef*   scope,
+        const PluginxxStringView* capability_id,
+        const PluginxxStringView* owner_tag
+    ) {
+        if (detail::abiViewEmpty(capability_id)) {
+            return PLUGINXX_RESULT_ERR_ARG;
+        }
+        const std::string id  = svToStr(*capability_id);
+        const std::string tag = owner_tag ? svToStr(*owner_tag) : std::string{};
+        PluginxxScopeRef  scopeCopy{};
+        const bool        hasScope = pluginxx_scope_ref_ok(scope) && scope;
+        if (hasScope) {
+            scopeCopy = *scope;
+        }
+        return detail::onInstanceIo<InstanceT, ManagerT>(
+            host,
+            [id, tag, hasScope, scopeCopy](InstanceT* inst, ManagerT* mgr) {
+                return mgr->unregisterScopedCapability(
+                    inst,
+                    hasScope ? &scopeCopy : nullptr,
+                    id,
+                    tag
+                );
             }
         );
     }
@@ -962,6 +1075,8 @@ struct GenericTableEntries {
             &broadcastSubscribeEntry,
             &broadcastReadEntry,
             &broadcastUnsubscribeEntry,
+            &broadcastEndEntry,
+            &broadcastSubscribeExEntry,
         };
         return iface;
     }
@@ -977,6 +1092,7 @@ struct GenericTableEntries {
             &capabilityListEntry,
             &opCancelEntry,
             &capabilityInvokeExEntry,
+            &capabilityUnregisterExEntry,
         };
         return iface;
     }

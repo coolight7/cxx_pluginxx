@@ -11,9 +11,16 @@
 /// 三条语义:
 /// 1. `cache: latest` 只保证"最后一次到达": 同一频道重复发布时缓存只留最后一份,
 ///    订阅方拿到的是最新值 (中间值不再补发); `cache: none` 没有当前值, 也不能 `read`。
-/// 2. **广播只有读与订阅**: 没有"给别人的频道写值"这个操作, 也没有回执; 要改属主的状态
+/// 2. **广播只有读与订阅**: 没有"给别人的频道写值"这个操作, 也没有回执; 要改属主的 状态
 ///    由属主暴露成能力 (调用方发请求、属主给结果)。
 /// 3. 订阅互不等待: 一个订阅抛异常只记日志, 不影响属主与其它订阅。
+///
+/// 流结束 ([BroadcastRegistry::end]): 一个频道可以表示"一段有限的东西" (一次任务的结果流、
+/// 一次会话的通知流)。属主 (或应用) 调 `end` 之后:
+/// - 发布一律被拒 (主程序返回 `PLUGINXX_RESULT_ERR_ENDED`);
+/// - `read` 也不再给值 (已结束的流没有"当前值");
+/// - 全部订阅立即摧除, 各自的 `onEnd` 回调恰好一次;
+/// - 再次 `declare` 同一个 id = 开一条新流 (清掉结束标记与缓存)。
 ///
 /// 订阅频率限制 ([BroadcastSubscribeOptions]): 每个订阅方自己声明通知间隔与模式,
 /// 互不影响。状态存在 [BroadcastSub] 上, 补发由 [BroadcastRegistry::flushPending] 完成
@@ -101,8 +108,10 @@ struct BroadcastDecl {
 /// 一个订阅 (含这个订阅方自己的限频状态)
 struct BroadcastSub {
     uint64_t                              token = 0;
-    std::string                           owner; ///< 订阅方 (插件名; 空 = 宿主)
+    std::string                           owner; ///< 订阅方 (插件名; 空 = 苛主)
     std::function<void(std::string_view)> handler;
+    /// 流结束时的回调 (可空): 参数是 `end` 给的 reason JSON
+    std::function<void(std::string_view)> onEnd;
 
     // ---- 限频状态 (每个订阅一份, 互不影响) ----
     int64_t              intervalMs  = 0;                  ///< 0 = 不限频
@@ -119,6 +128,10 @@ struct BroadcastChannel {
     std::string               latest;    ///< 最后一个值 (cache: latest)
     bool                      hasLatest = false;
     std::string               lastPublisher; ///< 最近一次发布的属主 (自省用)
+    /// 流是否已结束 (结束后不再接受发布与读取; 再次 declare 清除)
+    bool                      ended = false;
+    /// `end` 给的 reason JSON (自省用)
+    std::string               endReason;
     uint64_t                  nextToken = 0;
     std::vector<BroadcastSub> subs;
     /// 这个频道还有等补发的订阅, 且已经排进这一轮补发
@@ -174,6 +187,19 @@ public:
         std::string*                          error   = nullptr
     );
 
+    /// 订阅 (带流结束回调)
+    ///
+    /// 与上一个形态只差 `onEnd`: 频道被 `end` 时用 reason JSON 回调一次, 该订阅随即摧除。
+    /// 已结束的频道不接受新订阅 (返回 0, `error` 写原因)。
+    uint64_t subscribe(
+        std::string_view                      id,
+        std::string_view                      owner,
+        std::function<void(std::string_view)> handler,
+        std::function<void(std::string_view)> onEnd,
+        const BroadcastSubscribeOptions&      options = {},
+        std::string*                          error   = nullptr
+    );
+
     /// 退订 (幂等); 命中返回 true
     bool unsubscribe(std::string_view id, uint64_t token);
 
@@ -182,6 +208,22 @@ public:
 
     /// 删除一个频道 (插件撤销声明 / 宿主清理); 命中返回 true
     bool removeChannel(std::string_view id);
+
+    /// 结束一条流 (属主或应用可结束)
+    ///
+    /// - `writer` 是执行方: 空 = 应用, 非空 = 插件 id (必须与频道属主一致);
+    /// - 结束后: 发布被拒、`read` 不给值、全部订阅摧除并逐个回调 `onEnd`;
+    /// - 重复 `end` 是幂等成功;
+    /// - 返回 false 表示频道不存在或没权限, 原因写 `error`。
+    bool end(
+        std::string_view id,
+        std::string_view reasonJson,
+        std::string_view writer,
+        std::string*     error = nullptr
+    );
+
+    /// 这条流是否已结束 (未声明的频道返回 false)
+    bool isEnded(std::string_view id) const;
 
     /// 删除某个插件的频道并撤销其订阅 (插件卸载); 返回删除的频道数
     size_t removeChannelsOwnedBy(std::string_view owner);

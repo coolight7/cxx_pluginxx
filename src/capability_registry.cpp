@@ -18,15 +18,19 @@ int phaseOrder(CapabilityPhase_e phase) noexcept {
     return 3;
 }
 
-bool sameRow(const CapabilityProvider& row, std::string_view provider, std::string_view ownerTag,
-             CapabilityPhase_e phase) {
-    return row.provider == provider && row.ownerTag == ownerTag && row.phase == phase;
+bool sameRow(const CapabilityProvider& row, std::string_view provider, std::string_view scopeId,
+             std::string_view ownerTag, CapabilityPhase_e phase) {
+    return row.provider == provider && row.scopeId == scopeId && row.ownerTag == ownerTag
+           && row.phase == phase;
 }
 
 /// 把行里的阶段写进 JSON (自省用)
 utilxx_base::Json rowJson(const CapabilityProvider& row) {
     auto j          = utilxx_base::Json::object();
     j["provider"]   = row.provider;
+    if (!row.scopeId.empty()) {
+        j["scope"] = row.scopeId;
+    }
     if (!row.ownerTag.empty()) {
         j["ownerTag"] = row.ownerTag;
     }
@@ -192,11 +196,12 @@ bool CapabilityRegistry::addProvider(
         stored.seq = slot.nextSeq++;
     }
 
-    // impls: one 的 impl 行只有一个: 后登记的 (含跨插件) 整体覆盖
+    // impls: one 的 impl 行每个作用域只有一个: 同作用域内后登记的 (含跨插件) 整体覆盖
     if (slot.decl.impls == CapabilityImpls_e::One
         && stored.phase == CapabilityPhase_e::Impl) {
         for (const auto& existing : slot.rows) {
-            if (existing.phase == CapabilityPhase_e::Impl) {
+            if (existing.phase == CapabilityPhase_e::Impl
+                && existing.scopeId == stored.scopeId) {
                 XX_LOGI(
                     "CapabilityRegistry: capability `{}` impl replaced ({} -> {})",
                     id,
@@ -210,14 +215,15 @@ bool CapabilityRegistry::addProvider(
             std::remove_if(
                 slot.rows.begin(),
                 slot.rows.end(),
-                [](const CapabilityProvider& existing) {
-                    return existing.phase == CapabilityPhase_e::Impl;
+                [&stored](const CapabilityProvider& existing) {
+                    return existing.phase == CapabilityPhase_e::Impl
+                           && existing.scopeId == stored.scopeId;
                 }
             ),
             slot.rows.end()
         );
     } else {
-        // 同 provider + ownerTag + 阶段 = 同一行的重新登记 (等于替换)
+        // 同 provider + 作用域 + ownerTag + 阶段 = 同一行的重新登记 (等于替换)
         slot.rows.erase(
             std::remove_if(
                 slot.rows.begin(),
@@ -226,6 +232,7 @@ bool CapabilityRegistry::addProvider(
                     return sameRow(
                         existing,
                         stored.provider,
+                        stored.scopeId,
                         stored.ownerTag,
                         stored.phase
                     );
@@ -295,7 +302,7 @@ bool CapabilityRegistry::unregisterProvider(
             rows.begin(),
             rows.end(),
             [&](const CapabilityProvider& row) {
-                return sameRow(row, provider, ownerTag, phase);
+                return sameRow(row, provider, row.scopeId, ownerTag, phase);
             }
         ),
         rows.end()
@@ -324,6 +331,36 @@ bool CapabilityRegistry::unregisterProvider(
             rows.end(),
             [&](const CapabilityProvider& row) {
                 return row.provider == provider && row.ownerTag == ownerTag;
+            }
+        ),
+        rows.end()
+    );
+    if (before == rows.size()) {
+        return false;
+    }
+    refreshFirst(it->second);
+    return true;
+}
+
+bool CapabilityRegistry::unregisterScopedProvider(
+    std::string_view id,
+    std::string_view provider,
+    std::string_view scopeId,
+    std::string_view ownerTag
+) {
+    auto it = caps_.find(id);
+    if (it == caps_.end()) {
+        return false;
+    }
+    auto&      rows   = it->second.rows;
+    const auto before = rows.size();
+    rows.erase(
+        std::remove_if(
+            rows.begin(),
+            rows.end(),
+            [&](const CapabilityProvider& row) {
+                return row.provider == provider && row.scopeId == scopeId
+                       && row.ownerTag == ownerTag;
             }
         ),
         rows.end()
@@ -452,6 +489,59 @@ std::vector<const CapabilityProvider*> CapabilityRegistry::rowsOf(
         }
     }
     return out;
+}
+
+std::vector<const CapabilityProvider*> CapabilityRegistry::rowsOf(
+    std::string_view  id,
+    CapabilityPhase_e phase,
+    std::string_view  scopeId
+) const {
+    std::vector<const CapabilityProvider*> out;
+    auto                                   it = caps_.find(id);
+    if (it == caps_.end()) {
+        return out;
+    }
+    for (const auto& row : it->second.rows) {
+        if (row.phase == phase && rowInScope(row, scopeId)) {
+            out.push_back(&row);
+        }
+    }
+    return out;
+}
+
+size_t CapabilityRegistry::removeScope(std::string_view scopeId) {
+    if (scopeId.empty()) {
+        return 0;
+    }
+    size_t removed = 0;
+    for (auto it = caps_.begin(); it != caps_.end();) {
+        auto&      slot   = it->second;
+        const auto before = slot.rows.size();
+        slot.rows.erase(
+            std::remove_if(
+                slot.rows.begin(),
+                slot.rows.end(),
+                [scopeId](const CapabilityProvider& row) {
+                    return row.scopeId == scopeId;
+                }
+            ),
+            slot.rows.end()
+        );
+        removed += before - slot.rows.size();
+        if (slot.rows.empty() && !slot.decl.isAppDeclaration()) {
+            it = caps_.erase(it);
+            continue;
+        }
+        if (before != slot.rows.size()) {
+            refreshFirst(slot);
+        }
+        ++it;
+    }
+    return removed;
+}
+
+bool CapabilityRegistry::rowInScope(const CapabilityProvider& row, std::string_view scopeId) {
+    return scopeId.empty() || row.scopeId.empty() || row.scopeId == scopeId;
 }
 
 std::string CapabilityRegistry::infoJson(std::string_view id) const {

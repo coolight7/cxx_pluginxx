@@ -167,6 +167,23 @@ inline BroadcastScope_e broadcastScopeOf(const utilxx_base::Json& j) {
 
 } // namespace detail
 
+/// 一条功能埋点的声明 (点 = 能力 id + 同名广播频道)
+///
+/// 埋点是比“能力”更宽的一层说法: 核心走到一个位置时
+/// - 调用能力链拿结果 / 补丁 (`impl = true`, 声明为 `impls: many` + `merge: first`);
+/// - 往同名频道发一条广播 (`notify = true`), 只看不影响的订阅方靠它。
+///
+/// 两边都可以关: 只取值的埋点把 `notify` 关掉, 只通知的埋点把 `impl` 关掉。
+struct PluginPointDecl {
+    std::string          id;                    ///< 全名 (`<应用名>.…` 或 `plugin.<插件>.…`)
+    bool                 impl           = true; ///< 开放实现行
+    bool                 notify         = true; ///< 声明同名广播频道
+    BroadcastCache_e     cache          = BroadcastCache_e::Latest;
+    bool                 pushOnSubscribe = false; ///< 订阅时立即推当前值
+    int32_t              timeoutMs      = 0;    ///< 0 = 不设上限, 由调用方决定
+    BroadcastPublisher_e publish        = BroadcastPublisher_e::Owner;
+};
+
 /// 框架核心: 通用表的状态与实现
 ///
 /// - `InstanceT` 须继承 [pluginxx::PluginInstanceBase] (通用表的实例登记表在基类上);
@@ -247,7 +264,6 @@ public:
         const PluginxxCapabilitySpec& spec,
         std::string*                  error
     ) {
-        (void)scope;
         auto fail = [error](int32_t code, std::string message) {
             if (error) {
                 *error = std::move(message);
@@ -325,6 +341,10 @@ public:
         // provider 用**实例名** (路由键: 一个插件会被各个作用域各挂载一次, 实例名唯一);
         // 归属 / 命名空间校验用插件 id (见上面的 pluginId)
         row.provider = inst->name;
+        // 作用域: 登记时带的挂载引用 (空 = 进程级, 对所有作用域生效)
+        if (scope && pluginxx_scope_ref_ok(scope) && scope->id.data && scope->id.size > 0) {
+            row.scopeId.assign(scope->id.data, static_cast<size_t>(scope->id.size));
+        }
         row.ownerTag = detail::abiViewToString(spec.owner_tag);
         row.phase    = static_cast<CapabilityPhase_e>(
             spec.phase != 0 ? spec.phase : PLUGINXX_CAPABILITY_PHASE_IMPL
@@ -382,6 +402,38 @@ public:
         return PLUGINXX_RESULT_OK;
     }
 
+    /// 注销本插件在**指定作用域**上的一条实现行 (**IO 线程**)
+    ///
+    /// 与 [unregisterCapability] 只差作用域: 一个插件被多个作用域各挂载一次时,
+    /// 只撤指定作用域那一行 (不传作用域就是全部作用域)。
+    int unregisterScopedCapability(
+        InstanceT*               inst,
+        const PluginxxScopeRef*  scope,
+        std::string_view         capability,
+        std::string_view         ownerTag
+    ) {
+        if (!inst || capability.empty()) {
+            return PLUGINXX_RESULT_ERR_ARG;
+        }
+        const std::string pluginId = this->pluginIdOf(inst);
+        const std::string rawId{capability};
+        const std::string fullId
+            = this->isOfficialId(rawId)
+                  ? rawId
+                  : (detail::isPluginScopedId(rawId)
+                         ? rawId
+                         : detail::qualifyOwnedId(pluginId, rawId));
+        const std::string scopeId
+            = (scope && pluginxx_scope_ref_ok(scope) && scope->id.data && scope->id.size > 0)
+                  ? std::string{scope->id.data, static_cast<size_t>(scope->id.size)}
+                  : std::string{};
+        if (!capabilities_->unregisterScopedProvider(fullId, inst->name, scopeId, ownerTag)) {
+            return PLUGINXX_RESULT_ERR_NOT_DECLARED;
+        }
+        onCapabilityRowRemoved(inst, fullId, ownerTag);
+        return PLUGINXX_RESULT_OK;
+    }
+
     /// 能力是否可用 (1 = 有可用的 impl 行)
     int hasCapability(std::string_view capability) const {
         if (capability.empty()) {
@@ -425,16 +477,21 @@ public:
         void*                    ud,
         PluginxxString*          error_out
     ) {
-        (void)scope;
         std::shared_ptr<CapabilityChain> chain;
         std::shared_ptr<OpCore>          core;
         try {
-            if (!caller || !this->ioExecutor()) {
+            if (!this->ioExecutor()) {
                 throw std::runtime_error(
-                    "invoke_capability: missing caller or IO executor"
+                    "invoke_capability: missing IO executor"
                 );
             }
             const std::string cap{capability};
+            // 作用域: 调用方给的 scope 参与行过滤 (空 = 不过滤)
+            const std::string scopeId
+                = (scope && pluginxx_scope_ref_ok(scope) && scope->id.data
+                   && scope->id.size > 0)
+                      ? std::string{scope->id.data, static_cast<size_t>(scope->id.size)}
+                      : std::string{};
             const auto*       slot = capabilities_->slot(cap);
             if (!slot) {
                 throw std::runtime_error(
@@ -448,21 +505,24 @@ public:
                     *capabilities_,
                     cap,
                     CapabilityPhase_e::Before,
-                    false
+                    false,
+                    scopeId
                 );
                 detail::appendStage(
                     rows,
                     *capabilities_,
                     cap,
                     CapabilityPhase_e::Impl,
-                    false
+                    false,
+                    scopeId
                 );
                 detail::appendStage(
                     rows,
                     *capabilities_,
                     cap,
                     CapabilityPhase_e::After,
-                    true
+                    true,
+                    scopeId
                 );
             } else {
                 const auto wanted = static_cast<CapabilityPhase_e>(phase);
@@ -471,7 +531,8 @@ public:
                     *capabilities_,
                     cap,
                     wanted,
-                    wanted == CapabilityPhase_e::After
+                    wanted == CapabilityPhase_e::After,
+                    scopeId
                 );
             }
             if (rows.empty() && !slot->decl.declaredBy.empty()) {
@@ -479,17 +540,25 @@ public:
                     "invoke_capability: capability has no implementation: " + cap
                 );
             }
-            auto owner = caller->template sharedSelf<InstanceT>();
-            if (!owner) {
-                throw std::runtime_error(
-                    "invoke_capability: caller instance is unavailable"
-                );
+            std::shared_ptr<InstanceT> owner;
+            if (caller) {
+                owner = caller->template sharedSelf<InstanceT>();
+                if (!owner) {
+                    throw std::runtime_error(
+                        "invoke_capability: caller instance is unavailable"
+                    );
+                }
             }
+            // 调用方为空 = 主程序（应用）自己发起: 不挂任何实例租约
+            const auto newOperation = [&](const char* label) {
+                return owner ? OpCore::create(this->runtime(), owner, nullptr, label)
+                             : OpCore::createDetached(this->runtime(), label);
+            };
             if (rows.empty()) {
                 /// 应用实现的能力（声明由应用给出、没有插件实现行）: 派发前把调用
                 /// 交给派生宿主转给应用（应用实现的能力就是这种）。完成与取消都
                 /// 复用同一套 Operation 协议。
-                core = OpCore::create(this->runtime(), owner, nullptr, "capability " + cap);
+                core = newOperation("capability " + cap);
                 core->setCallback(cb, ud);
                 const std::string argsText{argsJson};
                 const int32_t     appTimeoutMs =
@@ -515,7 +584,7 @@ public:
             }
             // 外层操作只持有调用方的 lease: 一次调用是调用方的一次操作, 每一行
             // 在启动时各自持有提供者的 lease (提供者卸载会挡住或跳过它)。
-            core = OpCore::create(this->runtime(), owner, nullptr, "capability " + cap);
+            core = newOperation("capability " + cap);
             chain             = std::make_shared<CapabilityChain>();
             chain->host       = this;
             chain->core       = core;
@@ -556,6 +625,140 @@ public:
     int listCapabilities(PluginxxString* outJson) {
         detail::setErrorString(outJson, capabilities_->listJson());
         return PLUGINXX_RESULT_OK;
+    }
+
+    // =====================================================================
+    // 功能埋点 (point): 能力声明 + 同名广播频道
+    // =====================================================================
+
+    /// 声明一个功能埋点 (**启动阶段 / IO 线程**)
+    ///
+    /// - `impl`: 声明为 `impls: many` + `merge: first` + 只开放 `impl` 阶段
+    ///   (第一个给出非空结果的行生效; 没有行 = 没意见);
+    /// - `notify`: 声明同名广播频道 (应用频道, 属主 = 应用)。
+    ///
+    /// 两边任一项声明失败都返回 false (`error` 写原因), 已成功的那一项保留。
+    bool declarePoint(const PluginPointDecl& decl, std::string* error = nullptr) {
+        if (decl.id.empty()) {
+            if (error) {
+                *error = "point id is empty";
+            }
+            return false;
+        }
+        bool ok = true;
+        if (decl.impl) {
+            CapabilityDecl cap;
+            cap.id        = decl.id;
+            cap.impls     = CapabilityImpls_e::Many;
+            cap.merge     = CapabilityMerge_e::First;
+            cap.phases    = kCapabilityPhaseMaskImpl;
+            cap.timeoutMs = decl.timeoutMs;
+            std::string reason;
+            if (!capabilities_->declare(cap, &reason)) {
+                if (error) {
+                    *error = "point `" + decl.id + "`: " + reason;
+                }
+                ok = false;
+            }
+        }
+        if (decl.notify) {
+            BroadcastDecl channel;
+            channel.id              = decl.id;
+            channel.cache           = decl.cache;
+            channel.publish         = decl.publish;
+            channel.pushOnSubscribe = decl.pushOnSubscribe;
+            channel.coalesce        = true;
+            channel.scope           = BroadcastScope_e::App;
+            std::string reason;
+            if (!broadcasts_->declare(channel, &reason)) {
+                if (error && ok) {
+                    *error = "point `" + decl.id + "`: " + reason;
+                }
+                ok = false;
+            }
+        }
+        return ok;
+    }
+
+    /// 结束一个埋点的流 (**IO 线程**; 没有同名频道时视为已经结束)
+    bool endPoint(std::string_view pointId, std::string_view reasonJson, std::string* error = nullptr) {
+        if (!broadcasts_->declares(pointId)) {
+            return true;
+        }
+        return broadcasts_->end(pointId, reasonJson, std::string{}, error);
+    }
+
+    /// 发一次埋点 (**IO 线程**; 完成回调恰好一次)
+    ///
+    /// 顺序:
+    /// 1. 通知面: 往同名频道发一条广播 (未声明该频道就跳过; 失败只记日志);
+    /// 2. 实现面: 按 `scope` 调能力链 (只跑 `impl` 阶段; `merge: first`)。
+    ///    没有任何实现行时直接按 `OK` + `null` 完成 ("没人实现 = 没意见"),
+    ///    不把“没声明”和“没人实现”两种情形推给调用方去区分;
+    /// 3. 埋点本身没声明时返回 nullptr 并写 `error_out`。
+    ///
+    /// 调用方是主程序自己: 不挂任何实例租约 (见 [OpCore::createDetached])。
+    PluginxxOperatorHandle* emitPointAsync(
+        const PluginxxScopeRef*  scope,
+        std::string_view         pointId,
+        std::string_view         payloadJson,
+        int32_t                  timeoutMs,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    ) {
+        std::shared_ptr<OpCore> core;
+        try {
+            if (!this->ioExecutor()) {
+                throw std::runtime_error("emit_point: missing IO executor");
+            }
+            const std::string id{pointId};
+            const std::string payload
+                = payloadJson.empty() ? std::string{"{}"} : std::string{payloadJson};
+            if (broadcasts_->declares(id)) {
+                std::string reason;
+                if (!broadcasts_->publish(id, payload, std::string{}, &reason)) {
+                    XX_LOGW("point `{}`: broadcast rejected: {}", id, reason);
+                }
+            }
+            if (!capabilities_->declares(id)) {
+                throw std::runtime_error("emit_point: point is not declared: " + id);
+            }
+            const std::string scopeId
+                = (scope && pluginxx_scope_ref_ok(scope) && scope->id.data
+                   && scope->id.size > 0)
+                      ? std::string{scope->id.data, static_cast<size_t>(scope->id.size)}
+                      : std::string{};
+            const auto rows
+                = capabilities_->rowsOf(id, CapabilityPhase_e::Impl, scopeId);
+            if (rows.empty()) {
+                core = OpCore::createDetached(this->runtime(), "point " + id);
+                core->setCallback(cb, ud);
+                core->accept();
+                auto             notify = core->notify();
+                std::string_view none{"null"};
+                const auto       view = detail::abiView(none);
+                notify.done(notify.host_ud, PLUGINXX_OPERATOR_OK, &view);
+                return core->handle();
+            }
+            return invokeCapabilityAsync(
+                nullptr,
+                scope,
+                id,
+                payload,
+                PLUGINXX_CAPABILITY_PHASE_IMPL,
+                timeoutMs,
+                cb,
+                ud,
+                error_out
+            );
+        } catch (const std::exception& e) {
+            if (core && !core->submitted()) {
+                core->reject();
+            }
+            detail::setErrorString(error_out, e.what());
+            return nullptr;
+        }
     }
 
     // =====================================================================
@@ -637,6 +840,9 @@ public:
             if (error) {
                 *error = reason;
             }
+            if (reason.find("is ended") != std::string::npos) {
+                return PLUGINXX_RESULT_ERR_ENDED;
+            }
             const bool permission = reason.find("system") != std::string::npos
                                     || reason.find("owned by") != std::string::npos;
             return permission ? PLUGINXX_RESULT_ERR_PERMISSION : PLUGINXX_RESULT_ERR_NOT_DECLARED;
@@ -658,11 +864,41 @@ public:
     int readBroadcast(std::string_view broadcastId, PluginxxString* outJson) const {
         std::string value;
         if (!broadcasts_->read(broadcastId, &value)) {
+            if (broadcasts_->isEnded(broadcastId)) {
+                return PLUGINXX_RESULT_ERR_ENDED;
+            }
             return broadcasts_->declares(broadcastId) ? PLUGINXX_RESULT_ERR_NO_VALUE
                                                       : PLUGINXX_RESULT_ERR_NOT_DECLARED;
         }
         detail::setErrorString(outJson, value);
         return PLUGINXX_RESULT_OK;
+    }
+
+    /// 结束一条流 (**IO 线程**; `writer` 空 = 应用, 非空 = 插件 id)
+    int endBroadcast(
+        std::string_view broadcastId,
+        std::string_view reasonJson,
+        std::string_view writer,
+        std::string*     error = nullptr
+    ) {
+        return broadcasts_->end(broadcastId, reasonJson, writer, error)
+                   ? PLUGINXX_RESULT_OK
+                   : PLUGINXX_RESULT_ERR_ARG;
+    }
+
+    /// 插件结束自己的一条流 (**IO 线程**; 归属用插件 id)
+    int endBroadcastFrom(
+        InstanceT*       inst,
+        std::string_view broadcastId,
+        std::string_view reasonJson,
+        std::string*     error = nullptr
+    ) {
+        const std::string fullId
+            = services_ ? services_->qualifyEventTopic(broadcastId)
+                        : std::string{broadcastId};
+        return broadcasts_->end(fullId, reasonJson, pluginIdOf(inst), error)
+                   ? PLUGINXX_RESULT_OK
+                   : PLUGINXX_RESULT_ERR_ARG;
     }
 
     /// 订阅广播 (**IO 线程**)
@@ -671,6 +907,7 @@ public:
     ///   空 = 不限频);
     /// - 回调在发布线程执行, 每次回调都在实例执行 lease 保护下调用插件
     ///   (因此卸载的 idle 等待覆盖它);
+    /// - `onEnd` 可空: 频道被 `end` 时用 reason JSON 回调一次 (同一套 lease 保护);
     /// - 实例正在关闭/已禁用, 或 id 非法时返回 nullptr。
     PluginxxSubscription* subscribeBroadcast(
         InstanceT*               inst,
@@ -678,7 +915,8 @@ public:
         std::string_view         broadcastId,
         void(PLUGINXX_CALL* handler)(const PluginxxStringView* payload_json, void* ud),
         void*                    ud,
-        std::string_view         optionsJson = {}
+        std::string_view         optionsJson = {},
+        void(PLUGINXX_CALL* onEnd)(const PluginxxStringView* reason_json, void* ud) = nullptr
     ) {
         if (!inst || broadcastId.empty() || !handler) {
             return nullptr;
@@ -752,6 +990,31 @@ public:
                     XX_LOGW("Plugin `{}` broadcast handler threw unknown exception", inst->name);
                 }
             },
+            onEnd ? std::function<void(std::string_view)>([sub, onEnd](std::string_view reason) {
+                if (!sub->alive.load(std::memory_order_acquire)) {
+                    return;
+                }
+                auto inst = sub->inst.lock();
+                if (!inst || !inst->lifetime || !inst->lifetime->acceptsOperations()) {
+                    return;
+                }
+                PluginInstanceBase::InflightGuard guard(inst);
+                if (!guard || !sub->alive.load(std::memory_order_acquire)) {
+                    return;
+                }
+                try {
+                    const auto view = detail::abiView(reason);
+                    onEnd(&view, sub->ud);
+                } catch (const std::exception& e) {
+                    XX_LOGW("Plugin `{}` broadcast end handler threw: {}", inst->name, e.what());
+                } catch (...) {
+                    XX_LOGW(
+                        "Plugin `{}` broadcast end handler threw unknown exception",
+                        inst->name
+                    );
+                }
+            })
+                   : std::function<void(std::string_view)>{},
             options
         );
         if (token == 0) {
@@ -1130,7 +1393,6 @@ protected:
     struct OffloadCancelState {
         std::atomic<bool> requested{false};
     };
-
     static int32_t PLUGINXX_CALL isOffloadCanceled(const PluginxxCancelToken* token) {
         auto* state = token ? static_cast<const OffloadCancelState*>(token->host_ud) : nullptr;
         return state && state->requested.load(std::memory_order_acquire) ? 1 : 0;

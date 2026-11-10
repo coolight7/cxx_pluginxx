@@ -54,13 +54,13 @@ include/pluginxx/
                    通用表聚合 PluginIfaceCore、Logger、Task<T> 锚定协程与锚定原语
                    (sleep/yield/offload/invoke_cap)、CancelRegistry/OpCtl/ArgReader、
                    后台任务 spawn、能力注册 capability、实例上下文基类
-                   PluginBaseT<IfacesT>、入口符号导出宏 PLUGINXX_EXPORT_PLUGIN
-          guard.h  C ABI 边界异常守卫 (logTo/reportCurrentException/guardCall/guardCallVoid)
+                   PluginBaseT<IfacesT>、入口符号导出宏 PLUGINXX_EXPORT_PLUGIN          guard.h  C ABI 边界异常守卫 (logTo/reportCurrentException/guardCall/guardCallVoid)
   runtime/插件运行时 (runtime/driver/instance_base/manager_base/op_driver)
   host/   loader.h (dlopen/LoadLibrary)、manifest.h (plugin.yaml/名称推导/拓扑排序)、
           abi_util.h (C 串转换/异常保护/io 线程同步投递)、
-          capability_registry.h (能力注册表: 能力名 → 提供者插件 + 启动/取消回调)、
-          event_bus.h (事件后端抽象 EventSource + 订阅句柄 PluginxxSubscription)、
+          capability_registry.h (能力注册表: 声明 + 实现行 (阶段/优先级/作用域) + 启动/取消回调)、
+          broadcast_registry.h (广播注册表: 频道声明 + 缓存 + 发布权限 + 订阅限频 + 流结束)、
+          capability_chain.h (阶段链顺序 + JSON 补丁合并)、
           domain_services.h (业务数据入口 DomainServices: 通用表需要主程序数据的入口)、
           host_core.h (框架核心 PluginHostCore<InstanceT>: 通用表状态与方法实现)、
           tables_impl.h (十张通用表的 vtable 入口 + queryGenericPluginIface<I,M>)、
@@ -85,7 +85,7 @@ public:
         setDomainServices(this);
         setOfficialPrefix(pluginxx::appIdPrefix());   // 默认已是构建期的应用名, 写出来更好读
     }
-    // DomainServices: 事件后端 / 工作线程池 / 配置 JSON / 语言 / 会话工作目录 / 取消状态 / 插件清单
+    // DomainServices: 工作线程池 / 配置 JSON / 语言 / 插件清单
 protected:
     // 生命周期扩展点 (纯虚): 管理器自引用 / 生成业务实例 / 交给自己插件的 vtable
     std::shared_ptr<pluginxx::PluginHostLifecycle<MyInstance>> selfRef() override;
