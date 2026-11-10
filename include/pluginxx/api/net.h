@@ -2,8 +2,9 @@
 ///
 /// 归属: 这张表**只依赖"op + 参数 JSON → 结果 JSON"这套通用写法**, 不需要主程序业务语义,
 /// 所以放在通用表这一侧 (与 `capabilities` / `broadcasts` 同样由应用名拼出 IID)。
-/// 实现在 `cxx_utilxx` 的 `utilxx::PluginNetHub` (HTTP 客户端 / HTTP 服务端 / TCP /
-/// WebSocket / UDP, 自有网络线程), 主程序只负责把表接到主程序与插件实例上。
+/// 实现分两层: 通用网络服务在 `cxx_utilxx` 的 `utilxx::NetHub` (HTTP 客户端 / HTTP 服务端 /
+/// TCP / WebSocket / UDP, 自有网络线程, 按属主 id 隔离资源), 主程序负责把这张表接到
+/// 插件实例 (`<插件 id>` = 属主 id)、并把事件发到广播频道上。
 ///
 /// 三条硬约定:
 /// - 服务端默认**只监听回环** (`host` 缺省 `127.0.0.1`); 写 `0.0.0.0` 表示同网段可访问,
