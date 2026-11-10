@@ -550,9 +550,9 @@ public:
                 }
             }
             // 调用方为空 = 主程序（应用）自己发起: 不挂任何实例租约
-            const auto newOperation = [&](const char* label) {
-                return owner ? OpCore::create(this->runtime(), owner, nullptr, label)
-                             : OpCore::createDetached(this->runtime(), label);
+            const auto newOperation = [&](std::string label) {
+                return owner ? OpCore::create(this->runtime(), owner, nullptr, std::move(label))
+                             : OpCore::createDetached(this->runtime(), std::move(label));
             };
             if (rows.empty()) {
                 /// 应用实现的能力（声明由应用给出、没有插件实现行）: 派发前把调用
