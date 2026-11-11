@@ -3755,8 +3755,40 @@ inline decltype(auto) invokeCap(
 
 } // namespace detail
 
+/// 能力登记的选项 (不填时 = 声明自己的名字 + 单行覆盖 + 只开放 impl 阶段)
+struct CapabilityOptions {
+    /// 一个 id 上有几个实现: `PLUGINXX_CAPABILITY_IMPLS_ONE|MANY` (声明自己的名字时必填)
+    int32_t impls = PLUGINXX_CAPABILITY_IMPLS_ONE;
+    /// 实现链怎么合并: `PLUGINXX_CAPABILITY_MERGE_NONE|FIRST|VETO`
+    int32_t merge = PLUGINXX_CAPABILITY_MERGE_NONE;
+    /// 声明开放的阶段 (位或): `PLUGINXX_CAPABILITY_PHASE_MASK_*`
+    uint32_t phases = PLUGINXX_CAPABILITY_PHASE_MASK_IMPL;
+    /// 这次登记落在哪个阶段: `PLUGINXX_CAPABILITY_PHASE_*`
+    int32_t phase = PLUGINXX_CAPABILITY_PHASE_IMPL;
+    /// 行内顺序, 小者先
+    int32_t priority = 0;
+    /// 自报的最大耗时 (毫秒; 0 = 用声明里的值)
+    int32_t timeoutMs = 0;
+    /// 同一实例内区分多个处理器 (可空)
+    std::string_view ownerTag{};
+    /// 归属作用域 (空 = 进程级, 对所有作用域生效)
+    const PluginxxScopeRef* scope = nullptr;
+};
+
+/// 登记一行能力实现
+/// - `fn` 可返回字符串 (同步) 或 `Task<T>` (异步): 返回值就是这次调用的结果文本;
+/// - 未填 [CapabilityOptions] 时按"声明自己的名字 + 单行覆盖 + 只开放 impl 阶段"登记;
+/// - `error` 非空时写入主程序给的拒绝原因。
+///
+/// - `return` 0 = 成功, 其它 = 主程序的错误码 (`-1` = 主程序没有能力表)
 template<typename Ctx, typename CapFn>
-inline void capability(Ctx& ctx, std::string_view capName, CapFn&& fn) {
+inline int32_t capability(
+    Ctx&                    ctx,
+    std::string_view        capName,
+    CapFn&&                 fn,
+    const CapabilityOptions& opts  = {},
+    std::string*            error = nullptr
+) {
     struct CapShim {
         Ctx*                ctx = nullptr;
         std::decay_t<CapFn> fn;
@@ -3885,15 +3917,34 @@ inline void capability(Ctx& ctx, std::string_view capName, CapFn&& fn) {
         spec.version     = PLUGINXX_API_VERSION;
         spec.struct_size = sizeof(PluginxxCapabilitySpec);
         spec.id          = capSv;
-        spec.impls       = PLUGINXX_CAPABILITY_IMPLS_ONE;
-        spec.merge       = PLUGINXX_CAPABILITY_MERGE_NONE;
-        spec.phases      = PLUGINXX_CAPABILITY_PHASE_MASK_IMPL;
-        spec.phase       = PLUGINXX_CAPABILITY_PHASE_IMPL;
-        spec.run_start   = run;
-        spec.cancel      = cancel;
-        spec.user_data   = shim;
-        ctx.iface.capabilities->register_capability(ctx.host, nullptr, &spec, nullptr);
+        if (!opts.ownerTag.empty()) {
+            spec.owner_tag = PluginStringView::from(opts.ownerTag.data(), opts.ownerTag.size());
+        }
+        spec.impls     = opts.impls;
+        spec.merge     = opts.merge;
+        spec.phases    = opts.phases;
+        spec.phase     = opts.phase;
+        spec.priority  = opts.priority;
+        spec.timeout_ms = opts.timeoutMs;
+        spec.run_start = run;
+        spec.cancel    = cancel;
+        spec.user_data = shim;
+        PluginxxString regErr{nullptr, 0};
+        const int32_t  rc
+            = ctx.iface.capabilities->register_capability(ctx.host, opts.scope, &spec, &regErr);
+        if (error != nullptr) {
+            if (regErr.data != nullptr && regErr.size > 0) {
+                error->assign(regErr.data, static_cast<size_t>(regErr.size));
+            } else {
+                error->clear();
+            }
+        }
+        if (regErr.data != nullptr) {
+            PluginString::free(ctx.host, &regErr);
+        }
+        return rc;
     }
+    return -1;
 }
 
 inline PluginxxString invoke_capability_blocking(
