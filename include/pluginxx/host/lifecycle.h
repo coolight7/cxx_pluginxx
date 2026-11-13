@@ -230,7 +230,7 @@ public:
         int rc                     = -1;
         try {
             rc = createFn(inst->hostView(), &inst->pluginCtx);
-            // 即使 create 返回失败，只要交付了上下文，destroy 仍是主程序的责任。
+            // 即使 create 返回失败，只要把上下文交出去了，destroy 仍是主程序的责任。
             inst->pluginCreated = (inst->pluginCtx != nullptr);
         } catch (const std::exception& e) {
             XX_LOGE("{}Plugin `{}` create threw: {}", logTag(), inst->name, e.what());
@@ -640,7 +640,7 @@ public:
     /// 摘除实例的注册 (通用部分) 并回调主程序摘除业务注册
     ///
     /// - 通用部分: 取消未终结的 Operation、撤销事件订阅、撤销能力声明;
-    /// - 业务部分经 [detachDomainRegistrations] 交给主程序 (工具/权限/钩子/图/提示词等)。
+    /// - 业务部分经 [detachDomainRegistrations] 交给主程序 (工具/权限/回调/图/提示词等)。
     void detachAll(InstanceT* inst) {
         if (!inst) {
             return;
@@ -662,7 +662,7 @@ public:
         detachDomainRegistrations(inst);
     }
 
-    /// 清空"由插件 start 事务重新声明"的注册记录 (工具/权限/钩子/图/能力/订阅)。
+    /// 清空"由插件 start 事务重新声明"的注册记录 (工具/权限/回调/图/能力/订阅)。
     /// stop 成功后调用，避免下次 start 在旧记录上重复累积。
     void clearPluginOwnedRegistrations(InstanceT* inst) {
         if (!inst) {
@@ -845,7 +845,7 @@ protected:
         return {};
     }
 
-    /// 摘除实例的**业务**注册 (工具/权限/钩子/图节点/提示词贡献 等)
+    /// 摘除实例的**业务**注册 (工具/权限/回调/图节点/提示词贡献 等)
     /// - 调用时机: 禁用与卸载; 只摘除主程序侧生效的注册, 保留实例内的注册记录
     virtual void detachDomainRegistrations(InstanceT* inst) {
         (void)inst;

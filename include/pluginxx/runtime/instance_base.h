@@ -94,7 +94,7 @@ struct PluginInstanceBase {
     /// 同步关闭发现活动 lease 时，等待最后一个 lease 释放后再执行 destroy。
     bool destroyDeferred = false;
     /// 实例生命周期入口 (加载成功的插件必有这两个符号, 见 plugin_api.h):
-    /// - start: 注册事务 (工具/钩子/能力/订阅/自管线程), 在主程序 IO 线程执行;
+    /// - start: 注册事务 (工具/通知/能力/订阅/自管线程), 在主程序 IO 线程执行;
     /// - stop: 撤销自管资源, destroy 之前必须先完成。
     PluginxxStartFn lifecycleStart = nullptr;
     PluginxxStopFn  lifecycleStop  = nullptr;

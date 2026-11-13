@@ -14,7 +14,7 @@
 /// - 导出宏 PLUGINXX_EXPORT_PLUGIN / PLUGINXX_EXPORT_PLUGIN_LIFECYCLE
 ///   (入口符号前缀由主程序给出; 主程序侧再包一层自己的导出宏)
 ///
-/// 主程序业务部分 (工具 / 权限 / 钩子 / 图节点 / client UI 等) 由主程序自己补: 主程序在
+/// 主程序业务部分 (工具 / 权限 / 回调 / 图节点 / client UI 等) 由主程序自己补: 主程序在
 /// 自己的头文件里包含本头, 并用 `using` 把通用名引入本程序命名空间 —— 插件源码只包含
 /// 主程序那份头即可, 无需关心本节分层。
 #pragma once
@@ -413,7 +413,7 @@ const Iface* queryInterface(const PluginxxHost* host, const char* iid) noexcept 
 
 /// 通用接口表聚合 (与主程序业务无关的十个表; 成员为 NULL 表示主程序未实现该接口)
 ///
-/// 业务表 (工具 / 权限 / 钩子 / 会话 / 模型 / 提示词 / 资源 / 图, 以及 client 侧 UI)
+/// 业务表 (工具 / 权限 / 回调 / 会话 / 模型 / 提示词 / 资源 / 图, 以及 client 侧 UI)
 /// 由主程序在自己的聚合体中补充: 主程序那侧的聚合体是本聚合的超集,
 /// 可直接作为 [PluginBaseT] 的模板实参。
 struct PluginIfaceCore {
@@ -3890,7 +3890,7 @@ inline int32_t capability(
                     p.cancelFlag_ = job->cancelFlag;
                     job->coroAddr = h.address();
 
-                    // 根的首步由 host driver 推进 (与工具/钩子同一模型)。
+                    // 根的首步由 host driver 推进 (与工具同一套完成协议)。
                     detail::startBridgedRoot(shim->ctx->bridge(), p.notify_, h, [job] {
                         delete job;
                     });
@@ -4104,7 +4104,7 @@ inline void logCreateFailure(
 /// (见 `pluginxx/api/entry.h`), 两侧不一致时加载失败。
 ///
 /// 主程序按以下顺序调用, 插件必须遵守 (见 docs/zh-cn/design/plugins.md):
-/// - `create`: 只构造上下文 (`new CtxType` + `init(host)`), 不注册任何工具/钩子/能力/
+/// - `create`: 只构造上下文 (`new CtxType` + `init(host)`), 不注册任何工具/通知/能力/
 ///   订阅, 不启动线程;
 /// - `start`: **注册事务**, 在主程序 IO 线程执行; 同步完成时 `notify->done(OK)` 后返回 NULL,
 ///   失败时返回 NULL 并写出 `error_out` (主程序回滚本次注册并撤销实例);
