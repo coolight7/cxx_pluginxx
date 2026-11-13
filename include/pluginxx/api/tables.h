@@ -103,13 +103,11 @@ extern "C" {
 #define PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE \
     (offsetof(PluginxxBroadcastsIface, end_broadcast))
 
-/// 广播的通用结果码 (v1 起; 与主程序自己的错误码分开, 只在 uint 范围内比较)
-#define PLUGINXX_RESULT_OK               0
-#define PLUGINXX_RESULT_ERR_ARG         -1 ///< 参数非法
-#define PLUGINXX_RESULT_ERR_NOT_DECLARED -2 ///< 频道/能力没有声明
-#define PLUGINXX_RESULT_ERR_PERMISSION  -3 ///< 没有发布权限 (非属主 / 系统频道)
-#define PLUGINXX_RESULT_ERR_NO_VALUE    -4 ///< 没有当前值 (cache: none 或还没写过)
-#define PLUGINXX_RESULT_ERR_ENDED       -5 ///< 流已结束 (发布 / 读取 / 订阅都被拒)
+/// 广播的结果码：通用段与广播段都在 `pluginxx/api/result.h`（码表只有一份）
+///
+/// 这里不再另定义；历史上广播表的 -2 / -3 / -4 / -5 与通用段撞号，已按分段重编：
+/// `not_declared` = -200、`no_value` = -201、`ended` = -202、`not_owner` = -203。
+#include "pluginxx/api/result.h"
 
 typedef struct PluginxxBroadcastsIface {
     int32_t  version; ///< 主程序填 PLUGINXX_IFACE_BROADCASTS_VERSION
