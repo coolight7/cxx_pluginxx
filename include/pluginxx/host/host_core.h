@@ -358,7 +358,7 @@ public:
         if (!capabilities_->addProvider(fullId, row, &rowError)) {
             return fail(PLUGINXX_RESULT_ERR_ARG, rowError);
         }
-        // 派生主程序把这一行接进自己的派发表（例如主程序的钩子引擎）。
+        // 派生主程序把这一行接进自己的派发表（例如主程序的通知分发）。
         // 它拒绝时要把刚加的行撤掉，不能留下"注册表有、派发表没有"的半条登记。
         const int32_t attachRc = onCapabilityRowAdded(inst, fullId, spec, &rowError);
         if (attachRc != PLUGINXX_RESULT_OK) {
@@ -1322,7 +1322,7 @@ protected:
     ///
     /// 默认什么都不做（纯 pluginxx 主程序只记注册表）。返回非 0 时调用方会撤销刚加的
     /// 实现行并把原因返回给插件 —— 用于"这个 id 我认识，但这次登记不合法"这类判定
-    /// （例如钩子只接受同步处理器）。
+    /// （例如通知只接受同步处理器）。
     virtual int onCapabilityRowAdded(
         InstanceT*                    inst,
         const std::string&            id,

@@ -150,6 +150,8 @@ public:
 
     /// 声明一个频道
     /// - 重复声明: 应用声明不能被插件覆盖; 同为插件声明时后声明者覆盖;
+    /// - **完全相同的重复声明是幂等操作**: 不改状态也不打"replaced"日志
+    ///   (插件侧每次发布前都会先声明, 周期发布的频道不该因此刷日志);
     /// - 收窄成 `cache: none` 时丢掉缓存的当前值;
     /// - 校验失败写 `error` (可为空) 并返回 false
     bool declare(const BroadcastDecl& decl, std::string* error = nullptr);

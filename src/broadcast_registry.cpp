@@ -35,6 +35,16 @@ int64_t steadyNowMs() noexcept {
         .count();
 }
 
+/// 两份声明是否等价 (id 已由查表保证相同)
+///
+/// 用于把"重复声明同一个频道、什么都不改"识别成幂等操作: 插件侧每次发布前都会先声明
+/// (它无法预知频道是否已声明), 周期发布的频道否则会按发布频率刷一条 "replaced" 日志。
+bool sameDecl(const BroadcastDecl& a, const BroadcastDecl& b) noexcept {
+    return a.owner == b.owner && a.cache == b.cache && a.publish == b.publish
+           && a.pushOnSubscribe == b.pushOnSubscribe && a.coalesce == b.coalesce
+           && a.scope == b.scope;
+}
+
 } // namespace
 
 std::string BroadcastRegistry::validateDecl(const BroadcastDecl& decl) {
@@ -93,12 +103,16 @@ bool BroadcastRegistry::declare(const BroadcastDecl& inDecl, std::string* error)
         );
         return false;
     }
-    XX_LOGI(
-        "BroadcastRegistry: declaration of `{}` replaced ({} -> {})",
-        inDecl.id,
-        channel.decl.owner.empty() ? "app" : channel.decl.owner,
-        inDecl.owner.empty() ? "app" : inDecl.owner
-    );
+    // 完全相同的声明 = 幂等声明 (插件每次发布前都会先声明一次): 不进"replaced"日志,
+    // 否则周期发布的频道会按发布频率刷屏
+    if (!sameDecl(channel.decl, inDecl)) {
+        XX_LOGI(
+            "BroadcastRegistry: declaration of `{}` replaced ({} -> {})",
+            inDecl.id,
+            channel.decl.owner.empty() ? "app" : channel.decl.owner,
+            inDecl.owner.empty() ? "app" : inDecl.owner
+        );
+    }
     channel.decl = inDecl;
     if (inDecl.cache != BroadcastCache_e::Latest) {
         channel.latest.clear();
