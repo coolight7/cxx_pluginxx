@@ -26,7 +26,7 @@
 #define PLUGINXX_RESULT_ERR_STATE (-2)        ///< 当前状态不允许（没启动 / 已停止 / 已经做过）
 #define PLUGINXX_RESULT_ERR_JSON (-3)         ///< 参数不是合法 JSON
 #define PLUGINXX_RESULT_ERR_NOT_FOUND (-4)    ///< 目标不存在（id / 频道 / 请求 / 服务）
-#define PLUGINXX_RESULT_ERR_TIMEOUT (-5)      ///< 等对端（宿主线程 / 插件）超时
+#define PLUGINXX_RESULT_ERR_TIMEOUT (-5)      ///< 等对端（主程序线程 / 插件）超时
 #define PLUGINXX_RESULT_ERR_PERMISSION (-6)   ///< 没有权限（不是属主 / 系统频道 / 路径越界）
 #define PLUGINXX_RESULT_ERR_BUSY (-7)         ///< 排队已满（连接 / 请求 / 服务上限）
 #define PLUGINXX_RESULT_ERR_NO_MEMORY (-8)    ///< 内存不足
@@ -40,7 +40,7 @@
 
 /* ==================== 生命周期 / 内部段 ==================== */
 
-#define PLUGINXX_RESULT_ERR_NOT_READY (-500)  ///< 还没准备好（宿主未启动 / 加载中）
+#define PLUGINXX_RESULT_ERR_NOT_READY (-500)  ///< 还没准备好（主程序未启动 / 加载中）
 #define PLUGINXX_RESULT_ERR_INTERNAL (-999)   ///< 实现内部错误（不该发生）
 
 /* ==================== 自定义段（只约定区间，不定义码） ==================== */
@@ -48,7 +48,7 @@
 // -5000 ~ -9999   应用自定义（不同应用各有一套）
 // -10000 ~ -19999 插件自定义（各插件各有一套）
 //
-// 用自有码报错时，宿主按区间给出类别（`app_custom` / `plugin_custom`），名称由属主自己解释：
+// 用自有码报错时，主程序按区间给出类别（`app_custom` / `plugin_custom`），名称由属主自己解释：
 // `nameOf()` 对这两段返回 nullptr，`categoryOf()` 给类别。
 
 #ifdef __cplusplus
