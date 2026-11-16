@@ -25,14 +25,10 @@ _Static_assert(
 /* 追加成员必须真的在表尾: 基线（老主程序可见的部分）要么等于完整布局
    （刚重置过基线，此时没有追加段），要么止于第一个追加成员。
    改动布局时这里会先报错, 比运行期“读到别人的内存”更早发现。 */
+/* broadcasts 在 v4 重置过基线 (全部成员改异步), 当前没有追加段 */
 _Static_assert(
-    PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE
-        == offsetof(PluginxxBroadcastsIface, end_broadcast),
-    "broadcasts 基线必须止于第一个追加成员"
-);
-_Static_assert(
-    PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE < sizeof(PluginxxBroadcastsIface),
-    "broadcasts 必须真的追加了成员"
+    PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE <= sizeof(PluginxxBroadcastsIface),
+    "broadcasts 基线不得超过完整布局"
 );
 /* capabilities 在 v7 重置过基线 (删了 op_cancel), 当前没有追加段 */
 _Static_assert(

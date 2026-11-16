@@ -479,132 +479,213 @@ struct GenericTableEntries {
     // broadcasts 表
     // =====================================================================
 
-    static int32_t PLUGINXX_CALL broadcastDeclareEntry(
+    static PluginxxOperatorHandle* PLUGINXX_CALL broadcastDeclareEntry(
         const PluginxxHost*       host,
         const PluginxxStringView* decl_json,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
         PluginxxString*           error_out
     ) {
         if (detail::abiViewEmpty(decl_json)) {
-            detail::setErrorString(error_out, "declare_broadcast: missing declaration");
-            return PLUGINXX_RESULT_ERR_ARG;
+            setTableOpError(error_out, "declare_broadcast: missing declaration");
+            return nullptr;
         }
         const std::string decl = svToStr(*decl_json);
-        return detail::onInstanceIo<InstanceT, ManagerT>(
+        return detail::asyncTableOp<InstanceT, ManagerT>(
             host,
-            [decl, error_out](InstanceT* inst, ManagerT* mgr) {
-                std::string reason;
+            cb,
+            cb_ud,
+            error_out,
+            "broadcasts.declare_broadcast",
+            [decl](InstanceT* inst, ManagerT* mgr) -> std::string {
+                std::string   reason;
                 const int32_t rc = mgr->declareBroadcast(inst, decl, &reason);
                 if (rc != PLUGINXX_RESULT_OK) {
-                    detail::setErrorString(error_out, reason);
+                    throw TableOpError(
+                        reason.empty() ? std::string{"declare_broadcast failed"}
+                                       : std::move(reason)
+                    );
                 }
-                return rc;
+                return std::string{};
             }
         );
     }
 
-    static int32_t PLUGINXX_CALL broadcastPublishEntry(
+    static PluginxxOperatorHandle* PLUGINXX_CALL broadcastPublishEntry(
         const PluginxxHost*       host,
         const PluginxxStringView* broadcast_id,
         const PluginxxStringView* payload_json,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
         PluginxxString*           error_out
     ) {
         if (detail::abiViewEmpty(broadcast_id)) {
-            detail::setErrorString(error_out, "publish_broadcast: missing id");
-            return PLUGINXX_RESULT_ERR_ARG;
+            setTableOpError(error_out, "publish_broadcast: missing id");
+            return nullptr;
         }
         const std::string id      = svToStr(*broadcast_id);
         const std::string payload = payload_json ? svToStr(*payload_json) : std::string{"{}"};
-        return detail::onInstanceIo<InstanceT, ManagerT>(
+        return detail::asyncTableOp<InstanceT, ManagerT>(
             host,
-            [id, payload, error_out](InstanceT* inst, ManagerT* mgr) {
-                std::string reason;
+            cb,
+            cb_ud,
+            error_out,
+            "broadcasts.publish_broadcast",
+            [id, payload](InstanceT* inst, ManagerT* mgr) -> std::string {
+                std::string   reason;
                 const int32_t rc = mgr->publishBroadcastFrom(inst, id, payload, &reason);
                 if (rc != PLUGINXX_RESULT_OK) {
-                    detail::setErrorString(error_out, reason);
+                    throw TableOpError(
+                        reason.empty() ? std::string{"publish_broadcast failed"}
+                                       : std::move(reason)
+                    );
                 }
-                return rc;
+                return std::string{};
             }
         );
     }
 
-    static PluginxxSubscription* PLUGINXX_CALL broadcastSubscribeEntry(
+    /// 订阅的公共实现 (普通订阅与带 `on_end` 的订阅共用)
+    template<typename OnEnd>
+    static PluginxxOperatorHandle* subscribeBroadcastOp(
+        const PluginxxHost*       host,
+        const PluginxxScopeRef*   scope,
+        const PluginxxStringView* broadcast_id,
+        void(PLUGINXX_CALL* handler)(const PluginxxStringView* payload_json, void* ud),
+        OnEnd                     on_end,
+        void*                     ud,
+        const PluginxxStringView* options_json,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
+        PluginxxString*           error_out,
+        const char*               label
+    ) {
+        if (detail::abiViewEmpty(broadcast_id) || handler == nullptr) {
+            setTableOpError(error_out, fmt::format("{}: id and handler are required", label));
+            return nullptr;
+        }
+        // 引用含借用视图: 投递前复制成自有结构 (只在本次操作期间使用)
+        PluginxxScopeRef  scopeCopy{};
+        const bool        hasScope = pluginxx_scope_ref_ok(scope) && scope != nullptr;
+        if (hasScope) {
+            scopeCopy = *scope;
+        }
+        const std::string id      = svToStr(*broadcast_id);
+        const std::string options = (options_json && options_json->data)
+                                        ? svToStr(*options_json)
+                                        : std::string{};
+        return detail::asyncTableOp<InstanceT, ManagerT>(
+            host,
+            cb,
+            cb_ud,
+            error_out,
+            label,
+            [hasScope, scopeCopy, id, options, handler, on_end, ud](
+                InstanceT* inst,
+                ManagerT*  mgr
+            ) -> std::string {
+                auto* sub = mgr->subscribeBroadcast(
+                    inst,
+                    hasScope ? &scopeCopy : nullptr,
+                    id,
+                    handler,
+                    ud,
+                    options,
+                    on_end
+                );
+                if (sub == nullptr) {
+                    throw TableOpError("subscribe_broadcast: rejected");
+                }
+                return pluginxxSubscriptionToText(sub);
+            }
+        );
+    }
+
+    static PluginxxOperatorHandle* PLUGINXX_CALL broadcastSubscribeEntry(
         const PluginxxHost*       host,
         const PluginxxScopeRef*   scope,
         const PluginxxStringView* broadcast_id,
         void(PLUGINXX_CALL* handler)(const PluginxxStringView* payload_json, void* ud),
         void*                     ud,
         const PluginxxStringView* options_json,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
         PluginxxString*           error_out
     ) {
-        return guardVtableCall<PluginxxSubscription*>(nullptr, [&]() {
-            auto call = enterHost(host);
-            auto mgr  = call.manager();
-            auto inst = call.instance();
-            if (!mgr || !inst || detail::abiViewEmpty(broadcast_id) || !handler) {
-                detail::setErrorString(
-                    error_out,
-                    "subscribe_broadcast: missing instance, id, or handler"
-                );
-                return static_cast<PluginxxSubscription*>(nullptr);
-            }
-            // 引用含借用视图: 投递前复制为自有的 id/seq (库内部结构)
-            auto              keep    = call;
-            const std::string id      = svToStr(*broadcast_id);
-            const std::string options = (options_json && options_json->data)
-                                            ? svToStr(*options_json)
-                                            : std::string{};
-            PluginxxScopeRef  scopeCopy{};
-            const bool        hasScope = pluginxx_scope_ref_ok(scope) && scope;
-            if (hasScope) {
-                scopeCopy = *scope;
-            }
-            auto* sub = ioCallSyncKeep<PluginxxSubscription*>(
-                keep,
-                mgr,
-                [keep, hasScope, scopeCopy, id, options, handler, ud]() {
-                    return keep.manager()->subscribeBroadcast(
-                        keep.instance(),
-                        hasScope ? &scopeCopy : nullptr,
-                        id,
-                        handler,
-                        ud,
-                        options
-                    );
-                }
-            );
-            if (!sub) {
-                detail::setErrorString(error_out, "subscribe_broadcast: rejected");
-            }
-            return sub;
-        });
+        return subscribeBroadcastOp(
+            host,
+            scope,
+            broadcast_id,
+            handler,
+            nullptr,
+            ud,
+            options_json,
+            cb,
+            cb_ud,
+            error_out,
+            "broadcasts.subscribe_broadcast"
+        );
     }
 
-    static void PLUGINXX_CALL broadcastUnsubscribeEntry(PluginxxSubscription* sub) {
-        guardVtableCallVoid([&] { unsubscribePluginBroadcast(sub); });
+    static PluginxxOperatorHandle* PLUGINXX_CALL broadcastUnsubscribeEntry(
+        const PluginxxHost*      host,
+        PluginxxSubscription*    sub,
+        PluginxxOperatorCallback cb,
+        void*                    cb_ud,
+        PluginxxString*          error_out
+    ) {
+        if (sub == nullptr) {
+            setTableOpError(error_out, "unsubscribe_broadcast: handle is required");
+            return nullptr;
+        }
+        // 工作体本来就跑在 IO 线程上, 撤销是就地完成的 (幂等: 已撤销 / 已结束都算成功)
+        // 关闭中仍允许撤销: 插件在 `stop` 里退订也要生效 (旧实现与实例状态无关)
+        return detail::asyncTableOp<InstanceT, ManagerT>(
+            host,
+            cb,
+            cb_ud,
+            error_out,
+            "broadcasts.unsubscribe_broadcast",
+            [sub](InstanceT* inst, ManagerT* mgr) -> std::string {
+                (void)inst;
+                (void)mgr;
+                unsubscribePluginBroadcast(sub);
+                return std::string{};
+            },
+            /*allowClosing=*/true
+        );
     }
 
     /// `end_broadcast` (追加成员, v3): 属主结束一条流
-    static int32_t PLUGINXX_CALL broadcastEndEntry(
+    static PluginxxOperatorHandle* PLUGINXX_CALL broadcastEndEntry(
         const PluginxxHost*       host,
         const PluginxxStringView* broadcast_id,
         const PluginxxStringView* reason_json,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
         PluginxxString*           error_out
     ) {
         if (detail::abiViewEmpty(broadcast_id)) {
-            detail::setErrorString(error_out, "end_broadcast: missing id");
-            return PLUGINXX_RESULT_ERR_ARG;
+            setTableOpError(error_out, "end_broadcast: missing id");
+            return nullptr;
         }
         const std::string id     = svToStr(*broadcast_id);
         const std::string reason = reason_json ? svToStr(*reason_json) : std::string{};
-        return detail::onInstanceIo<InstanceT, ManagerT>(
+        return detail::asyncTableOp<InstanceT, ManagerT>(
             host,
-            [id, reason, error_out](InstanceT* inst, ManagerT* mgr) {
-                std::string local;
+            cb,
+            cb_ud,
+            error_out,
+            "broadcasts.end_broadcast",
+            [id, reason](InstanceT* inst, ManagerT* mgr) -> std::string {
+                std::string   local;
                 const int32_t rc = mgr->endBroadcastFrom(inst, id, reason, &local);
                 if (rc != PLUGINXX_RESULT_OK) {
-                    detail::setErrorString(error_out, local);
+                    throw TableOpError(
+                        local.empty() ? std::string{"end_broadcast failed"} : std::move(local)
+                    );
                 }
-                return rc;
+                return std::string{};
             }
         );
     }
@@ -613,7 +694,7 @@ struct GenericTableEntries {
     ///
     /// 结束回调的租赁保护与普通回调一致: `on_end` 在注册表锁外、在实例执行 lease 下调用
     /// (句柄的 `alive` 标志在摧销后立即失活, 不再回调已卸载的插件)。
-    static PluginxxSubscription* PLUGINXX_CALL broadcastSubscribeExEntry(
+    static PluginxxOperatorHandle* PLUGINXX_CALL broadcastSubscribeExEntry(
         const PluginxxHost*       host,
         const PluginxxScopeRef*   scope,
         const PluginxxStringView* broadcast_id,
@@ -621,68 +702,57 @@ struct GenericTableEntries {
         void(PLUGINXX_CALL* on_end)(const PluginxxStringView* reason_json, void* ud),
         void*                     ud,
         const PluginxxStringView* options_json,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
         PluginxxString*           error_out
     ) {
-        return guardVtableCall<PluginxxSubscription*>(nullptr, [&]() {
-            auto call = enterHost(host);
-            auto mgr  = call.manager();
-            auto inst = call.instance();
-            if (!mgr || !inst || detail::abiViewEmpty(broadcast_id) || !handler) {
-                detail::setErrorString(
-                    error_out,
-                    "subscribe_broadcast: missing instance, id, or handler"
-                );
-                return static_cast<PluginxxSubscription*>(nullptr);
-            }
-            auto              keep    = call;
-            const std::string id      = svToStr(*broadcast_id);
-            const std::string options = (options_json && options_json->data)
-                                            ? svToStr(*options_json)
-                                            : std::string{};
-            PluginxxScopeRef  scopeCopy{};
-            const bool        hasScope = pluginxx_scope_ref_ok(scope) && scope;
-            if (hasScope) {
-                scopeCopy = *scope;
-            }
-            auto* sub = ioCallSyncKeep<PluginxxSubscription*>(
-                keep,
-                mgr,
-                [keep, hasScope, scopeCopy, id, options, handler, on_end, ud]() {
-                    return keep.manager()->subscribeBroadcast(
-                        keep.instance(),
-                        hasScope ? &scopeCopy : nullptr,
-                        id,
-                        handler,
-                        ud,
-                        options,
-                        on_end
-                    );
-                }
-            );
-            if (!sub) {
-                detail::setErrorString(error_out, "subscribe_broadcast: rejected");
-            }
-            return sub;
-        });
+        return subscribeBroadcastOp(
+            host,
+            scope,
+            broadcast_id,
+            handler,
+            on_end,
+            ud,
+            options_json,
+            cb,
+            cb_ud,
+            error_out,
+            "broadcasts.subscribe_broadcast_ex"
+        );
     }
 
-    static int32_t PLUGINXX_CALL broadcastReadEntry(
+    static PluginxxOperatorHandle* PLUGINXX_CALL broadcastReadEntry(
         const PluginxxHost*       host,
         const PluginxxStringView* broadcast_id,
-        PluginxxString*           out_json
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
+        PluginxxString*           error_out
     ) {
-        if (!out_json || detail::abiViewEmpty(broadcast_id)) {
-            return PLUGINXX_RESULT_ERR_ARG;
+        if (detail::abiViewEmpty(broadcast_id)) {
+            setTableOpError(error_out, "read_broadcast: missing id");
+            return nullptr;
         }
-        return guardVtableCall<int32_t>(PLUGINXX_RESULT_ERR_ARG, [&]() -> int32_t {
-            auto call = enterHost(host, /*allowClosing=*/true);
-            auto mgr  = call.manager();
-            if (!mgr) {
-                return PLUGINXX_RESULT_ERR_ARG;
-            }
-            const std::string id = svToStr(*broadcast_id);
-            return mgr->readBroadcast(id, out_json);
-        });
+        const std::string id = svToStr(*broadcast_id);
+        return detail::asyncTableOp<InstanceT, ManagerT>(
+            host,
+            cb,
+            cb_ud,
+            error_out,
+            "broadcasts.read_broadcast",
+            [id](InstanceT* inst, ManagerT* mgr) -> std::string {
+                (void)inst;
+                std::string   value;
+                const int32_t rc = mgr->readBroadcastText(id, &value);
+                if (rc != PLUGINXX_RESULT_OK) {
+                    const char* name = result::nameOf(rc);
+                    throw TableOpError(
+                        fmt::format("read_broadcast: {}", name ? name : "failed")
+                    );
+                }
+                return value;
+            },
+            /*allowClosing=*/true
+        );
     }
 
     // =====================================================================

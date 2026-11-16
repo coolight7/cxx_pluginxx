@@ -99,12 +99,14 @@ extern "C" {
 /// v2: `subscribe_broadcast` 多一个 `options_json` (每个订阅方自己声明通知频率);
 ///     声明字段 `writable` 改名 `publish`, 宏改成 `PLUGINXX_BROADCAST_PUBLISH_*`
 /// v3: 表尾追加 `end_broadcast` (属主结束一条流) 与 `subscribe_broadcast_ex`
-///     (订阅时带结束回调); 基线不变, 调用点用 `ifaceHas` 判定
-#define PLUGINXX_IFACE_BROADCASTS_VERSION     3
-#define PLUGINXX_IFACE_BROADCASTS_MIN_VERSION 2
+///     (订阅时带结束回调)
+/// v4: 7 个成员改成异步操作契约 (受理即返回, 结果经完成回调交回):
+///     订阅句柄以十进制文本放在 `payload` 里 (见 [PluginxxBroadcastsIface] 的说明),
+///     `unsubscribe_broadcast` 多一个 `host` 参数, 基线重置为整表长度
+#define PLUGINXX_IFACE_BROADCASTS_VERSION     4
+#define PLUGINXX_IFACE_BROADCASTS_MIN_VERSION 4
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
-#define PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE \
-    (offsetof(PluginxxBroadcastsIface, end_broadcast))
+#define PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE sizeof(PluginxxBroadcastsIface)
 
 /// 广播的结果码：通用段与广播段都在 `pluginxx/api/result.h`（码表只有一份）
 ///
@@ -122,67 +124,88 @@ typedef struct PluginxxBroadcastsIface {
     ///     "pushOnSubscribe": true, "coalesce": true, "scope": "app"}`
     ///   (`id` 可用短名: 主程序补成 `plugin.<本插件 id>.<名字>`);
     /// - 应用已声明的 id 不能被插件改写; 插件自己的 id 后声明者覆盖;
-    /// - 失败返回 [PLUGINXX_RESULT_ERR_ARG] / [PLUGINXX_RESULT_ERR_PERMISSION] 并写 `error_out`
-    int32_t(PLUGINXX_CALL* declare_broadcast)(
+    /// - 业务失败经完成回调交回 (名称见 [pluginxx/api/result.h] 的广播段)
+    PluginxxOperatorHandle*(PLUGINXX_CALL* declare_broadcast)(
         const PluginxxHost*       host,
         const PluginxxStringView* decl_json,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
         PluginxxString*           error_out
     );
 
     /// 发布 (**任意线程**): 属主发 `publish: owner` 的频道, 任何插件发 `publish: anyone` 的频道
-    int32_t(PLUGINXX_CALL* publish_broadcast)(
+    PluginxxOperatorHandle*(PLUGINXX_CALL* publish_broadcast)(
         const PluginxxHost*       host,
         const PluginxxStringView* broadcast_id,
         const PluginxxStringView* payload_json,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
         PluginxxString*           error_out
     );
 
     /// 订阅 (**任意线程**)
-    /// - `pushOnSubscribe` 的频道在返回值之前用当前值回调一次 (没有当前值时不回调),
+    /// - `pushOnSubscribe` 的频道在订阅生效后用当前值回调一次 (没有当前值时不回调),
     ///   这次回调算该订阅的第一条通知, 也是限频窗口的起点;
     /// - `options_json` 可空, 形如 `{"intervalMs": 200, "mode": "delay|drop"}`:
     ///   `intervalMs` = 通知间隔 (毫秒, 0 / 缺省 = 不限频), `mode` = 间隔内只留最新 (delay) /
     ///   直接丢掉 (drop);
-    /// - 失败返回 NULL 并写 `error_out` (句柄用 [unsubscribe_broadcast] 撤销)
-    PluginxxSubscription*(PLUGINXX_CALL* subscribe_broadcast)(
+    /// - **完成时 `payload` 是订阅句柄的十进制文本** (`PluginxxSubscription` 的地址),
+    ///   调用方原样转回 [unsubscribe_broadcast] 即可; 主程序在实例卸载时也会一并回收
+    PluginxxOperatorHandle*(PLUGINXX_CALL* subscribe_broadcast)(
         const PluginxxHost*       host,
         const PluginxxScopeRef*   scope,
         const PluginxxStringView* broadcast_id,
         void(PLUGINXX_CALL* handler)(const PluginxxStringView* payload_json, void* ud),
         void*                     ud,
         const PluginxxStringView* options_json,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
         PluginxxString*           error_out
     );
 
-    /// 读当前值 (同步): 成功返回 [PLUGINXX_RESULT_OK] 并写 `out_json`;
-    /// 没有声明返回 [PLUGINXX_RESULT_ERR_NOT_DECLARED], 没有当前值返回 [PLUGINXX_RESULT_ERR_NO_VALUE]
-    int32_t(PLUGINXX_CALL* read_broadcast)(
+    /// 读当前值: 成功时 `payload` 是当前值 JSON;
+    /// 没有声明按 `not_declared` 失败, 没有当前值按 `no_value` 失败
+    PluginxxOperatorHandle*(PLUGINXX_CALL* read_broadcast)(
         const PluginxxHost*       host,
         const PluginxxStringView* broadcast_id,
-        PluginxxString*           out_json
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
+        PluginxxString*           error_out
     );
 
-    /// 撤销订阅 (**幂等**, 任意线程)
-    void(PLUGINXX_CALL* unsubscribe_broadcast)(PluginxxSubscription* sub);
+    /// 撤销订阅 (**幂等**, 任意线程; 完成时没有 `payload`)
+    ///
+    /// 句柄来自 [subscribe_broadcast] / [subscribe_broadcast_ex] 的 `payload`;
+    /// 已撤销或从未存在的句柄按成功处理。
+    PluginxxOperatorHandle*(PLUGINXX_CALL* unsubscribe_broadcast)(
+        const PluginxxHost*      host,
+        PluginxxSubscription*    sub,
+        PluginxxOperatorCallback cb,
+        void*                    cb_ud,
+        PluginxxString*          error_out
+    );
 
     /// 结束一条流 (追加成员, v3)
     ///
     /// - `writer` 由框架按调用实例的插件 id 代; 应用自己结束走 C++ 层
-    ///   (`PluginHostCore::endBroadcast`) 或传空的 writer;
-    /// - 结束后: 发布返回 [PLUGINXX_RESULT_ERR_ENDED]、`read` 也返回它、
+    ///   (`PluginHostCore::endBroadcast`);
+    /// - 结束后: 发布按 `ended` 失败、`read` 也按它失败、
     ///   全部订阅按 `on_end` 回调一次并摧除;
     /// - 重复结束是幂等成功; 再次 `declare` 同一个 id = 开一条新流。
-    int32_t(PLUGINXX_CALL* end_broadcast)(
+    PluginxxOperatorHandle*(PLUGINXX_CALL* end_broadcast)(
         const PluginxxHost*       host,
         const PluginxxStringView* broadcast_id,
         const PluginxxStringView* reason_json,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
         PluginxxString*           error_out
     );
 
     /// 订阅 (带流结束回调; 追加成员, v3)
     ///
     /// 与 [subscribe_broadcast] 只差 `on_end`: 频道被结束时用 reason JSON 回调一次。
-    PluginxxSubscription*(PLUGINXX_CALL* subscribe_broadcast_ex)(
+    /// 完成时 `payload` 同样是订阅句柄的十进制文本。
+    PluginxxOperatorHandle*(PLUGINXX_CALL* subscribe_broadcast_ex)(
         const PluginxxHost*       host,
         const PluginxxScopeRef*   scope,
         const PluginxxStringView* broadcast_id,
@@ -190,6 +213,8 @@ typedef struct PluginxxBroadcastsIface {
         void(PLUGINXX_CALL* on_end)(const PluginxxStringView* reason_json, void* ud),
         void*                     ud,
         const PluginxxStringView* options_json,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
         PluginxxString*           error_out
     );
 } PluginxxBroadcastsIface;

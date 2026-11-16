@@ -872,16 +872,27 @@ public:
     }
 
     /// 读当前值 (**任意线程**; 注册表内部加锁)
+    ///
+    /// `outJson` 由主程序堆分配 (调用方用 `PluginString::free` 还回)。
     int readBroadcast(std::string_view broadcastId, PluginxxString* outJson) const {
         std::string value;
-        if (!broadcasts_->read(broadcastId, &value)) {
+        const int   rc = readBroadcastText(broadcastId, &value);
+        if (rc != PLUGINXX_RESULT_OK) {
+            return rc;
+        }
+        detail::setErrorString(outJson, value);
+        return PLUGINXX_RESULT_OK;
+    }
+
+    /// 读当前值 (结果给 `std::string`; 异步表入口直接把它当 `payload` 交回)
+    int readBroadcastText(std::string_view broadcastId, std::string* outJson) const {
+        if (!broadcasts_->read(broadcastId, outJson)) {
             if (broadcasts_->isEnded(broadcastId)) {
                 return PLUGINXX_RESULT_ERR_ENDED;
             }
             return broadcasts_->declares(broadcastId) ? PLUGINXX_RESULT_ERR_NO_VALUE
                                                       : PLUGINXX_RESULT_ERR_NOT_DECLARED;
         }
-        detail::setErrorString(outJson, value);
         return PLUGINXX_RESULT_OK;
     }
 

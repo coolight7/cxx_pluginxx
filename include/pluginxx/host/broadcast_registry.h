@@ -31,6 +31,7 @@
 #pragma once
 
 #include "pluginxx/api/abi.h"
+#include "pluginxx/api/broadcast_handle.h"
 #include "pluginxx/export.h"
 #include "pluginxx/runtime/runtime.h"
 #include "utilxx_base/json.h"
@@ -320,6 +321,12 @@ struct PluginxxSubscription {
 };
 
 namespace pluginxx {
+
+/// 订阅句柄 ⇄ 表成员完成回调的 `payload` 文本
+///
+/// 订阅是异步操作契约: 句柄只能经 `payload` 交回。转换实现与插件侧共用
+/// [pluginxx/api/broadcast_handle.h]。
+
 namespace detail {
 
 /// 撤销簿记的具体动作 (**须在主程序 IO 线程执行**): 撤销注册表订阅并移出实例订阅表。
