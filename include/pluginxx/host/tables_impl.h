@@ -12,8 +12,8 @@
 /// }
 /// ```
 ///
-/// 覆盖 10 张通用表: log / json / config / plugins / broadcasts / scheduler /
-/// coroutine_runtime / tasks / cancel / capabilities。入口体只做三件事:
+/// 覆盖 9 张通用表: log / json / config / plugins / broadcasts / scheduler /
+/// tasks / cancel / capabilities。入口体只做三件事:
 /// 解析框架控制块 (取实例/管理器 + admission lease) → 投递到 IO 线程 → 调用
 /// [PluginHostCore] 的同名方法; 业务数据一律由 [DomainServices] 提供。
 ///
@@ -831,22 +831,6 @@ struct GenericTableEntries {
         return (mgr && mgr->isIoThread()) ? 1 : 0;
     }
 
-    static int32_t PLUGINXX_CALL
-        postToIoEntry(const PluginxxHost* host, void(PLUGINXX_CALL* fn)(void*), void* ud) {
-        return guardVtableCall(-1, [&]() -> int32_t {
-            auto call = enterHost(host);
-            auto mgr  = call.manager();
-            auto inst = call.instance();
-            if (!mgr || !inst || !fn) {
-                return -1;
-            }
-            auto keep = call;
-            return ioCallSyncKeep<int32_t>(keep, mgr, [keep, fn, ud]() -> int32_t {
-                return keep.manager()->postCallback(keep.instance(), fn, ud) ? 0 : -1;
-            });
-        });
-    }
-
     static PluginxxOperatorHandle* PLUGINXX_CALL sleepEntry(
         const PluginxxHost*      host,
         int64_t                       ms,
@@ -909,13 +893,10 @@ struct GenericTableEntries {
         });
     }
 
-    /// Operation 取消 (scheduler / capabilities / tasks 三张表共用)
-    static void PLUGINXX_CALL opCancelEntry(PluginxxOperatorHandle* op) {
-        cancelPluginOperation(op);
-    }
+    /// Operation 取消由 `<应用名>.cancel` 表唯一提供 (`op_cancel`), 本集合不再自带一份
 
     // =====================================================================
-    // coroutine_runtime 表
+    // 协程驱动 (v2 起并入 scheduler 表)
     // =====================================================================
 
     /// 申请一次驱动请求 (任意线程可调用; 永不内联回调)
@@ -985,6 +966,11 @@ struct GenericTableEntries {
                 XX_LOGW("Plugin driver cancellation ignored: handle is not an active ticket");
             }
         });
+    }
+
+    /// Operation 取消 (`<应用名>.cancel` 表的唯一入口; tasks 表复用它)
+    static void PLUGINXX_CALL opCancelEntry(PluginxxOperatorHandle* op) {
+        cancelPluginOperation(op);
     }
 
     // =====================================================================
@@ -1093,7 +1079,6 @@ struct GenericTableEntries {
             &capabilityInvokeEntry,
             &capabilityInfoEntry,
             &capabilityListEntry,
-            &opCancelEntry,
             &capabilityInvokeExEntry,
             &capabilityUnregisterExEntry,
         };
@@ -1105,21 +1090,10 @@ struct GenericTableEntries {
             PLUGINXX_IFACE_SCHEDULER_VERSION,
             sizeof(PluginxxSchedulerIface),
             &isIoThreadEntry,
-            &postToIoEntry,
             &sleepEntry,
-            &opCancelEntry,
             &offloadEntry,
-        };
-        return iface;
-    }
-
-    static const PluginxxCoroutineRuntimeIface& coroutineRuntimeIface() {
-        static const PluginxxCoroutineRuntimeIface iface{
-            PLUGINXX_IFACE_COROUTINE_RUNTIME_VERSION,
-            sizeof(PluginxxCoroutineRuntimeIface),
             &requestDriverEntry,
             &cancelDriverEntry,
-            &isIoThreadEntry,
         };
         return iface;
     }
@@ -1146,8 +1120,8 @@ struct GenericTableEntries {
 
 /// 通用表的表名清单 (IID 里 `<应用名>.` 之后那一段): 应用名不一致时用来给提示
 inline constexpr std::string_view kGenericTableNames[] = {
-    "log",         "json",     "config",    "plugins",    "broadcasts",
-    "capabilities", "scheduler", "coroutine_runtime", "tasks", "cancel",
+    "log",  "json",      "config",    "plugins",  "broadcasts",
+    "capabilities", "scheduler", "tasks", "cancel",
 };
 
 /// `iid` 是否以 `.<已知通用表名>` 结尾
@@ -1193,9 +1167,6 @@ const void* queryGenericPluginIface(std::string_view iid) {
     }
     if (iid == PLUGINXX_IFACE_SCHEDULER) {
         return &Entries::schedulerIface();
-    }
-    if (iid == PLUGINXX_IFACE_COROUTINE_RUNTIME) {
-        return &Entries::coroutineRuntimeIface();
     }
     if (iid == PLUGINXX_IFACE_TASKS) {
         return &Entries::tasksIface();

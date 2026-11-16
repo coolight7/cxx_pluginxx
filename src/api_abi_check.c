@@ -22,7 +22,8 @@ _Static_assert(
     "PluginxxStringView::size 必须是 8 字节定长类型"
 );
 
-/* 追加成员必须真的在表尾: 基线（老主程序可见的部分）止于第一个追加成员。
+/* 追加成员必须真的在表尾: 基线（老主程序可见的部分）要么等于完整布局
+   （刚重置过基线，此时没有追加段），要么止于第一个追加成员。
    改动布局时这里会先报错, 比运行期“读到别人的内存”更早发现。 */
 _Static_assert(
     PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE
@@ -30,17 +31,18 @@ _Static_assert(
     "broadcasts 基线必须止于第一个追加成员"
 );
 _Static_assert(
-    PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE
-        == offsetof(PluginxxCapabilitiesIface, invoke_capability_ex),
-    "capabilities 基线必须止于第一个追加成员"
-);
-_Static_assert(
     PLUGINXX_IFACE_BROADCASTS_BASELINE_SIZE < sizeof(PluginxxBroadcastsIface),
     "broadcasts 必须真的追加了成员"
 );
+/* capabilities 在 v7 重置过基线 (删了 op_cancel), 当前没有追加段 */
 _Static_assert(
-    PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE < sizeof(PluginxxCapabilitiesIface),
-    "capabilities 必须真的追加了成员"
+    PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE <= sizeof(PluginxxCapabilitiesIface),
+    "capabilities 基线不得超过完整布局"
+);
+/* scheduler 在 v2 重置过基线 (删 post_to_io / op_cancel, 并入 driver 两成员) */
+_Static_assert(
+    PLUGINXX_IFACE_SCHEDULER_BASELINE_SIZE <= sizeof(PluginxxSchedulerIface),
+    "scheduler 基线不得超过完整布局"
 );
 
 /* 入口符号名由主程序提供 (插件框架不定义主程序专名, 见 pluginxx/api/entry.h):

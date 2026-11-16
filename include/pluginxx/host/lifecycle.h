@@ -111,9 +111,16 @@ public:
         const PluginManifestInterfaces& interfaces        = {}
     ) {
         std::string err;
-        void*       dl = NativeLoader::open(path, err);
+        void*       dl = nullptr;
+        // `dlopen` 会读盘并跑插件静态初始化 (有些插件在 DSO 构造里建索引): 不放在
+        // 主程序 IO 线程上做。默认实现在调用线程直接执行, 派生类可以改投线程池。
+        auto openError = co_await runLoaderTask([&path, &dl]() -> std::string {
+            std::string openErr;
+            dl = NativeLoader::open(path, openErr);
+            return dl ? std::string{} : openErr;
+        });
         if (!dl) {
-            XX_LOGE("{}Plugin load failed: {}: {}", logTag(), path, err);
+            XX_LOGE("{}Plugin load failed: {}: {}", logTag(), path, openError);
             co_return nullptr;
         }
 
@@ -228,25 +235,28 @@ public:
 
         this->plugins_[inst->name] = inst;
         int rc                     = -1;
-        try {
-            rc = createFn(inst->hostView(), &inst->pluginCtx);
-            // 即使 create 返回失败，只要把上下文交出去了，destroy 仍是主程序的责任。
-            inst->pluginCreated = (inst->pluginCtx != nullptr);
-        } catch (const std::exception& e) {
-            XX_LOGE("{}Plugin `{}` create threw: {}", logTag(), inst->name, e.what());
-            rc = -1;
-        } catch (...) {
-            XX_LOGE("{}Plugin `{}` create threw unknown exception", logTag(), inst->name);
-            rc = -1;
-        }
+        // `create` 是插件的构造期: 允许读配置/建索引, 但不允许注册与起线程。
+        // 和其它阻塞动作一样不放在主程序 IO 线程上 (派生类可改投线程池)。
+        auto createError = co_await runLoaderTask([&]() -> std::string {
+            try {
+                rc = createFn(inst->hostView(), &inst->pluginCtx);
+                // 即使 create 返回失败，只要把上下文交出去了，destroy 仍是主程序的责任。
+                inst->pluginCreated = (inst->pluginCtx != nullptr);
+            } catch (const std::exception& e) {
+                rc = -1;
+                return fmt::format("create threw: {}", e.what());
+            } catch (...) {
+                rc = -1;
+                return std::string{"create threw unknown exception"};
+            }
+            if (rc == 0) {
+                return std::string{};
+            }
+            return fmt::format("create failed (code={})", rc);
+        });
 
-        if (rc != 0) {
-            XX_LOGE(
-                "{}Plugin `{}` create failed (code={}), performing rollback",
-                logTag(),
-                inst->name,
-                rc
-            );
+        if (!createError.empty()) {
+            XX_LOGE("{}Plugin `{}` {}, performing rollback", logTag(), inst->name, createError);
             rollbackLoad(inst, /*closeHandle=*/true);
             co_return nullptr;
         }
@@ -843,6 +853,17 @@ protected:
     /// 同进程可能同时存在多个主程序实例, 日志前缀用于区分
     virtual std::string_view logTag() const noexcept {
         return {};
+    }
+
+    /// 把一段**阻塞**的加载动作 (dlopen / 符号查找 / `get_info` / `create`) 交给底层线程
+    ///
+    /// - 默认实现在调用线程直接执行 (`fn` 返回错误文本, 空 = 成功);
+    /// - 派生类可以覆写成线程池投递: 插件加载与 `create` 里的读盘/建索引因此不再占用
+    ///   主程序 IO 线程 (客户端插件管理器一直是这样做的);
+    /// - `fn` 只做本地构造: **不得**调用主程序接口表 —— 它跑在别的线程上, 且此刻实例
+    ///   还没进入可用状态 (注册属于 `start`, 那是通知契约)。
+    virtual asio::awaitable<std::string> runLoaderTask(std::function<std::string()> fn) {
+        co_return fn();
     }
 
     /// 摘除实例的**业务**注册 (工具/权限/回调/图节点/提示词贡献 等)

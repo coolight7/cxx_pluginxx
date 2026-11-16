@@ -108,16 +108,6 @@ static_assert(PLUGINXX_IFACE_SCHEDULER_BASELINE_SIZE >= 8u);
 static_assert(PLUGINXX_IFACE_SCHEDULER_BASELINE_SIZE <= sizeof(PluginxxSchedulerIface));
 
 template<>
-struct IfaceMeta<PluginxxCoroutineRuntimeIface> {
-    static constexpr int32_t  min_version   = PLUGINXX_IFACE_COROUTINE_RUNTIME_MIN_VERSION;
-    static constexpr uint32_t baseline_size = PLUGINXX_IFACE_COROUTINE_RUNTIME_BASELINE_SIZE;
-};
-static_assert(PLUGINXX_IFACE_COROUTINE_RUNTIME_BASELINE_SIZE >= 8u);
-static_assert(
-    PLUGINXX_IFACE_COROUTINE_RUNTIME_BASELINE_SIZE <= sizeof(PluginxxCoroutineRuntimeIface)
-);
-
-template<>
 struct IfaceMeta<PluginxxPluginsIface> {
     static constexpr int32_t  min_version   = PLUGINXX_IFACE_PLUGINS_MIN_VERSION;
     static constexpr uint32_t baseline_size = PLUGINXX_IFACE_PLUGINS_BASELINE_SIZE;

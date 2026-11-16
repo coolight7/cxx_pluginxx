@@ -424,10 +424,9 @@ struct PluginIfaceCore {
     const PluginxxBroadcastsIface*   broadcasts   = nullptr; ///< "<应用名>.broadcasts"
     const PluginxxCapabilitiesIface* capabilities = nullptr; ///< "<应用名>.capabilities"
     const PluginxxSchedulerIface*    scheduler    = nullptr; ///< "<应用名>.scheduler"
-    /// "<应用名>.coroutine_runtime": 协程驱动 (host driver/wake 协议)
-    const PluginxxCoroutineRuntimeIface* coroutineRuntime = nullptr;
-    const PluginxxTasksIface*            tasks            = nullptr; ///< "<应用名>.tasks"
-    const PluginxxCancelIface*           cancel           = nullptr; ///< "<应用名>.cancel"
+    /// "<应用名>.cancel": 异步操作句柄的唯一取消入口
+    const PluginxxCancelIface* cancel = nullptr;
+    const PluginxxTasksIface*  tasks  = nullptr; ///< "<应用名>.tasks"
 
     /// 从主程序查询全部通用接口表 (host 为空时返回全 NULL 聚合)
     static PluginIfaceCore query(const PluginxxHost* host) {
@@ -444,10 +443,8 @@ struct PluginIfaceCore {
         f.capabilities
             = queryInterface<PluginxxCapabilitiesIface>(host, PLUGINXX_IFACE_CAPABILITIES);
         f.scheduler = queryInterface<PluginxxSchedulerIface>(host, PLUGINXX_IFACE_SCHEDULER);
-        f.coroutineRuntime
-            = queryInterface<PluginxxCoroutineRuntimeIface>(host, PLUGINXX_IFACE_COROUTINE_RUNTIME);
-        f.tasks  = queryInterface<PluginxxTasksIface>(host, PLUGINXX_IFACE_TASKS);
-        f.cancel = queryInterface<PluginxxCancelIface>(host, PLUGINXX_IFACE_CANCEL);
+        f.tasks     = queryInterface<PluginxxTasksIface>(host, PLUGINXX_IFACE_TASKS);
+        f.cancel    = queryInterface<PluginxxCancelIface>(host, PLUGINXX_IFACE_CANCEL);
         return f;
     }
 };
@@ -928,15 +925,15 @@ public:
     static constexpr int64_t kPollBurstYieldMs = 1;
 
     PollOneBridge(
-        const PluginxxHost*                  host,
-        const PluginxxCoroutineRuntimeIface* runtime,
-        const PluginxxSchedulerIface*        scheduler = nullptr
+        const PluginxxHost*           host,
+        const PluginxxSchedulerIface* scheduler,
+        const PluginxxCancelIface*    cancel = nullptr
     ) :
         localIo_(1),
         work_(asio::make_work_guard(localIo_)),
         host_(host),
-        runtime_(runtime),
-        sched_(scheduler) {}
+        sched_(scheduler),
+        cancel_(cancel) {}
 
     PollOneBridge(const PollOneBridge&)            = delete;
     PollOneBridge& operator=(const PollOneBridge&) = delete;
@@ -972,8 +969,12 @@ public:
         return host_;
     }
 
-    const PluginxxCoroutineRuntimeIface* runtime() const noexcept {
-        return runtime_;
+    const PluginxxSchedulerIface* scheduler() const noexcept {
+        return sched_;
+    }
+
+    const PluginxxCancelIface* cancelIface() const noexcept {
+        return cancel_;
     }
 
     /// 是否仍有已知可运行工作 (显式 wake 未被请求覆盖, 或有已投递未执行的步骤)。
@@ -1041,10 +1042,10 @@ public:
 
     /// 当前线程是否主程序 IO 线程 (仅诊断; 不得据此内联执行 driver 回调)。
     bool onHostIoThread() const noexcept {
-        if (!host_ || !runtime_ || !runtime_->is_io_thread) {
+        if (!host_ || !sched_ || !sched_->is_io_thread) {
             return false;
         }
-        return runtime_->is_io_thread(host_) != 0;
+        return sched_->is_io_thread(host_) != 0;
     }
 
     /// 把一段插件侧代码投递到本地执行器, 由后续 host driver 推进。
@@ -1315,7 +1316,7 @@ private:
         }
         PluginxxString  error{nullptr, 0};
         PluginxxDriver* ticket
-            = runtime_->request_driver(host_, &PollOneBridge::driveOnceTrampoline, this, &error);
+            = sched_->request_driver(host_, &PollOneBridge::driveOnceTrampoline, this, &error);
         if (!ticket) {
             std::string message = "host refused coroutine driver";
             if (error.data) {
@@ -1350,8 +1351,8 @@ private:
     }
 
     void cancelTicket(PluginxxDriver* ticket) noexcept {
-        if (ticket && runtime_ && runtime_->cancel_driver) {
-            runtime_->cancel_driver(ticket);
+        if (ticket && sched_ && sched_->cancel_driver) {
+            sched_->cancel_driver(ticket);
         }
     }
 
@@ -1574,8 +1575,8 @@ private:
 
     /// 取消一个主程序调度句柄 (幂等; 已收束的句柄由主程序按空操作处理)。
     void cancelSchedulerOp(PluginxxOperatorHandle* op) noexcept {
-        if (op && sched_ && sched_->op_cancel) {
-            sched_->op_cancel(op);
+        if (op && cancel_ && cancel_->op_cancel) {
+            cancel_->op_cancel(op);
         }
     }
 
@@ -1584,11 +1585,11 @@ private:
     mutable std::mutex                                         mutex_;
     asio::io_context                                           localIo_;
     asio::executor_work_guard<asio::io_context::executor_type> work_;
-    const PluginxxHost*                                        host_    = nullptr;
-    const PluginxxCoroutineRuntimeIface*                       runtime_ = nullptr;
-    /// 主程序计时器/卸载接口表 (`scheduler.sleep` 用于受控轮询的退避时间片,
-    /// `op_cancel` 用于取消已排定的退避); 缺失时为 nullptr。
-    const PluginxxSchedulerIface* sched_ = nullptr;
+    const PluginxxHost*           host_    = nullptr;
+    /// 主程序调度与驱动表 (`request_driver` / `cancel_driver` / `sleep` 退避 + 取消)
+    const PluginxxSchedulerIface* sched_   = nullptr;
+    /// 异步操作句柄的唯一取消入口 (`cancel.op_cancel`)
+    const PluginxxCancelIface*    cancel_  = nullptr;
 
     bool            stopping_      = false;
     bool            wakePending_   = false;
@@ -3027,23 +3028,13 @@ inline void spawnTaskImpl(Ctx& ctx, Fn&& fn) {
     };
     rec->starter = starter;
     ctx.spawns_.push_back(rec);
-    // 首步仍在主程序 IO 线程排队执行 (与既有语义一致: spawn 不在 start 调用栈内跑任务体)
-    auto*      raw    = rec.get();
-    const auto status = ctx.iface.scheduler->post_to_io(
-        ctx.host,
-        [](void* ud) {
-            auto* rec = static_cast<SpawnRecord*>(ud);
-            if (rec && rec->starter) {
-                auto starterFn = std::move(rec->starter);
-                rec->starter   = nullptr;
-                starterFn();
-            }
-        },
-        raw
-    );
-    if (status != 0 && hostNotify.done) {
-        auto message = PluginStringView::fromCstr("spawn: failed to post task to IO");
-        hostNotify.done(hostNotify.host_ud, PLUGINXX_OPERATOR_FAILED, &message);
+    // 任务体仍然不在当前调用栈里跑: [startBridgedRoot] 会把首步投递到本地执行器,
+    // 由主程序下一次 driver 推进。所以这里直接调 starter 只是"建帧 + 排队",
+    // 不需要再借 scheduler 做一次阻塞往返 (早期的 post_to_io 已删除)。
+    if (rec->starter) {
+        auto starterFn = std::move(rec->starter);
+        rec->starter   = nullptr;
+        starterFn();
     }
 }
 
@@ -3097,8 +3088,8 @@ public:
         if (!bridge_) {
             bridge_ = std::make_unique<detail::PollOneBridge>(
                 host,
-                iface.coroutineRuntime,
-                iface.scheduler
+                iface.scheduler,
+                iface.cancel
             );
         }
         return *bridge_;
@@ -3332,6 +3323,8 @@ namespace detail {
 struct SleepAwaiter {
     const PluginxxHost*           host;
     const PluginxxSchedulerIface* sched;
+    /// 异步操作句柄的取消入口 (`cancel.op_cancel`)
+    const PluginxxCancelIface* cancel = nullptr;
     /// 协程驱动桥 (主程序支持时为非空): 完成回调经它投递 continuation 并唤醒 driver。
     PollOneBridge*          bridge = nullptr;
     int64_t                 ms;
@@ -3383,9 +3376,9 @@ struct SleepAwaiter {
             PluginString::free(host, &errorOut);
             return false;
         }
-        p.set_outstanding([sched = this->sched, operation = this->operation]() {
-            if (sched && sched->op_cancel && operation) {
-                sched->op_cancel(operation);
+        p.set_outstanding([cancel = this->cancel, operation = this->operation]() {
+            if (cancel && cancel->op_cancel && operation) {
+                cancel->op_cancel(operation);
             }
         });
         return true;
@@ -3423,7 +3416,9 @@ struct OffloadAwaiter {
 
     const PluginxxHost*           host;
     const PluginxxSchedulerIface* sched;
-    WorkFn                        work;
+    /// 异步操作句柄的取消入口 (`cancel.op_cancel`)
+    const PluginxxCancelIface* cancel = nullptr;
+    WorkFn                     work;
     /// 协程驱动桥。**注意**: offload 的工作体本身仍运行在主程序工作线程池
     /// (显式声明的例外), 只有"完成后的恢复"经桥回到 driver 序列。
     PollOneBridge*     bridge = nullptr;
@@ -3483,9 +3478,9 @@ struct OffloadAwaiter {
             PluginString::free(host, &errorOut);
             return false;
         }
-        p.set_outstanding([sched = this->sched, operation = this->operation]() {
-            if (sched && sched->op_cancel && operation) {
-                sched->op_cancel(operation);
+        p.set_outstanding([cancel = this->cancel, operation = this->operation]() {
+            if (cancel && cancel->op_cancel && operation) {
+                cancel->op_cancel(operation);
             }
         });
         return true;
@@ -3519,6 +3514,8 @@ enum class AwaiterState : uint32_t {
 struct InvokeCapState {
     const PluginxxHost*              host = nullptr;
     const PluginxxCapabilitiesIface* caps = nullptr;
+    /// 异步操作句柄的取消入口 (`cancel.op_cancel`)
+    const PluginxxCancelIface* cancelIface = nullptr;
     PluginxxScopeRef                 scope{}; ///< 归属引用 (借用视图指向 awaiter 内部)
     std::string                      scopeId;
     uint64_t                         scopeSeq = 0;
@@ -3553,6 +3550,7 @@ struct InvokeCapAwaiter {
     InvokeCapAwaiter(
         const PluginxxHost*              in_host,
         const PluginxxCapabilitiesIface* in_caps,
+        const PluginxxCancelIface*       in_cancel,
         std::string_view                 in_cap,
         std::string_view                 in_args,
         PollOneBridge*                   in_bridge   = nullptr,
@@ -3560,13 +3558,14 @@ struct InvokeCapAwaiter {
         uint64_t                         in_scopeSeq = 0
     ) :
         st(std::make_shared<InvokeCapState>()) {
-        st->host       = in_host;
-        st->caps       = in_caps;
-        st->capability = std::string(in_cap);
-        st->argsJson   = std::string(in_args);
-        st->bridge     = in_bridge;
-        st->scopeId    = std::string(in_scope);
-        st->scopeSeq   = in_scopeSeq;
+        st->host        = in_host;
+        st->caps        = in_caps;
+        st->cancelIface = in_cancel;
+        st->capability  = std::string(in_cap);
+        st->argsJson    = std::string(in_args);
+        st->bridge      = in_bridge;
+        st->scopeId     = std::string(in_scope);
+        st->scopeSeq    = in_scopeSeq;
     }
 
     bool await_ready() const noexcept {
@@ -3634,8 +3633,8 @@ struct InvokeCapAwaiter {
                 std::memory_order_acq_rel
             )) {
             h.promise().set_outstanding([st = this->st]() {
-                if (st->caps && st->caps->op_cancel && st->opHandle) {
-                    st->caps->op_cancel(st->opHandle);
+                if (st->cancelIface && st->cancelIface->op_cancel && st->opHandle) {
+                    st->cancelIface->op_cancel(st->opHandle);
                 }
             });
             return true;
@@ -3662,6 +3661,174 @@ struct InvokeCapAwaiter {
     }
 };
 
+/// 一次表调用的结果 (接口表成员统一走异步操作契约)
+///
+/// 两种"没拿到结果"要分开看:
+/// - `startError` 非空 = 主程序**没有受理**这次调用 (参数错 / 作用域失效 /
+///   实例正在关闭), 此时没有完成回调, `status` 无意义;
+/// - 已受理但 `status != PLUGINXX_OPERATOR_OK` = 执行期失败或取消, 正文是原因。
+struct TableOpResult {
+    int32_t     status = PLUGINXX_OPERATOR_FAILED;
+    std::string payload;
+    std::string startError;
+
+    /// 是否已受理 (false = 没有结果正文, 原因看 [startError])
+    bool accepted() const noexcept {
+        return startError.empty();
+    }
+    /// 已受理且执行成功
+    bool ok() const noexcept {
+        return accepted() && status == PLUGINXX_OPERATOR_OK;
+    }
+    /// 已受理但被取消
+    bool canceled() const noexcept {
+        return accepted() && status == PLUGINXX_OPERATOR_CANCELED;
+    }
+    /// 结果正文 (成功时是结果; 失败时是错误文本)
+    std::string_view text() const noexcept {
+        return payload;
+    }
+    /// 按 `1`/`0` 文本读标记 (旧接口用返回码表达"是/否"的成员)
+    ///
+    /// 空正文、`0`、`false`、`null` 都算 false; 其余非空文本算 true。
+    bool flag() const noexcept {
+        const auto v = trimmed();
+        return !v.empty() && v != "0" && v != "false" && v != "null";
+    }
+    /// 按十进制文本读整数 (读不到用 `fallback`)
+    int64_t integer(int64_t fallback = 0) const noexcept {
+        long long v = 0;
+        if (!parseWholeInteger(trimmed(), v)) {
+            return fallback;
+        }
+        return static_cast<int64_t>(v);
+    }
+
+private:
+
+    std::string_view trimmed() const noexcept {
+        std::string_view v{payload};
+        while (!v.empty() && isArgSpace(v.front())) {
+            v.remove_prefix(1);
+        }
+        while (!v.empty() && isArgSpace(v.back())) {
+            v.remove_suffix(1);
+        }
+        return v;
+    }
+};
+
+/// 取一个主程序堆字符串出参并把内存还回去 (空出参得到空串)
+inline std::string takeHostError(const PluginxxHost* host, PluginxxString& s) {
+    std::string out;
+    if (s.data) {
+        out.assign(s.data, static_cast<size_t>(s.size));
+        PluginString::free(host, &s);
+    }
+    return out;
+}
+
+/// 表调用在等待期间共享的状态 (堆上持有: 完成回调与 awaiter 各持一份)
+struct TableOpState {
+    const PluginxxHost*        host         = nullptr;
+    const PluginxxCancelIface* cancelIface = nullptr;
+    PluginxxOperatorHandle*    opHandle    = nullptr;
+    int32_t                    status      = PLUGINXX_OPERATOR_FAILED;
+    std::string                payload;
+    std::string                startError;
+    std::atomic<AwaiterState>  state{AwaiterState::INIT};
+    void*                      coroAddr = nullptr;
+
+    TableOpState(const PluginxxHost* inHost, const PluginxxCancelIface* inCancel) :
+        host(inHost),
+        cancelIface(inCancel) {}
+};
+
+/// `co_await tableOp(...)` 的 awaiter
+///
+/// `StartFn` 就是"把收尾三件套转交给表成员"的调用体:
+/// `(PluginxxOperatorCallback cb, void* ud, PluginxxString* error_out) -> PluginxxOperatorHandle*`。
+/// 完成回调不直接恢复插件协程, 而是经协程驱动桥恢复 (同 [InvokeCapAwaiter] 的协议)。
+template<typename StartFn>
+struct TableOpAwaiter {
+    std::shared_ptr<TableOpState> st;
+    StartFn                       start;
+    PollOneBridge*                bridge = nullptr;
+
+    bool await_ready() const noexcept {
+        return false;
+    }
+
+    template<typename Promise>
+    bool await_suspend(std::coroutine_handle<Promise> h) {
+        st->coroAddr = h.address();
+        st->state.store(AwaiterState::CALLING, std::memory_order_release);
+
+        auto*          holder = new std::shared_ptr<TableOpState>(st);
+        PluginxxString err{nullptr, 0};
+        auto*          bridgePtr = bridge;
+        st->opHandle = start(
+            [bridgePtr](void* ud, int32_t cbStatus, const PluginxxStringView* payload) {
+                auto* hp = static_cast<std::shared_ptr<TableOpState>*>(ud);
+                auto  s  = *hp;
+                delete hp;
+
+                s->status = cbStatus;
+                if (payload && payload->data && payload->size > 0) {
+                    s->payload.assign(payload->data, static_cast<size_t>(payload->size));
+                }
+
+                auto expected = AwaiterState::CALLING;
+                if (s->state.compare_exchange_strong(
+                        expected,
+                        AwaiterState::COMPLETED,
+                        std::memory_order_acq_rel
+                    )) {
+                    return;
+                }
+
+                auto handle = std::coroutine_handle<Promise>::from_address(s->coroAddr);
+                handle.promise().clear_outstanding();
+                resumePluginCoroutine(bridgePtr, handle);
+            },
+            holder,
+            &err
+        );
+
+        if (!st->opHandle) {
+            delete holder;
+            st->startError = takeHostError(st->host, err);
+            if (st->startError.empty()) {
+                st->startError = "plugin table call was not accepted";
+            }
+            return false;
+        }
+
+        auto expected = AwaiterState::CALLING;
+        if (st->state.compare_exchange_strong(
+                expected,
+                AwaiterState::SUSPENDED,
+                std::memory_order_acq_rel
+            )) {
+            h.promise().set_outstanding([state = st]() {
+                if (state->cancelIface && state->cancelIface->op_cancel && state->opHandle) {
+                    state->cancelIface->op_cancel(state->opHandle);
+                }
+            });
+            return true;
+        }
+        return false;
+    }
+
+    TableOpResult await_resume() {
+        TableOpResult r;
+        r.status     = st->status;
+        r.payload    = std::move(st->payload);
+        r.startError = std::move(st->startError);
+        return r;
+    }
+};
+
 } // namespace detail
 
 /// 主程序计时器适配 (非轮询): 计时器到期时主程序回调 adapter, adapter 把 continuation
@@ -3669,11 +3836,17 @@ struct InvokeCapAwaiter {
 /// 推进, 因此既不需要额外线程, 也不占用主程序 IO 线程执行插件工作。
 template<typename Ctx>
 inline detail::SleepAwaiter sleep(const Ctx& ctx, int64_t ms) noexcept {
-    return detail::SleepAwaiter{ctx.host, ctx.iface.scheduler, &ctx.bridge(), ms};
+    return detail::SleepAwaiter{
+        ctx.host,
+        ctx.iface.scheduler,
+        ctx.iface.cancel,
+        &ctx.bridge(),
+        ms
+    };
 }
 
-/// 让出一轮 (等价于"下一位"): 有桥时投递 continuation + 唤醒 driver,
-/// 由下一次请求推进; 无桥时沿用主程序 post_to_io。
+/// 让出一轮 (等价于"下一位"): 投递 continuation + 唤醒 driver,
+/// 由下一次请求推进, 因此主程序与插件任务按轮次交替。
 template<typename Ctx>
 inline detail::YieldAwaiter yield(const Ctx& ctx) noexcept {
     return detail::YieldAwaiter{ctx.host, &ctx.bridge()};
@@ -3686,6 +3859,7 @@ inline auto offload(const Ctx& ctx, WorkFn&& work) {
     return detail::OffloadAwaiter<std::decay_t<WorkFn>>{
         ctx.host,
         ctx.iface.scheduler,
+        ctx.iface.cancel,
         std::forward<WorkFn>(work),
         &ctx.bridge()
     };
@@ -3700,6 +3874,7 @@ inline detail::InvokeCapAwaiter invoke_cap(
     return detail::InvokeCapAwaiter{
         ctx.host,
         ctx.iface.capabilities,
+        ctx.iface.cancel,
         capability,
         argsJson,
         &ctx.bridge()
@@ -3717,12 +3892,179 @@ inline detail::InvokeCapAwaiter invoke_cap(
     return detail::InvokeCapAwaiter{
         ctx.host,
         ctx.iface.capabilities,
+        ctx.iface.cancel,
         capability,
         argsJson,
         &ctx.bridge(),
         scope.id(),
         scope.seq()
     };
+}
+
+/// 表调用的结果类型 (`pluginxx::detail::TableOpResult` 的对外别名)
+using TableOpResult = detail::TableOpResult;
+
+/// 调用接口表成员并等结果 (**协程形态**)
+///
+/// `start` 把收尾三件套原样转交给表成员, 例如:
+/// ```cpp
+/// auto r = co_await tableOp(ctx, [&](auto cb, auto ud, auto err) {
+///     return iface->get_messages(host, scope, &sid, cb, ud, err);
+/// });
+/// if (!r.ok()) { log("读会话失败: {}", r.text()); }
+/// ```
+/// - 返回 [detail::TableOpResult]: 同时带"是否受理"与执行状态, 业务失败**不抛异常**
+///   (取消也是其中一种状态), 由调用方自己决定怎么处理;
+/// - 协程被取消时经 `cancel.op_cancel` 取消这次调用 (协作式);
+/// - 注册类调用必须 `co_await` 完再继续 —— "登记后立刻可见"的顺序语义靠它保证。
+template<typename Ctx, typename StartFn>
+inline detail::TableOpAwaiter<std::decay_t<StartFn>> tableOp(const Ctx& ctx, StartFn&& start) {
+    return detail::TableOpAwaiter<std::decay_t<StartFn>>{
+        std::make_shared<detail::TableOpState>(ctx.host, ctx.iface.cancel),
+        std::forward<StartFn>(start),
+        &ctx.bridge()
+    };
+}
+
+/// 调用接口表成员并把结果交给回调 (**回调形态**, 任意线程)
+///
+/// `done` 在主程序 IO 线程被调用恰好一次 (含"未受理"的情况, 此时
+/// `result.accepted() == false`)。回调里不要长时间阻塞: 那是主程序 IO 线程。
+template<typename Ctx, typename StartFn, typename DoneFn>
+inline void tableOpCallback(const Ctx& ctx, StartFn&& start, DoneFn&& done) {
+    using Done = std::decay_t<DoneFn>;
+    auto* work = new Done(std::forward<DoneFn>(done));
+    PluginxxString err{nullptr, 0};
+    auto handle = start(
+        [](void* ud, int32_t status, const PluginxxStringView* payload) {
+            std::unique_ptr<Done> fn(static_cast<Done*>(ud));
+            detail::TableOpResult r;
+            r.status = status;
+            if (payload && payload->data && payload->size > 0) {
+                r.payload.assign(payload->data, static_cast<size_t>(payload->size));
+            }
+            (*fn)(r);
+        },
+        work,
+        &err
+    );
+    if (!handle) {
+        std::unique_ptr<Done> fn(work);
+        detail::TableOpResult r;
+        r.startError = detail::takeHostError(ctx.host, err);
+        if (r.startError.empty()) {
+            r.startError = "plugin table call was not accepted";
+        }
+        (*fn)(std::move(r));
+    }
+}
+
+/// 调用接口表成员并等结果 (**阻塞形态**)
+///
+/// 适用位置: 插件自己的线程、`blocking_tool` 的实现体、初始化代码。
+///
+/// 线程规则:
+/// - **非 IO 线程**: 真等到完成回调, `timeoutMs > 0` 时到点先请求取消
+///   (`cancel.op_cancel`), 然后继续等 —— 取消是协作式的, 主程序**一定会**交回结果,
+///   所以不会留下悬空的等待对象;
+/// - **IO 线程上**: 不等待 (那会把主程序卡死)。主程序的表操作在调用方本来就在
+///   IO 线程时是**内联执行**的, 因此正常情况这里已经拿到结果;
+///   万一没有 (实现内部真的异步化了), 返回 `accepted() == false` 并说明原因,
+///   调用方按"没有结果"处理, 不会死锁。
+///
+/// 只有 `host` / `start` 的场景 (如脚本引擎) 用 [tableOpBlockingRaw]。
+template<typename Ctx, typename StartFn>
+inline detail::TableOpResult
+    tableOpBlocking(const Ctx& ctx, StartFn&& start, int64_t timeoutMs = 0);
+
+/// [tableOpBlocking] 的裸参数形态 (没有插件上下文对象时用)
+template<typename StartFn>
+inline detail::TableOpResult tableOpBlockingRaw(
+    const PluginxxHost*           host,
+    const PluginxxCancelIface*    cancel,
+    const PluginxxSchedulerIface* scheduler,
+    StartFn&&                     start,
+    int64_t                       timeoutMs = 0
+) {
+    detail::TableOpResult out;
+
+    struct Wait {
+        std::mutex              mutex;
+        std::condition_variable cv;
+        bool                    done   = false;
+        int32_t                 status = PLUGINXX_OPERATOR_FAILED;
+        std::string             payload;
+    };
+    auto holder = std::make_shared<Wait>();
+    auto waitOn = [](void* ud, int32_t status, const PluginxxStringView* payload) {
+        std::unique_ptr<std::shared_ptr<Wait>> keep(static_cast<std::shared_ptr<Wait>*>(ud));
+        auto&                                  w = **keep;
+        std::lock_guard                        lock(w.mutex);
+        w.status = status;
+        if (payload && payload->data && payload->size > 0) {
+            w.payload.assign(payload->data, static_cast<size_t>(payload->size));
+        }
+        w.done = true;
+        w.cv.notify_all();
+    };
+
+    PluginxxString err{nullptr, 0};
+    auto           handle = start(waitOn, new std::shared_ptr<Wait>(holder), &err);
+    if (!handle) {
+        out.startError = detail::takeHostError(host, err);
+        if (out.startError.empty()) {
+            out.startError = "plugin table call was not accepted";
+        }
+        return out;
+    }
+
+    if (holder->done) {
+        // 主程序在 IO 线程上内联执行完了 (最常见的情况)
+        std::lock_guard lock(holder->mutex);
+        out.status  = holder->status;
+        out.payload = holder->payload;
+        return out;
+    }
+
+    if (scheduler && scheduler->is_io_thread && scheduler->is_io_thread(host)) {
+        out.startError = "tableOpBlocking would block on the plugin IO thread; use co_await tableOp";
+        return out;
+    }
+
+    std::unique_lock lock(holder->mutex);
+    if (timeoutMs > 0) {
+        if (!holder->cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] {
+                return holder->done;
+            })) {
+            lock.unlock();
+            if (cancel && cancel->op_cancel) {
+                cancel->op_cancel(handle);
+            }
+            lock.lock();
+            holder->cv.wait(lock, [&] {
+                return holder->done;
+            });
+        }
+    } else {
+        holder->cv.wait(lock, [&] {
+            return holder->done;
+        });
+    }
+    out.status  = holder->status;
+    out.payload = std::move(holder->payload);
+    return out;
+}
+
+template<typename Ctx, typename StartFn>
+inline detail::TableOpResult
+    tableOpBlocking(const Ctx& ctx, StartFn&& start, int64_t timeoutMs) {
+    return tableOpBlockingRaw(
+        ctx.host,
+        ctx.iface.cancel,
+        ctx.iface.scheduler,
+        std::forward<StartFn>(start),
+        timeoutMs
+    );
 }
 
 namespace detail {

@@ -164,7 +164,7 @@ typedef struct PluginxxOperatorHandle PluginxxOperatorHandle;
 
 /// 单次驱动请求 (主程序托管生命周期; 插件只持有裸指针用于取消)
 ///
-/// 语义 (见 `pluginxx.coroutine_runtime` 接口表):
+/// 语义 (见 `pluginxx.scheduler` 接口表的 `request_driver` / `cancel_driver`):
 /// - 一次 ticket 至多执行一次 drive_once 回调, 且永不内联执行 (主程序异步投递);
 /// - ticket 持有插件实例的执行 lease, 因此 dlclose 不会越过它;
 /// - 主程序保证 `cancel_driver` 之后该 ticket 不再执行回调。

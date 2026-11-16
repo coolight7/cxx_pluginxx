@@ -1,6 +1,6 @@
 /// pluginxx 通用接口表 (与主程序业务无关的跨边界 C ABI 表)
 ///
-/// 收录: 事件 / 能力 / 任务调度 / 协程驱动 / 插件互查 / 主程序配置 / 会话取消状态 /
+/// 收录: 广播 / 能力 / 任务调度与驱动 / 插件互查 / 主程序配置 / 会话取消状态 /
 /// JSON 辅助 / 日志 / 后台任务。
 ///
 /// 归属判据: **只需要 JSON 载荷与通用资源即可工作** 的表属于通用表 (本头);
@@ -36,9 +36,12 @@
 ///   调到隔壁函数) —— 要改就换新 IID;
 /// - 用 `_MIN_VERSION` 表达"我加了新成员"是错的 (那等于把老主程序全部判死)。
 ///
-/// 本表的当前状态: 通用表 10 张。其中 `capabilities` 为 v5 (v4 是声明 + 多实现行,
-/// v5 在表尾追加了 `invoke_capability_ex`), `broadcasts` 为 v1 (取代旧的事件表),
-/// `config` / `cancel` 为 v3, 其余 6 张仍为 v1。
+/// 本表的当前状态: 通用表 9 张。其中 `capabilities` 为 v7 (v4 是声明 + 多实现行,
+/// v5 追加 `invoke_capability_ex`, v6 追加 `unregister_capability_ex`, v7 删掉
+/// `op_cancel`), `scheduler` 为 v2 (v2 删 `post_to_io` 与 `op_cancel`,
+/// 并把已删除的 `coroutine_runtime` 表并入), `broadcasts` 为 v3 (v3 追加
+/// `end_broadcast` / `subscribe_broadcast_ex`), `config` / `cancel` 为 v3,
+/// 其余 4 张仍为 v1。
 ///
 /// 接口契约的代次 (全局): v4 = 能力改成"声明 + 实现行" (阶段 / 优先级 / 覆盖)、
 /// 事件表换成广播表 (频道声明 + 缓存 + 写权限); v3 = 插件一次加载、可挂到多个作用域
@@ -197,11 +200,11 @@ typedef struct PluginxxBroadcastsIface {
 /// v4: 声明 + 多实现行 (阶段 / 优先级 / 合并), 取代 v3 的"唯一提供者"
 /// v5: 表尾追加 `invoke_capability_ex` (带本次调用的超时), 基线与最低版本不变
 /// v6: 表尾追加 `unregister_capability_ex` (按作用域注销一条实现行), 基线不变
-#define PLUGINXX_IFACE_CAPABILITIES_VERSION     6
-#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 4
+/// v7: 删 `op_cancel` (并入 `<应用名>.cancel` 唯一入口)。基线随本次布局变化重置
+#define PLUGINXX_IFACE_CAPABILITIES_VERSION     7
+#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 7
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
-#define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE \
-    (offsetof(PluginxxCapabilitiesIface, invoke_capability_ex))
+#define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE sizeof(PluginxxCapabilitiesIface)
 
 /// 一次能力登记 (插件 → 主程序)
 ///
@@ -278,9 +281,6 @@ typedef struct PluginxxCapabilitiesIface {
         PluginxxString*     out_json
     );
 
-    /// 取消一次异步能力调用 (与 scheduler / tasks 的取消同语义)
-    void(PLUGINXX_CALL* op_cancel)(PluginxxOperatorHandle* op);
-
     /// 调用能力 (带**这次调用**的超时; 追加成员, 老主程序没有它)
     ///
     /// 与 [invoke_capability] 只差一个 `timeout_ms`:
@@ -316,9 +316,33 @@ typedef struct PluginxxCapabilitiesIface {
 
 /* ==================== 接口表: 任务调度 (<应用名>.scheduler) ==================== */
 
+/// 调度与执行体控制 (含协程驱动)
+///
+/// 五件事回答的都是"怎么把一段执行安排到主程序这一侧、我现在在哪":
+/// - `is_io_thread`: 我在哪个线程 (只用于"能不能阻塞"的判断);
+/// - `sleep` / `offload`: 让出 / 换线程;
+/// - `request_driver` / `cancel_driver`: 在**不阻塞**的前提下让主程序推进一段插件
+///   自己的执行 (协程驱动 / 一次性投递)。
+///
+/// 早期的 `post_to_io` 已删除 (它自己就是一次阻塞往返: 调用线程要等 io 跑完一个只
+/// 负责入队的 lambda), 需要"稍后执行"的话用 `request_driver` (有 lease、可取消),
+/// 或者干脆在自己的线程上做。独立的 `coroutine_runtime` 表也已并入本表 (§5.7)。
+///
+/// 协程驱动协议 (主程序与插件共同遵守):
+/// - `request_driver` **永不内联**回调, 即使调用者就在主程序 IO 线程; 否则 root start /
+///   completion / cancel 会形成意外重入, 并失去交错执行的公平性;
+/// - 一次 ticket 至多执行一次回调, 且回调只推进一个有限步骤 (不阻塞、不等待);
+/// - 主程序不得把插件私有 reactor 的内部等待对象接进自己的执行序列; 插件必须保证
+///   每个 driver 都对应"已知的、真实存在的可运行工作" (外部完成回调 / 定时器回调 /
+///   已 post 的 continuation), 不得在无工作时持续申请 ticket (那是隐藏轮询);
+/// - 重复 wake 由插件适配器自行合并 (同一实例同时只登记一次 ticket); 主程序另做
+///   ticket 去重与关闭时取消作为最后防线。
 #define PLUGINXX_IFACE_SCHEDULER          PLUGINXX_APP_ID("scheduler")
-#define PLUGINXX_IFACE_SCHEDULER_VERSION     1
-#define PLUGINXX_IFACE_SCHEDULER_MIN_VERSION 1
+/// v2: 删 `post_to_io` (它自己就是一次阻塞往返) 与 `op_cancel` (并入
+///     `<应用名>.cancel`); `request_driver` / `cancel_driver` 从已删除的
+///     `<应用名>.coroutine_runtime` 表搬来。基线随本次签名变化重置
+#define PLUGINXX_IFACE_SCHEDULER_VERSION     2
+#define PLUGINXX_IFACE_SCHEDULER_MIN_VERSION 2
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
 #define PLUGINXX_IFACE_SCHEDULER_BASELINE_SIZE sizeof(PluginxxSchedulerIface)
 
@@ -326,9 +350,15 @@ typedef struct PluginxxSchedulerIface {
     int32_t  version; ///< 主程序填 PLUGINXX_IFACE_SCHEDULER_VERSION
     uint32_t struct_size;
 
+    /// 当前线程是否为该实例的 IO 线程 (**同步**, 线程本地判定)
+    ///
+    /// 保留同步的理由: 只是比一下线程 id, 不发任务、不跨执行体、不产生任何等待。
+    /// 用途: 判断"这次能不能阻塞等结果" (kit 的 `tableOpBlocking` /
+    /// `netCallBlocking` / `invoke_capability_blocking` 用它做安全闸)。
+    /// **不允许**据此内联执行 driver 回调。
     int32_t(PLUGINXX_CALL* is_io_thread)(const PluginxxHost* host);
-    int32_t(PLUGINXX_CALL*
-                post_to_io)(const PluginxxHost* host, void(PLUGINXX_CALL* fn)(void* ud), void* ud);
+
+    /// 睡一段时间 (回调式异步: 到点回调, 期间不占线程)
     PluginxxOperatorHandle*(PLUGINXX_CALL* sleep)(
         const PluginxxHost*      host,
         int64_t                  ms,
@@ -336,8 +366,8 @@ typedef struct PluginxxSchedulerIface {
         void*                    ud,
         PluginxxString*          error_out
     );
-    void(PLUGINXX_CALL* op_cancel)(PluginxxOperatorHandle* op);
 
+    /// 把一段阻塞工作交给主程序线程池 (回调式异步)
     PluginxxOperatorHandle*(PLUGINXX_CALL* offload)(
         const PluginxxHost* host,
         void*(PLUGINXX_CALL*
@@ -347,35 +377,6 @@ typedef struct PluginxxSchedulerIface {
         void*           ud,
         PluginxxString* error_out
     );
-} PluginxxSchedulerIface;
-
-/* ==================== 接口表: 协程驱动 (<应用名>.coroutine_runtime) ==================== */
-
-/// 通用协程驱动接口 (与协程库无关)
-///
-/// 定位: 插件协程与主程序协程在**同一主程序 IO 执行序列**中交错推进的基础设施。
-/// 核心只有两类动作:
-/// - **driver/pump**: 插件申请主程序异步执行一次有界回调 (push 一个有限步骤);
-/// - **wake 合并**: 插件本地有新工作时自行合并重复请求, 再申请下一次 ticket。
-///
-/// 关键约束 (主程序与插件共同遵守):
-/// - `request_driver` **永不内联**回调, 即使调用者就在主程序 IO 线程; 否则 root start /
-///   completion / cancel 会形成意外重入, 并失去交错执行的公平性;
-/// - 一次 ticket 至多执行一次回调, 且回调只推进一个有限步骤 (不阻塞、不等待);
-/// - 主程序不得把插件私有 reactor 的内部等待对象接进自己的执行序列; 插件必须保证
-///   每个 driver 都对应"已知的、真实存在的可运行工作" (外部完成回调 / 定时器回调 /
-///   已 post 的 continuation), 不得在无工作时持续申请 ticket (那是隐藏轮询);
-/// - 重复 wake 由插件适配器自行合并 (同一实例同时只登记一次 ticket); 主程序另做
-///   ticket 去重与关闭时取消作为最后防线。
-#define PLUGINXX_IFACE_COROUTINE_RUNTIME  PLUGINXX_APP_ID("coroutine_runtime")
-#define PLUGINXX_IFACE_COROUTINE_RUNTIME_VERSION     1
-#define PLUGINXX_IFACE_COROUTINE_RUNTIME_MIN_VERSION 1
-/* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
-#define PLUGINXX_IFACE_COROUTINE_RUNTIME_BASELINE_SIZE sizeof(PluginxxCoroutineRuntimeIface)
-
-typedef struct PluginxxCoroutineRuntimeIface {
-    int32_t  version; ///< 主程序填 PLUGINXX_IFACE_COROUTINE_RUNTIME_VERSION
-    uint32_t struct_size;
 
     /// 申请一次驱动请求 (**任意线程可调用**, 非阻塞):
     /// - 成功返回主程序托管的 ticket (主程序只会**异步**调用 drive_once, 每张至多一次);
@@ -394,11 +395,7 @@ typedef struct PluginxxCoroutineRuntimeIface {
     ///   它由插件自己的 root 收束协议 (取消/完成) 收尾;
     /// - 取消后票不再持有实例 lease, 因此关闭等待可以继续推进。
     void(PLUGINXX_CALL* cancel_driver)(PluginxxDriver* driver);
-
-    /// 当前线程是否为该实例的 IO 线程 (**仅用于断言与诊断**):
-    /// - 只允许插件据此检查自己的用法, **不允许**据此内联执行 driver 回调。
-    int32_t(PLUGINXX_CALL* is_io_thread)(const PluginxxHost* host);
-} PluginxxCoroutineRuntimeIface;
+} PluginxxSchedulerIface;
 
 /* ==================== 接口表: 插件互查 (<应用名>.plugins) ==================== */
 
@@ -552,7 +549,7 @@ typedef struct PluginxxTasksIface {
     );
     /// 取消任务 (幂等; 仅限 io 线程调用, 或主程序内部经 ioCallSync 投递后调用)
     /// - 与主程序 detachAll 内部路径一致; 句柄由主程序托管, 跨线程主动取消需经
-    ///   scheduler.post_to_io / ioCallSync 回到 io 线程 (与注册类接口线程
+    ///   scheduler.request_driver / ioCallSync 回到 io 线程 (与注册类接口线程
     ///   约束一致), 避免 handle->caller 裸指针跨线程反查实例
     void(PLUGINXX_CALL* cancel_task)(PluginxxOperatorHandle* h);
 } PluginxxTasksIface;
