@@ -759,38 +759,41 @@ struct GenericTableEntries {
     // capabilities 表
     // =====================================================================
 
-    static int32_t PLUGINXX_CALL capabilityRegisterEntry(
+    static PluginxxOperatorHandle* PLUGINXX_CALL capabilityRegisterEntry(
         const PluginxxHost*           host,
         const PluginxxScopeRef*       scope,
         const PluginxxCapabilitySpec* spec,
+        PluginxxOperatorCallback      cb,
+        void*                         cb_ud,
         PluginxxString*               error_out
     ) {
         if (!spec || spec->struct_size < sizeof(PluginxxCapabilitySpec)) {
-            detail::setErrorString(
-                error_out,
-                "register_capability: spec is missing or too short"
-            );
-            return PLUGINXX_RESULT_ERR_ARG;
+            setTableOpError(error_out, "register_capability: spec is missing or too short");
+            return nullptr;
         }
         // 视图只在本次调用内有效: 复制成自有字符串后再投递
-        const std::string id       = svToStr(spec->id);
-        const std::string ownerTag = svToStr(spec->owner_tag);
-        PluginxxCapabilitySpec local = *spec;
+        const std::string     id       = svToStr(spec->id);
+        const std::string     ownerTag = svToStr(spec->owner_tag);
+        PluginxxCapabilitySpec local   = *spec;
         PluginxxScopeRef       scopeCopy{};
         const bool             hasScope = pluginxx_scope_ref_ok(scope) && scope;
         if (hasScope) {
             scopeCopy = *scope;
         }
-        return detail::onInstanceIo<InstanceT, ManagerT>(
+        return detail::asyncTableOp<InstanceT, ManagerT>(
             host,
-            [local, id, ownerTag, hasScope, scopeCopy, error_out](
+            cb,
+            cb_ud,
+            error_out,
+            "capabilities.register_capability",
+            [local, id, ownerTag, hasScope, scopeCopy](
                 InstanceT* inst,
                 ManagerT*  mgr
-            ) {
+            ) -> std::string {
                 PluginxxCapabilitySpec resolved = local;
                 resolved.id        = PluginxxStringView{id.data(), id.size()};
                 resolved.owner_tag = PluginxxStringView{ownerTag.data(), ownerTag.size()};
-                std::string reason;
+                std::string   reason;
                 const int32_t rc = mgr->registerCapability(
                     inst,
                     hasScope ? &scopeCopy : nullptr,
@@ -798,40 +801,66 @@ struct GenericTableEntries {
                     &reason
                 );
                 if (rc != PLUGINXX_RESULT_OK) {
-                    detail::setErrorString(error_out, reason);
+                    const char* name = result::nameOf(rc);
+                    throw TableOpError(
+                        !reason.empty() ? std::move(reason)
+                                        : fmt::format(
+                                              "register_capability: {}",
+                                              name ? name : "failed"
+                                          )
+                    );
                 }
-                return rc;
+                return std::string{};
             }
         );
     }
 
-    static int32_t PLUGINXX_CALL capabilityUnregisterEntry(
+    static PluginxxOperatorHandle* PLUGINXX_CALL capabilityUnregisterEntry(
         const PluginxxHost*       host,
         const PluginxxStringView* capability_id,
-        const PluginxxStringView* owner_tag
+        const PluginxxStringView* owner_tag,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
+        PluginxxString*           error_out
     ) {
         if (detail::abiViewEmpty(capability_id)) {
-            return PLUGINXX_RESULT_ERR_ARG;
+            setTableOpError(error_out, "unregister_capability: missing id");
+            return nullptr;
         }
         const std::string id  = svToStr(*capability_id);
         const std::string tag = owner_tag ? svToStr(*owner_tag) : std::string{};
-        return detail::onInstanceIo<InstanceT, ManagerT>(
+        return detail::asyncTableOp<InstanceT, ManagerT>(
             host,
-            [id, tag](InstanceT* inst, ManagerT* mgr) {
-                return mgr->unregisterCapability(inst, id, tag);
+            cb,
+            cb_ud,
+            error_out,
+            "capabilities.unregister_capability",
+            [id, tag](InstanceT* inst, ManagerT* mgr) -> std::string {
+                const int32_t rc = mgr->unregisterCapability(inst, id, tag);
+                if (rc != PLUGINXX_RESULT_OK) {
+                    const char* name = result::nameOf(rc);
+                    throw TableOpError(
+                        fmt::format("unregister_capability: {}", name ? name : "failed")
+                    );
+                }
+                return std::string{};
             }
         );
     }
 
     /// `unregister_capability_ex` (追加成员, v6): 按作用域注销一条实现行
-    static int32_t PLUGINXX_CALL capabilityUnregisterExEntry(
+    static PluginxxOperatorHandle* PLUGINXX_CALL capabilityUnregisterExEntry(
         const PluginxxHost*       host,
         const PluginxxScopeRef*   scope,
         const PluginxxStringView* capability_id,
-        const PluginxxStringView* owner_tag
+        const PluginxxStringView* owner_tag,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
+        PluginxxString*           error_out
     ) {
         if (detail::abiViewEmpty(capability_id)) {
-            return PLUGINXX_RESULT_ERR_ARG;
+            setTableOpError(error_out, "unregister_capability_ex: missing id");
+            return nullptr;
         }
         const std::string id  = svToStr(*capability_id);
         const std::string tag = owner_tag ? svToStr(*owner_tag) : std::string{};
@@ -840,15 +869,26 @@ struct GenericTableEntries {
         if (hasScope) {
             scopeCopy = *scope;
         }
-        return detail::onInstanceIo<InstanceT, ManagerT>(
+        return detail::asyncTableOp<InstanceT, ManagerT>(
             host,
-            [id, tag, hasScope, scopeCopy](InstanceT* inst, ManagerT* mgr) {
-                return mgr->unregisterScopedCapability(
+            cb,
+            cb_ud,
+            error_out,
+            "capabilities.unregister_capability_ex",
+            [id, tag, hasScope, scopeCopy](InstanceT* inst, ManagerT* mgr) -> std::string {
+                const int32_t rc = mgr->unregisterScopedCapability(
                     inst,
                     hasScope ? &scopeCopy : nullptr,
                     id,
                     tag
                 );
+                if (rc != PLUGINXX_RESULT_OK) {
+                    const char* name = result::nameOf(rc);
+                    throw TableOpError(
+                        fmt::format("unregister_capability_ex: {}", name ? name : "failed")
+                    );
+                }
+                return std::string{};
             }
         );
     }
@@ -936,35 +976,53 @@ struct GenericTableEntries {
         });
     }
 
-    static int32_t PLUGINXX_CALL capabilityInfoEntry(
+    static PluginxxOperatorHandle* PLUGINXX_CALL capabilityInfoEntry(
         const PluginxxHost*       host,
         const PluginxxStringView* capability_id,
-        PluginxxString*           out_json
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
+        PluginxxString*           error_out
     ) {
-        if (!out_json || detail::abiViewEmpty(capability_id)) {
-            return PLUGINXX_RESULT_ERR_ARG;
+        if (detail::abiViewEmpty(capability_id)) {
+            setTableOpError(error_out, "capability_info: missing id");
+            return nullptr;
         }
         const std::string id = svToStr(*capability_id);
-        return detail::onInstanceIo<InstanceT, ManagerT>(
+        return detail::asyncTableOp<InstanceT, ManagerT>(
             host,
-            [id, out_json](InstanceT*, ManagerT* mgr) {
-                return mgr->capabilityInfo(id, out_json);
-            }
+            cb,
+            cb_ud,
+            error_out,
+            "capabilities.capability_info",
+            [id](InstanceT* inst, ManagerT* mgr) -> std::string {
+                (void)inst;
+                const std::string text = mgr->capabilityInfoText(id);
+                if (text.empty()) {
+                    throw TableOpError("capability_info: not_declared");
+                }
+                return text;
+            },
+            /*allowClosing=*/true
         );
     }
 
-    static int32_t PLUGINXX_CALL capabilityListEntry(
-        const PluginxxHost* host,
-        PluginxxString*     out_json
+    static PluginxxOperatorHandle* PLUGINXX_CALL capabilityListEntry(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    cb_ud,
+        PluginxxString*          error_out
     ) {
-        if (!out_json) {
-            return PLUGINXX_RESULT_ERR_ARG;
-        }
-        return detail::onInstanceIo<InstanceT, ManagerT>(
+        return detail::asyncTableOp<InstanceT, ManagerT>(
             host,
-            [out_json](InstanceT*, ManagerT* mgr) {
-                return mgr->listCapabilities(out_json);
-            }
+            cb,
+            cb_ud,
+            error_out,
+            "capabilities.list_capabilities",
+            [](InstanceT* inst, ManagerT* mgr) -> std::string {
+                (void)inst;
+                return mgr->listCapabilitiesText();
+            },
+            /*allowClosing=*/true
         );
     }
 

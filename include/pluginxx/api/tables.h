@@ -226,8 +226,12 @@ typedef struct PluginxxBroadcastsIface {
 /// v5: 表尾追加 `invoke_capability_ex` (带本次调用的超时), 基线与最低版本不变
 /// v6: 表尾追加 `unregister_capability_ex` (按作用域注销一条实现行), 基线不变
 /// v7: 删 `op_cancel` (并入 `<应用名>.cancel` 唯一入口)。基线随本次布局变化重置
-#define PLUGINXX_IFACE_CAPABILITIES_VERSION     7
-#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 7
+/// v8: 登记 / 注销 / 自省四个成员改成异步操作契约 (`invoke_capability(_ex)` 本来就是
+///     操作契约, 不变): 登记与注销的结论经完成回调交回, `capability_info` /
+///     `list_capabilities` 的清单 JSON 在 `payload` 里, 细分原因 (如 `not_declared`)
+///     也在 `payload` 文本里
+#define PLUGINXX_IFACE_CAPABILITIES_VERSION     8
+#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 8
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
 #define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE sizeof(PluginxxCapabilitiesIface)
 
@@ -263,20 +267,26 @@ typedef struct PluginxxCapabilitiesIface {
     uint32_t struct_size;
 
     /// 登记 / 声明 (**任意线程**; 主程序投递到 IO 线程执行)
-    /// - `spec->id` 为空、阶段未开放、`impls` 自相矛盾时拒绝并写 `error_out`;
+    /// - `spec->id` 为空、阶段未开放、`impls` 自相矛盾时**未受理** (返回 NULL + `error_out`);
+    ///   登记本身的结论经完成回调交回 (失败原因在 `payload` 文本里);
     /// - `impls: one` 的 impl 行后登记 (含跨插件) 整体覆盖; `impls: many` 多行共存
-    int32_t(PLUGINXX_CALL* register_capability)(
+    PluginxxOperatorHandle*(PLUGINXX_CALL* register_capability)(
         const PluginxxHost*            host,
         const PluginxxScopeRef*        scope,
         const PluginxxCapabilitySpec*  spec,
+        PluginxxOperatorCallback       cb,
+        void*                          cb_ud,
         PluginxxString*                error_out
     );
 
-    /// 注销本插件的一条实现行 (**任意线程**; 行不存在返回 [PLUGINXX_RESULT_ERR_NOT_DECLARED])
-    int32_t(PLUGINXX_CALL* unregister_capability)(
+    /// 注销本插件的一条实现行 (**任意线程**; 行不存在按 `not_declared` 失败)
+    PluginxxOperatorHandle*(PLUGINXX_CALL* unregister_capability)(
         const PluginxxHost*       host,
         const PluginxxStringView* capability_id,
-        const PluginxxStringView* owner_tag
+        const PluginxxStringView* owner_tag,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
+        PluginxxString*           error_out
     );
 
     /// 调用能力 (**异步; 完成回调恰好一次**)
@@ -293,17 +303,22 @@ typedef struct PluginxxCapabilitiesIface {
         PluginxxString*           error_out
     );
 
-    /// 自省: 一条能力的声明与实现行 (JSON); 未声明返回 [PLUGINXX_RESULT_ERR_NOT_DECLARED]
-    int32_t(PLUGINXX_CALL* capability_info)(
+    /// 自省: 一条能力的声明与实现行 (JSON, 完成时在 `payload` 里);
+    /// 未声明按 `not_declared` 失败
+    PluginxxOperatorHandle*(PLUGINXX_CALL* capability_info)(
         const PluginxxHost*       host,
         const PluginxxStringView* capability_id,
-        PluginxxString*           out_json
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
+        PluginxxString*           error_out
     );
 
-    /// 自省: 全部能力与实现行数 (JSON)
-    int32_t(PLUGINXX_CALL* list_capabilities)(
-        const PluginxxHost* host,
-        PluginxxString*     out_json
+    /// 自省: 全部能力与实现行数 (JSON, 完成时在 `payload` 里)
+    PluginxxOperatorHandle*(PLUGINXX_CALL* list_capabilities)(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    cb_ud,
+        PluginxxString*          error_out
     );
 
     /// 调用能力 (带**这次调用**的超时; 追加成员, 老主程序没有它)
@@ -331,11 +346,14 @@ typedef struct PluginxxCapabilitiesIface {
     ///
     /// 与 [unregister_capability] 的差别: 那个是本实例的全部作用域, 这个是给定作用域的
     /// 那一行 —— 同一个插件被多个作用域各挂载一次时用它只撤其中一份。
-    int32_t(PLUGINXX_CALL* unregister_capability_ex)(
+    PluginxxOperatorHandle*(PLUGINXX_CALL* unregister_capability_ex)(
         const PluginxxHost*       host,
         const PluginxxScopeRef*   scope,
         const PluginxxStringView* capability_id,
-        const PluginxxStringView* owner_tag
+        const PluginxxStringView* owner_tag,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
+        PluginxxString*           error_out
     );
 } PluginxxCapabilitiesIface;
 

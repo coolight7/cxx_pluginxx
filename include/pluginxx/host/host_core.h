@@ -632,10 +632,25 @@ public:
         return PLUGINXX_RESULT_OK;
     }
 
+    /// 自省: 一条能力的 JSON 正文 (**IO 线程**; 未声明给空串)
+    ///
+    /// 异步表成员的完成回调只带结果正文, 因此这一份直接给字符串。
+    std::string capabilityInfoText(std::string_view capability) {
+        if (capability.empty()) {
+            return std::string{};
+        }
+        return capabilities_->infoJson(capability);
+    }
+
     /// 自省: 全部能力 (**IO 线程**)
     int listCapabilities(PluginxxString* outJson) {
         detail::setErrorString(outJson, capabilities_->listJson());
         return PLUGINXX_RESULT_OK;
+    }
+
+    /// 自省: 全部能力的 JSON 正文 (**IO 线程**)
+    std::string listCapabilitiesText() {
+        return capabilities_->listJson();
     }
 
     // =====================================================================

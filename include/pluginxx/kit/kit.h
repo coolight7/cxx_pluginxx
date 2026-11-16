@@ -4212,7 +4212,7 @@ struct CapabilityOptions {
 /// - 未填 [CapabilityOptions] 时按"声明自己的名字 + 单行覆盖 + 只开放 impl 阶段"登记;
 /// - `error` 非空时写入主程序给的拒绝原因。
 ///
-/// - `return` 0 = 成功, 其它 = 主程序的错误码 (`-1` = 主程序没有能力表)
+/// - `return` 0 = 成功, `-1` = 未受理或登记被拒 (具体原因看 `error`)
 template<typename Ctx, typename CapFn>
 inline int32_t capability(
     Ctx&                    ctx,
@@ -4361,20 +4361,33 @@ inline int32_t capability(
         spec.run_start = run;
         spec.cancel    = cancel;
         spec.user_data = shim;
-        PluginxxString regErr{nullptr, 0};
-        const int32_t  rc
-            = ctx.iface.capabilities->register_capability(ctx.host, opts.scope, &spec, &regErr);
+        // 表成员是异步契约: 登记结论经完成回调交回; 不关心结果的调用方 (生命周期里
+        // 登记能力) 靠同步返回值区分“未受理”与“已受理”即可
+        auto op = tableOpBlocking(
+            ctx,
+            [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
+                return ctx.iface.capabilities->register_capability(
+                    ctx.host,
+                    opts.scope,
+                    &spec,
+                    cb,
+                    ud,
+                    err
+                );
+            },
+            0
+        );
         if (error != nullptr) {
-            if (regErr.data != nullptr && regErr.size > 0) {
-                error->assign(regErr.data, static_cast<size_t>(regErr.size));
-            } else {
+            if (op.ok()) {
                 error->clear();
+            } else {
+                error->assign(op.text());
+                if (error->empty()) {
+                    error->assign(op.startError);
+                }
             }
         }
-        if (regErr.data != nullptr) {
-            PluginString::free(ctx.host, &regErr);
-        }
-        return rc;
+        return op.ok() ? 0 : -1;
     }
     return -1;
 }
