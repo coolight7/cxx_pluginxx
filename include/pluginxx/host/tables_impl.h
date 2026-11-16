@@ -24,6 +24,7 @@
 #include "pluginxx/api/tables.h"
 #include "pluginxx/host/abi_util.h"
 #include "pluginxx/host/host_core.h"
+#include "pluginxx/host/table_op.h"
 #include "pluginxx/runtime/driver.h"
 #include "pluginxx/runtime/instance_base.h"
 #include "pluginxx/runtime/manager_base.h"
@@ -89,6 +90,67 @@ int32_t queryStringIo(const PluginxxHost* host, PluginxxString* out, Fn&& fn) {
         hostMemorySetString(out, text);
         return 0;
     });
+}
+
+/// 异步表调用的公共骨架 (与主程序业务表同一套契约, 见 pluginxx/host/table_op.h)
+///
+/// - 返回非 NULL = 已受理 (结果经 `cb` 恰好一次在 IO 线程交回); 返回 NULL = 未受理
+///   (参数形状错 / 实例不可用), 原因写 `error_out`;
+/// - 工作体在 IO 线程执行, 返回结果正文; 抛异常 = 本次失败, 正文是原因;
+/// - `allowClosing=true` 用于只读查询 (实例收尾时其工具仍在跑, 仍可查)。
+template<typename InstanceT, typename ManagerT, typename Fn>
+PluginxxOperatorHandle* asyncTableOp(
+    const PluginxxHost*      host,
+    PluginxxOperatorCallback cb,
+    void*                    ud,
+    PluginxxString*          error_out,
+    std::string              label,
+    Fn&&                     work,
+    bool                     allowClosing = false
+) {
+    auto call = enterPluginHost<InstanceT, ManagerT>(host, allowClosing);
+    if (!call.ok()) {
+        setTableOpError(error_out, "plugin runtime is unavailable");
+        return nullptr;
+    }
+    auto keep = call;
+    return startTableOp(
+        keep.manager(),
+        cb,
+        ud,
+        error_out,
+        std::move(label),
+        [keep, work = std::forward<Fn>(work)]() mutable -> std::string {
+            return work(keep.instance(), keep.manager());
+        }
+    );
+}
+
+/// 只读查询类异步入口: 空结果按 `not_found` 交回 (与旧版"空串 = 失败"同义)
+template<typename InstanceT, typename ManagerT, typename Fn>
+PluginxxOperatorHandle* asyncQueryOp(
+    const PluginxxHost*      host,
+    PluginxxOperatorCallback cb,
+    void*                    ud,
+    PluginxxString*          error_out,
+    std::string              label,
+    Fn&&                     work
+) {
+    return asyncTableOp<InstanceT, ManagerT>(
+        host,
+        cb,
+        ud,
+        error_out,
+        std::move(label),
+        [work = std::forward<Fn>(work)](InstanceT* inst, ManagerT* mgr) mutable -> std::string {
+            auto text = work(inst, mgr);
+            if (text.empty()) {
+                throw TableOpError("not_found");
+            }
+            return text;
+        },
+        /*allowClosing=*/true
+    );
 }
 
 } // namespace detail
@@ -233,47 +295,62 @@ struct GenericTableEntries {
     // config 表
     // =====================================================================
 
-    static int32_t PLUGINXX_CALL
-        configGetEntry(const PluginxxHost* host, PluginxxString* out) {
-        return detail::queryStringIo<InstanceT, ManagerT>(
+    static PluginxxOperatorHandle* PLUGINXX_CALL configGetEntry(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    ) {
+        return detail::asyncQueryOp<InstanceT, ManagerT>(
             host,
-            out,
+            cb,
+            ud,
+            error_out,
+            "config.get_config",
             [](InstanceT* inst, ManagerT* mgr) -> std::string {
-                auto* services = mgr->domainServices();
                 (void)inst;
+                auto* services = mgr->domainServices();
                 return services ? services->configJson() : std::string{};
             }
         );
     }
 
-    static int32_t PLUGINXX_CALL
-        pluginArgsEntry(const PluginxxHost* host, PluginxxString* out) {
-        return guardVtableCall(-1, [&]() -> int32_t {
-            if (!out) {
-                return -1;
-            }
-            auto call = enterHost(host, /*allowClosing=*/true);
-            auto mgr  = call.manager();
-            auto inst = call.instance();
-            if (!mgr || !inst) {
-                return -1;
-            }
-            auto keep = call;
-            auto json = ioCallSyncKeep<std::string>(keep, mgr, [keep]() -> std::string {
-                return keep.instance()->args.is_object() ? keep.instance()->args.dump()
-                                                         : std::string{"{}"};
-            });
-            hostMemorySetString(out, json);
-            return 0;
-        });
+    static PluginxxOperatorHandle* PLUGINXX_CALL pluginArgsEntry(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    ) {
+        return detail::asyncTableOp<InstanceT, ManagerT>(
+            host,
+            cb,
+            ud,
+            error_out,
+            "config.get_plugin_args",
+            [](InstanceT* inst, ManagerT* mgr) -> std::string {
+                (void)mgr;
+                if (inst == nullptr) {
+                    throw TableOpError("not_found");
+                }
+                return inst->args.is_object() ? inst->args.dump() : std::string{"{}"};
+            },
+            /*allowClosing=*/true
+        );
     }
 
 
-    static int32_t PLUGINXX_CALL
-        pluginConfigPathEntry(const PluginxxHost* host, PluginxxString* out) {
-        return detail::queryStringIo<InstanceT, ManagerT>(
+    static PluginxxOperatorHandle* PLUGINXX_CALL pluginConfigPathEntry(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    ) {
+        return detail::asyncQueryOp<InstanceT, ManagerT>(
             host,
-            out,
+            cb,
+            ud,
+            error_out,
+            "config.get_plugin_config_path",
             [](InstanceT* inst, ManagerT* mgr) -> std::string {
                 (void)mgr;
                 return inst ? inst->configPath : std::string{};
@@ -281,60 +358,67 @@ struct GenericTableEntries {
         );
     }
 
-    static int32_t PLUGINXX_CALL
-        languageGetEntry(const PluginxxHost* host, PluginxxString* out) {
-        return guardVtableCall(-1, [&]() -> int32_t {
-            if (!out) {
-                return -1;
+    static PluginxxOperatorHandle* PLUGINXX_CALL languageGetEntry(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    ) {
+        return detail::asyncQueryOp<InstanceT, ManagerT>(
+            host,
+            cb,
+            ud,
+            error_out,
+            "config.get_language",
+            [](InstanceT* inst, ManagerT* mgr) -> std::string {
+                (void)inst;
+                auto* services = mgr->domainServices();
+                auto  lang     = services ? services->language() : std::string{};
+                return lang.empty() ? std::string{"en"} : lang;
             }
-            auto call = enterHost(host, /*allowClosing=*/true);
-            auto mgr  = call.manager();
-            if (!mgr) {
-                return -1;
-            }
-            auto keep = call;
-            auto lang = ioCallSyncKeep<std::string>(keep, mgr, [keep]() {
-                auto* services = keep.manager()->domainServices();
-                return services ? services->language() : std::string{};
-            });
-            if (lang.empty()) {
-                lang = "en";
-            }
-            hostMemorySetString(out, lang);
-            return 0;
-        });
+        );
     }
 
-    static int32_t PLUGINXX_CALL languageSetEntry(
+    static PluginxxOperatorHandle* PLUGINXX_CALL languageSetEntry(
         const PluginxxHost*       host,
-        const PluginxxStringView* language
+        const PluginxxStringView* language,
+        PluginxxOperatorCallback  cb,
+        void*                     ud,
+        PluginxxString*           error_out
     ) {
-        return guardVtableCall(-1, [&]() -> int32_t {
-            auto call = enterHost(host);
-            auto mgr  = call.manager();
-            if (!mgr) {
-                return -1;
-            }
-            auto              keep = call;
-            const std::string lang = language ? svToStr(*language) : std::string{};
-            ioCallSyncVoidKeep(keep, mgr, [keep, lang]() {
-                if (auto* services = keep.manager()->domainServices()) {
+        const std::string lang = language ? svToStr(*language) : std::string{};
+        return detail::asyncTableOp<InstanceT, ManagerT>(
+            host,
+            cb,
+            ud,
+            error_out,
+            "config.set_language",
+            [lang](InstanceT* inst, ManagerT* mgr) -> std::string {
+                (void)inst;
+                if (auto* services = mgr->domainServices()) {
                     services->setLanguage(lang);
                 }
-            });
-            return 0;
-        });
+                return std::string{};
+            }
+        );
     }
 
     // =====================================================================
     // plugins 表
     // =====================================================================
 
-    static int32_t PLUGINXX_CALL
-        listPluginsEntry(const PluginxxHost* host, PluginxxString* out) {
-        return detail::queryStringIo<InstanceT, ManagerT>(
+    static PluginxxOperatorHandle* PLUGINXX_CALL listPluginsEntry(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    ) {
+        return detail::asyncQueryOp<InstanceT, ManagerT>(
             host,
-            out,
+            cb,
+            ud,
+            error_out,
+            "plugins.list_plugins",
             [](InstanceT* inst, ManagerT* mgr) -> std::string {
                 (void)inst;
                 auto* services = mgr->domainServices();
@@ -343,58 +427,52 @@ struct GenericTableEntries {
         );
     }
 
-    static int32_t PLUGINXX_CALL getPluginEntry(
+    static PluginxxOperatorHandle* PLUGINXX_CALL getPluginEntry(
         const PluginxxHost*       host,
         const PluginxxStringView* name,
-        PluginxxString*           out
+        PluginxxOperatorCallback  cb,
+        void*                     ud,
+        PluginxxString*           error_out
     ) {
-        return guardVtableCall(-1, [&]() -> int32_t {
-            if (!out) {
-                return -1;
-            }
-            auto call = enterHost(host, /*allowClosing=*/true);
-            auto mgr  = call.manager();
-            if (!mgr || detail::abiViewEmpty(name)) {
-                return -1;
-            }
-            auto              keep      = call;
-            const std::string pluginName = svToStr(*name);
-            auto              json      = ioCallSyncKeep<std::string>(keep, mgr, [keep, pluginName]() {
-                auto* services = keep.manager()->domainServices();
+        if (detail::abiViewEmpty(name)) {
+            setTableOpError(error_out, "get_plugin: plugin name is required");
+            return nullptr;
+        }
+        const std::string pluginName = svToStr(*name);
+        return detail::asyncQueryOp<InstanceT, ManagerT>(
+            host,
+            cb,
+            ud,
+            error_out,
+            "plugins.get_plugin",
+            [pluginName](InstanceT* inst, ManagerT* mgr) -> std::string {
+                (void)inst;
+                auto* services = mgr->domainServices();
                 return services ? services->pluginJson(pluginName) : std::string{};
-            });
-            if (json.empty()) {
-                return -1;
             }
-            hostMemorySetString(out, json);
-            return 0;
-        });
+        );
     }
 
-    static int32_t PLUGINXX_CALL
-        ownInfoEntry(const PluginxxHost* host, PluginxxString* out) {
-        return guardVtableCall(-1, [&]() -> int32_t {
-            if (!out) {
-                return -1;
+    static PluginxxOperatorHandle* PLUGINXX_CALL ownInfoEntry(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    ) {
+        return detail::asyncQueryOp<InstanceT, ManagerT>(
+            host,
+            cb,
+            ud,
+            error_out,
+            "plugins.get_own_info",
+            [](InstanceT* inst, ManagerT* mgr) -> std::string {
+                auto* services = mgr->domainServices();
+                if (inst == nullptr || services == nullptr) {
+                    return std::string{};
+                }
+                return services->pluginJson(inst->name);
             }
-            auto call = enterHost(host, /*allowClosing=*/true);
-            auto mgr  = call.manager();
-            auto inst = call.instance();
-            if (!mgr || !inst) {
-                return -1;
-            }
-            auto              keep     = call;
-            const std::string ownName  = inst->name;
-            auto              json     = ioCallSyncKeep<std::string>(keep, mgr, [keep, ownName]() {
-                auto* services = keep.manager()->domainServices();
-                return services ? services->pluginJson(ownName) : std::string{};
-            });
-            if (json.empty()) {
-                return -1;
-            }
-            hostMemorySetString(out, json);
-            return 0;
-        });
+        );
     }
 
     // =====================================================================

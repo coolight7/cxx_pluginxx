@@ -674,12 +674,16 @@ public:
 
     /// 清空"由插件 start 事务重新声明"的注册记录 (工具/权限/回调/图/能力/订阅)。
     /// stop 成功后调用，避免下次 start 在旧记录上重复累积。
+    ///
+    /// **句柄本体 (`subscriptionHandles`) 不在这里清**: 它的契约是"随实例析构释放" ——
+    /// 插件可能在自己线程上停下之后才对这些裸指针调 `unsubscribe_broadcast`;
+    /// 把这些对象提前释放会让那次调用变成 use-after-free。已撤销的句柄只剩
+    /// `alive == false`, 再传进来是按幂等空操作处理。
     void clearPluginOwnedRegistrations(InstanceT* inst) {
         if (!inst) {
             return;
         }
         inst->subscriptions.clear();
-        inst->subscriptionHandles.clear();
         inst->capabilityRegistrations.clear();
         clearDomainRegistrations(inst);
     }

@@ -3045,6 +3045,43 @@ inline void spawn(Ctx& ctx, Fn&& fn) {
     detail::spawnTaskImpl(ctx, std::forward<Fn>(fn));
 }
 
+namespace detail {
+
+/// 结果类型 (定义在本文件后半; 声明模板时只需不完整类型)
+struct TableOpResult;
+
+/// 通用表的阻塞调用形态: 只取结果正文 (失败 = 空串)
+template<typename StartFn>
+std::string tableOpText(
+    const PluginxxHost*           host,
+    const PluginxxCancelIface*    cancel,
+    const PluginxxSchedulerIface* scheduler,
+    StartFn&&                     start
+);
+
+/// 通用表的阻塞调用形态: 只看成败
+template<typename StartFn>
+bool tableOpOk(
+    const PluginxxHost*           host,
+    const PluginxxCancelIface*    cancel,
+    const PluginxxSchedulerIface* scheduler,
+    StartFn&&                     start
+);
+
+} // namespace detail
+
+/// 通用表的阻塞调用形态 (定义在本文件后半)
+///
+/// 实例上下文基类在定义之前, 所以先在这里声明 (结果类型在定义处才完整)。
+template<typename StartFn>
+detail::TableOpResult tableOpBlockingRaw(
+    const PluginxxHost*           host,
+    const PluginxxCancelIface*    cancel,
+    const PluginxxSchedulerIface* scheduler,
+    StartFn&&                     start,
+    int64_t                       timeoutMs
+);
+
 /* ==================== 插件实例上下文基类 (通用部分) ==================== */
 
 /// 插件实例上下文基类 (通用部分; header-only)
@@ -3114,67 +3151,84 @@ public:
         onHostReady();
     }
 
+    /// 主程序配置 JSON (失败给 `{}`)
+    ///
+    /// 表成员是异步操作契约, 这里用阻塞形态: 调用方本来就在主程序 IO 线程时内联完成。
     std::string config() const {
         if (!host || !iface.config || !iface.config->get_config) {
             return "{}";
         }
-        PluginxxString s{nullptr, 0};
-        iface.config->get_config(host, &s);
-        if (!s.data) {
-            return "{}";
-        }
-        std::string res(s.data, static_cast<size_t>(s.size));
-        PluginString::free(host, &s);
-        return res;
+        auto text = detail::tableOpText(
+            host,
+            iface.cancel,
+            iface.scheduler,
+            [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
+                return iface.config->get_config(host, cb, ud, err);
+            }
+        );
+        return text.empty() ? std::string{"{}"} : text;
     }
 
+    /// 本插件配置参数 JSON (失败给 `{}`)
     std::string argsJson() const {
         if (!host || !iface.config || !iface.config->get_plugin_args) {
             return "{}";
         }
-        PluginxxString s{nullptr, 0};
-        iface.config->get_plugin_args(host, &s);
-        if (!s.data) {
-            return "{}";
-        }
-        std::string res(s.data, static_cast<size_t>(s.size));
-        PluginString::free(host, &s);
-        return res;
+        return detail::tableOpText(
+            host,
+            iface.cancel,
+            iface.scheduler,
+            [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
+                return iface.config->get_plugin_args(host, cb, ud, err);
+            }
+        );
     }
 
+    /// 本插件配置文件路径 (未配置给空串)
     std::string configPath() const {
         if (!host || !iface.config || !iface.config->get_plugin_config_path) {
             return "";
         }
-        PluginxxString s{nullptr, 0};
-        iface.config->get_plugin_config_path(host, &s);
-        if (!s.data) {
-            return "";
-        }
-        std::string res(s.data, static_cast<size_t>(s.size));
-        PluginString::free(host, &s);
-        return res;
+        return detail::tableOpText(
+            host,
+            iface.cancel,
+            iface.scheduler,
+            [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
+                return iface.config->get_plugin_config_path(host, cb, ud, err);
+            }
+        );
     }
 
+    /// 当前语言 (取不到给 `en`; 高频值建议在 `start` / `mount` 里缓存)
     std::string language() const {
         if (!host || !iface.config || !iface.config->get_language) {
             return "en";
         }
-        PluginxxString s{nullptr, 0};
-        if (iface.config->get_language(host, &s) == 0 && s.data) {
-            std::string res(s.data, static_cast<size_t>(s.size));
-            PluginString::free(host, &s);
-            return res;
-        }
-        return "en";
+        auto text = detail::tableOpText(
+            host,
+            iface.cancel,
+            iface.scheduler,
+            [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
+                return iface.config->get_language(host, cb, ud, err);
+            }
+        );
+        return text.empty() ? std::string{"en"} : text;
     }
 
+    /// 切换语言 (返回是否受理且成功)
     bool setLanguage(std::string_view lang) const {
         if (!host || !iface.config || !iface.config->set_language) {
             return false;
         }
         auto langSv = PluginStringView::from(lang.data(), lang.size());
-        return iface.config->set_language(host, &langSv) == 0;
+        return detail::tableOpOk(
+            host,
+            iface.cancel,
+            iface.scheduler,
+            [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
+                return iface.config->set_language(host, &langSv, cb, ud, err);
+            }
+        );
     }
 
     char* strdup(PluginxxStringView sv) const {
@@ -4068,6 +4122,42 @@ inline detail::TableOpResult
 }
 
 namespace detail {
+
+/// [tableOpText] 的定义: 只取结果正文 (失败 = 空串)
+template<typename StartFn>
+std::string tableOpText(
+    const PluginxxHost*           host,
+    const PluginxxCancelIface*    cancel,
+    const PluginxxSchedulerIface* scheduler,
+    StartFn&&                     start
+) {
+    auto res = pluginxx::tableOpBlockingRaw(
+        host,
+        cancel,
+        scheduler,
+        std::forward<StartFn>(start),
+        0
+    );
+    return res.ok() ? std::string(res.text()) : std::string{};
+}
+
+/// [tableOpOk] 的定义: 只看成败
+template<typename StartFn>
+bool tableOpOk(
+    const PluginxxHost*           host,
+    const PluginxxCancelIface*    cancel,
+    const PluginxxSchedulerIface* scheduler,
+    StartFn&&                     start
+) {
+    return pluginxx::tableOpBlockingRaw(
+               host,
+               cancel,
+               scheduler,
+               std::forward<StartFn>(start),
+               0
+    )
+        .ok();
+}
 
 /// 按可调用性选择能力业务签名：fn(ctx, caller, method, args) /
 /// fn(ctx, method, args) / fn(method, args)。

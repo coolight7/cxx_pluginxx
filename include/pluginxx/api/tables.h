@@ -400,8 +400,9 @@ typedef struct PluginxxSchedulerIface {
 /* ==================== 接口表: 插件互查 (<应用名>.plugins) ==================== */
 
 #define PLUGINXX_IFACE_PLUGINS            PLUGINXX_APP_ID("plugins")
-#define PLUGINXX_IFACE_PLUGINS_VERSION     1
-#define PLUGINXX_IFACE_PLUGINS_MIN_VERSION 1
+/// v2: 三个成员改成异步操作契约 (受理即返回, 清单 JSON 经完成回调的 `payload` 交回)
+#define PLUGINXX_IFACE_PLUGINS_VERSION     2
+#define PLUGINXX_IFACE_PLUGINS_MIN_VERSION 2
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
 #define PLUGINXX_IFACE_PLUGINS_BASELINE_SIZE sizeof(PluginxxPluginsIface)
 
@@ -409,13 +410,28 @@ typedef struct PluginxxPluginsIface {
     int32_t  version; ///< 主程序填 PLUGINXX_IFACE_PLUGINS_VERSION
     uint32_t struct_size;
 
-    int32_t(PLUGINXX_CALL* list_plugins)(const PluginxxHost* host, PluginxxString* out);
-    int32_t(PLUGINXX_CALL* get_plugin)(
+    /// 全部插件清单 JSON 数组 (完成时经 `payload` 交回; 允许实例关闭中查询)
+    PluginxxOperatorHandle*(PLUGINXX_CALL* list_plugins)(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    );
+    /// 单个插件摘要 JSON (不存在按 `not_found` 失败)
+    PluginxxOperatorHandle*(PLUGINXX_CALL* get_plugin)(
         const PluginxxHost*       host,
         const PluginxxStringView* name,
-        PluginxxString*           out
+        PluginxxOperatorCallback  cb,
+        void*                     ud,
+        PluginxxString*           error_out
     );
-    int32_t(PLUGINXX_CALL* get_own_info)(const PluginxxHost* host, PluginxxString* out);
+    /// 本实例所属插件的摘要 JSON
+    PluginxxOperatorHandle*(PLUGINXX_CALL* get_own_info)(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    );
 } PluginxxPluginsIface;
 
 /* ==================== 接口表: 主程序配置 (<应用名>.config) ==================== */
@@ -423,8 +439,9 @@ typedef struct PluginxxPluginsIface {
 #define PLUGINXX_IFACE_CONFIG             PLUGINXX_APP_ID("config")
 /// v3: 移出主程序业务成员 (工具提示词 / 指定键的工作目录), 改由主程序业务表提供;
 /// 本表只保留与业务无关的配置读取
-#define PLUGINXX_IFACE_CONFIG_VERSION     3
-#define PLUGINXX_IFACE_CONFIG_MIN_VERSION 3
+/// v4: 五个成员改成异步操作契约 (受理即返回, 配置 JSON / 语言代码经 `payload` 交回)
+#define PLUGINXX_IFACE_CONFIG_VERSION     4
+#define PLUGINXX_IFACE_CONFIG_MIN_VERSION 4
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
 #define PLUGINXX_IFACE_CONFIG_BASELINE_SIZE sizeof(PluginxxConfigIface)
 
@@ -432,24 +449,47 @@ typedef struct PluginxxConfigIface {
     int32_t  version; ///< 主程序填 PLUGINXX_IFACE_CONFIG_VERSION
     uint32_t struct_size;
 
-    /// 主程序配置的关键字段 JSON (io 线程; host->alloc):
+    /// 主程序配置的关键字段 JSON (经 `payload` 交回):
     /// {"dataDir": "...", "projectRoot": "..."(可为空), "platform":
     /// "windows"|"linux"|"macos"|"android"|"ios"}
-    int32_t(PLUGINXX_CALL* get_config)(const PluginxxHost* host, PluginxxString* out);
-    /// 本插件配置参数 JSON (yaml `plugins` 条目 args; io 线程; host->alloc):
-    int32_t(PLUGINXX_CALL* get_plugin_args)(const PluginxxHost* host, PluginxxString* out);
-    /// 本插件配置文件所在目录或文件路径 (yaml `plugins` 条目 config; io 线程;
-    /// host->alloc; 未指定返回空串, 空串表示未配置)
+    PluginxxOperatorHandle*(PLUGINXX_CALL* get_config)(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    );
+    /// 本插件配置参数 JSON (yaml `plugins` 条目 args; 经 `payload` 交回)
+    PluginxxOperatorHandle*(PLUGINXX_CALL* get_plugin_args)(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    );
+    /// 本插件配置文件所在目录或文件路径 (yaml `plugins` 条目 config; 经 `payload` 交回)
     /// - 可指向文件或目录 (由插件自行判断类型并加载)
     /// - 主程序已归一化为绝对路径 (正斜杠, lexically_normal)
-    int32_t(PLUGINXX_CALL* get_plugin_config_path)(const PluginxxHost* host, PluginxxString* out);
-    /// 读取当前使用的语言 (io 线程; 返回 0 成功, out 填入语言代码如 "en" / "zh-cn", host->alloc
-    /// 分配; 默认 "en")
-    int32_t(PLUGINXX_CALL* get_language)(const PluginxxHost* host, PluginxxString* out);
-    /// 指定使用的语言 (io 线程; 返回 0 成功; 不支持 auto, 为空或 auto 时回退为 "en")
-    int32_t(PLUGINXX_CALL* set_language)(
+    /// - 未指定时完成回调按 `not_found` 失败 (与旧版"返回空串"同义)
+    PluginxxOperatorHandle*(PLUGINXX_CALL* get_plugin_config_path)(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    );
+    /// 读取当前使用的语言 (`payload` 是语言代码如 "en" / "zh-cn"; 默认 "en")
+    /// - 高频值请在 `start` / `mount` 里取一次缓存
+    PluginxxOperatorHandle*(PLUGINXX_CALL* get_language)(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    ud,
+        PluginxxString*          error_out
+    );
+    /// 指定使用的语言 (不支持 auto; 为空或 auto 时回退为 "en")
+    PluginxxOperatorHandle*(PLUGINXX_CALL* set_language)(
         const PluginxxHost*       host,
-        const PluginxxStringView* language
+        const PluginxxStringView* language,
+        PluginxxOperatorCallback  cb,
+        void*                     ud,
+        PluginxxString*           error_out
     );
 } PluginxxConfigIface;
 
