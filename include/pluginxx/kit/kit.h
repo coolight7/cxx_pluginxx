@@ -46,6 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -3133,7 +3134,11 @@ inline void spawnTaskImpl(Ctx& ctx, Fn&& fn) {
         return;
     }
 
-    auto starter = [&ctx, fn, cancelFlag, recWeak, hostNotify]() {
+    // 闭包由记录与根 cleanup 一起保活: 协程帧只保存闭包指针, 任务挂起期间
+    // 闭包必须一直有效 (否则访问捕获变量就是 use-after-free)。
+    auto closure = std::make_shared<std::decay_t<Fn>>(std::forward<Fn>(fn));
+    rec->closureKeepAlive = closure;
+    auto starter = [&ctx, closure, cancelFlag, recWeak, hostNotify]() {
         auto rec = recWeak.lock();
         if (!rec) {
             return;
@@ -3143,7 +3148,7 @@ inline void spawnTaskImpl(Ctx& ctx, Fn&& fn) {
         if (!rec->ctl) {
             rec->ctl = std::make_shared<OpCtl>(OpCtl{cancelFlag, nullptr, std::string{}, {}});
         }
-        auto task = fn(ctx, *rec->ctl);
+        auto task = (*closure)(ctx, *rec->ctl);
         if (task.handle_) {
             auto h        = task.handle_;
             task.handle_  = nullptr;
@@ -3158,7 +3163,7 @@ inline void spawnTaskImpl(Ctx& ctx, Fn&& fn) {
             // 任务首步由 host driver 推进, 因此 spawn 不会在调用方栈里同步跑任务体
             // (调用方可能正处在主程序 start/注册事务中)。桥停止时会经 [BridgeRoot]
             // 把任务上报为失败, 帧也随之销毁。
-            detail::startBridgedRoot(ctx.bridge(), hostNotify, h, [recWeak] {
+            detail::startBridgedRoot(ctx.bridge(), hostNotify, h, [recWeak, closure] {
                 if (auto recSp = recWeak.lock()) {
                     recSp->coroAddr = nullptr;
                 }
@@ -3446,7 +3451,11 @@ public:
         return res;
     }
 
-    std::vector<std::string> storage_;
+    /// 注册类 spec 的字符串存储: 用 `std::deque` 而不是 `vector` ——
+    /// `push_back` 不会让已存字符串搬位置, 因此 spec 里的 `string_view` 在整个
+    /// 实例生命周期内一直有效 (注册是"提交后由主程序异步读取", 不能靠"调用期间
+    /// 不扩容"来保证)。
+    std::deque<std::string> storage_;
 
     std::vector<std::unique_ptr<void, void (*)(void*)>> shims_;
 
@@ -3466,6 +3475,10 @@ public:
         /// 后台任务的 OpCtl 由记录持有：任务协程以引用接收它，必须在挂起后仍然
         /// 有效（放在 starter 栈上会悬垂）。
         std::shared_ptr<OpCtl> ctl;
+        /// 任务体的闭包保活 (类型擦除): 协程帧只保存闭包指针, 而闭包本身是
+        /// `spawn(...)` 的实参临时量 —— 记录不持有它, 任务一挂起就悬垂
+        /// (ASan 实测 heap-use-after-free)。
+        std::shared_ptr<void> closureKeepAlive;
     };
 
     std::vector<std::shared_ptr<SpawnRecord>> spawns_;
