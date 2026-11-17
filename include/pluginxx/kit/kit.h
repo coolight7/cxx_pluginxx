@@ -710,6 +710,8 @@ class BridgeRoot : public std::enable_shared_from_this<BridgeRoot> {
 public:
 
     using DestroyFrameFn = void (*)(void* frame) noexcept;
+    /// "帧已结束时收尾一次"的类型擦除入口 (对应 [finishIfDone])
+    using FinishFrameFn = void (*)(void* frame);
 
     BridgeRoot(const PluginxxOperatorNotify& notify, void* frame, DestroyFrameFn destroyFrame) :
         notify_(notify),
@@ -792,6 +794,22 @@ public:
         cleanup_ = std::move(cleanup);
     }
 
+    /// 绑定"根帧已结束就收尾"的入口 (由 [startBridgedRoot] 设置)。
+    void setFinishFrame(FinishFrameFn fn) noexcept {
+        finishFrame_ = fn;
+    }
+
+    /// 根帧已经结束 (挂在 final_suspend) 就收尾一次; 未结束是空操作。
+    ///
+    /// 用于"恢复了某条子 Task 帧"的路径: 子帧结束后把控制权交回父协程, 父链最上面的
+    /// 根可能因此在**这次 resume 里**结束, 而那条路径上没有根帧的句柄。`finishIfDone`
+    /// 自身幂等 (完成权 CAS + 帧指针置空), 重复调用无副作用。
+    void finishFrameIfDone() noexcept {
+        if (finishFrame_ && hasFrame()) {
+            finishFrame_(frame_.load(std::memory_order_acquire));
+        }
+    }
+
     /// 销毁仍然挂起的协程帧 (幂等) 并释放 op 侧资源。
     ///
     /// 调用点都满足"协程已终止或不可能再被恢复":
@@ -812,6 +830,7 @@ private:
     PluginxxOperatorNotify notify_{nullptr, nullptr};
     std::atomic<void*>     frame_{nullptr};
     DestroyFrameFn         destroyFrame_ = nullptr;
+    FinishFrameFn          finishFrame_  = nullptr;
     PollOneBridge*         owner_        = nullptr;
     std::function<void()>  cleanup_;
     std::atomic<bool>      claimed_{false};
@@ -2406,8 +2425,11 @@ inline void finishIfDone(std::coroutine_handle<Promise> h) {
         if constexpr (!std::is_void_v<typename Promise::value_type>) {
             if constexpr (std::is_same_v<typename Promise::value_type, std::string>) {
                 resPayload = p.result();
-            } else {
+            } else if constexpr (fmt::is_formattable<typename Promise::value_type>::value) {
                 resPayload = fmt::format("{}", p.result());
+            } else {
+                // 结果类型既不是字符串也不能格式化 (例如 `whenAll` 返回的结果数组):
+                // 这种 Task 只作为子协程使用, 根完成正文留空即可。
             }
         }
     }
@@ -2482,18 +2504,26 @@ inline void resumePluginCoroutine(
     std::coroutine_handle<Promise> handle
 ) noexcept {
     std::weak_ptr<detail::BridgeRoot> weakRoot = handle.promise().bridgeRoot_;
-    bridge->postToLocal([handle, weakRoot] {
-        if (auto root = weakRoot.lock()) {
-            if (!root->shouldAdvance()) {
-                return; // 已放弃: 不恢复, 帧由引用释放路径销毁
-            }
+    // 子 Task 帧 (有 continuation) 结束后由父协程的 `await_resume` 收结果并销毁,
+    // 因此恢复之后不能再碰它 —— 父协程可能在这次 resume 里就把它销毁了。
+    // 只有根帧 (没有 continuation) 才在这里按帧收尾; 子帧这条路径改为让根收尾
+    // (根可能因为这条子帧结束而在同一次 resume 里结束)。
+    const bool isRootFrame = !handle.promise().continuation_;
+    bridge->postToLocal([handle, weakRoot, isRootFrame] {
+        auto root = weakRoot.lock();
+        if (root && !root->shouldAdvance()) {
+            return; // 已放弃: 不恢复, 帧由引用释放路径销毁
         }
         try {
             handle.resume();
         } catch (...) {
             handle.promise().set_exception(std::current_exception());
         }
-        finishIfDone(handle);
+        if (isRootFrame) {
+            finishIfDone(handle);
+        } else if (root) {
+            root->finishFrameIfDone();
+        }
     });
     bridge->wake();
 }
@@ -2516,6 +2546,13 @@ inline std::shared_ptr<detail::BridgeRoot> startBridgedRoot(
     auto root
         = std::make_shared<detail::BridgeRoot>(notify, h.address(), &destroyBridgeFrame<Promise>);
     root->setOwner(&bridge);
+    // 子 Task 帧被恢复时没有根帧句柄, 但它结束时父链最上面的根可能一起结束;
+    // 这条类型擦除入口让那条路径也能给根收尾 (幂等)。
+    root->setFinishFrame(+[](void* frame) {
+        if (frame) {
+            finishIfDone(std::coroutine_handle<Promise>::from_address(frame));
+        }
+    });
     {
         auto  userCleanup = std::move(cleanup);
         auto* bridgePtr   = &bridge;
@@ -2844,7 +2881,18 @@ struct Task {
             return !handle || handle.done();
         }
 
-        std::coroutine_handle<> await_suspend(std::coroutine_handle<> parent) {
+        /// 挂起子帧并把控制权交给它
+        ///
+        /// 父协程是插件协程帧时顺手把"所属根"传下去: 子帧可能由外部完成回调恢复,
+        /// 那条路径上没有根帧句柄, 靠这个引用让子帧结束后能给根收尾
+        /// (见 [detail::resumePluginCoroutine])。
+        template<typename ParentPromise>
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<ParentPromise> parent) {
+            if constexpr (!std::is_void_v<ParentPromise>) {
+                if constexpr (requires { parent.promise().bridgeRoot_; }) {
+                    handle.promise().bridgeRoot_ = parent.promise().bridgeRoot_;
+                }
+            }
             handle.promise().continuation_ = parent;
             return handle;
         }
@@ -2914,7 +2962,18 @@ struct Task<void> {
             return !handle || handle.done();
         }
 
-        std::coroutine_handle<> await_suspend(std::coroutine_handle<> parent) {
+        /// 挂起子帧并把控制权交给它
+        ///
+        /// 父协程是插件协程帧时顺手把"所属根"传下去: 子帧可能由外部完成回调恢复,
+        /// 那条路径上没有根帧句柄, 靠这个引用让子帧结束后能给根收尾
+        /// (见 [detail::resumePluginCoroutine])。
+        template<typename ParentPromise>
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<ParentPromise> parent) {
+            if constexpr (!std::is_void_v<ParentPromise>) {
+                if constexpr (requires { parent.promise().bridgeRoot_; }) {
+                    handle.promise().bridgeRoot_ = parent.promise().bridgeRoot_;
+                }
+            }
             handle.promise().continuation_ = parent;
             return handle;
         }
@@ -3782,7 +3841,15 @@ inline std::string takeHostError(const PluginxxHost* host, PluginxxString& s) {
     return out;
 }
 
-/// 表调用在等待期间共享的状态 (堆上持有: 完成回调与 awaiter 各持一份)
+/// 表调用在等待期间共享的状态 (堆上持有: 完成回调与 ticket 各持一份)
+///
+/// 调用在构造 ticket 时就提交了, 因此协程可能在**任何时刻**装进来等结果; 这里用
+/// 一个原子状态把三个窗口分开 (与完成回调的 CAS 顺序一一对应):
+/// - `INIT`: 已提交, 还没有协程在等 —— 完成回调直接置 `COMPLETED`, 之后的 await
+///   立即返回, 不需要恢复任何人;
+/// - `CALLING`: 有协程正在安装挂起 —— 完成回调置 `COMPLETED` 但**不恢复**协程,
+///   它随后看到 `COMPLETED` 就不挂起了;
+/// - `SUSPENDED`: 协程已挂起 —— 完成回调置 `COMPLETED` 并恢复协程。
 struct TableOpState {
     const PluginxxHost*        host         = nullptr;
     const PluginxxCancelIface* cancelIface = nullptr;
@@ -3791,97 +3858,198 @@ struct TableOpState {
     std::string                payload;
     std::string                startError;
     std::atomic<AwaiterState>  state{AwaiterState::INIT};
-    void*                      coroAddr = nullptr;
+    /// 挂起中的协程帧地址与类型擦除的恢复入口 (都由 `await_suspend` 写入)
+    void* coroAddr                            = nullptr;
+    void (*resumeEntry)(TableOpState* state)  = nullptr;
+    /// 协程驱动桥 (恢复协程时经它投递 + 唤醒, 绝不在主程序回调栈内恢复)
+    PollOneBridge*            bridge = nullptr;
+    /// 结果已经被取走过 (ticket 可以复制, 但正文只能取一次)
+    std::atomic<bool> consumed{false};
 
     TableOpState(const PluginxxHost* inHost, const PluginxxCancelIface* inCancel) :
         host(inHost),
         cancelIface(inCancel) {}
 };
 
-/// `co_await tableOp(...)` 的 awaiter
+/// 一次表调用的凭据 (**调用即提交**)
 ///
-/// `StartFn` 就是"把收尾三件套转交给表成员"的调用体:
-/// `(PluginxxOperatorCallback cb, void* ud, PluginxxString* error_out) -> PluginxxOperatorHandle*`。
-/// 完成回调不直接恢复插件协程, 而是经协程驱动桥恢复 (同 [InvokeCapAwaiter] 的协议)。
-template<typename StartFn>
-struct TableOpAwaiter {
-    std::shared_ptr<TableOpState> st;
-    StartFn                       start;
-    PollOneBridge*                bridge = nullptr;
+/// 三种用法:
+/// - `co_await tableOp(ctx, ...)`: 提交并当场等结果;
+/// - `auto t = tableOp(ctx, ...);` 之后再 `co_await t`: 提交时就已经在跑, 协程可以
+///   先干别的 (顺手再提交几条), 需要结果时再取; 多条并发用 [whenAll] 一次收齐;
+/// - `tableOp(ctx, ...).forget();`: 提交完不管结果 (fire-and-forget)。
+///
+/// 规则:
+/// - **构造即提交**: 即使之后提前 `return` 或抛异常, 这次调用也已经在跑, 撤不回来;
+/// - `~TableOpTicket` 不取消操作 —— 取消是显式动作 [cancel];
+/// - 正在等它的协程被取消时, 会经 `pluginxx.cancel.op_cancel` 请求取消这次调用
+///   (协作式), 之后仍要 await 才拿得到终态;
+/// - 正文只能取一次: 重复 `co_await` 得到 `accepted() == false` 的说明文本;
+/// - 可复制 (语义与 `std::shared_future` 类似): 复制品共享同一份状态, 但只有一个
+///   能取到正文。
+class [[nodiscard]] TableOpTicket {
+public:
+    TableOpTicket() = default;
+
+    /// 由 [tableOp] 构造 (业务代码写 `tableOp(ctx, ...)` 即可)
+    explicit TableOpTicket(std::shared_ptr<TableOpState> st) noexcept :
+        st_(std::move(st)) {}
+
+    /// 主程序受理了这次调用 (false = 压根没开始, 原因在结果的 `startError`)
+    bool accepted() const noexcept {
+        return st_ && st_->startError.empty();
+    }
+
+    /// 已有结果 (含"未受理"; 为真时 `co_await` 不挂起)
+    bool done() const noexcept {
+        return !st_ || st_->state.load(std::memory_order_acquire) == AwaiterState::COMPLETED;
+    }
+
+    /// 请求取消这次调用 (协作式, 不等待; 终态仍通过 `co_await` 取)
+    void cancel() const noexcept {
+        if (!st_) {
+            return;
+        }
+        if (st_->cancelIface && st_->cancelIface->op_cancel && st_->opHandle) {
+            st_->cancelIface->op_cancel(st_->opHandle);
+        }
+    }
+
+    /// 明确的"提交完不管": 丢掉结果 (完成回调照常执行, 只是没人看)
+    void forget() const noexcept {}
 
     bool await_ready() const noexcept {
-        return false;
+        return done();
     }
 
     template<typename Promise>
     bool await_suspend(std::coroutine_handle<Promise> h) {
-        st->coroAddr = h.address();
-        st->state.store(AwaiterState::CALLING, std::memory_order_release);
+        auto st = st_;
+        if (!st) {
+            return false;
+        }
+        st->coroAddr    = h.address();
+        st->resumeEntry = +[](TableOpState* state) {
+            auto handle = std::coroutine_handle<Promise>::from_address(state->coroAddr);
+            handle.promise().clear_outstanding();
+            resumePluginCoroutine(state->bridge, handle);
+        };
 
-        auto*          holder = new std::shared_ptr<TableOpState>(st);
-        PluginxxString err{nullptr, 0};
-        auto*          bridgePtr = bridge;
-        st->opHandle = start(
-            [bridgePtr](void* ud, int32_t cbStatus, const PluginxxStringView* payload) {
-                auto* hp = static_cast<std::shared_ptr<TableOpState>*>(ud);
-                auto  s  = *hp;
-                delete hp;
-
-                s->status = cbStatus;
-                if (payload && payload->data && payload->size > 0) {
-                    s->payload.assign(payload->data, static_cast<size_t>(payload->size));
-                }
-
-                auto expected = AwaiterState::CALLING;
-                if (s->state.compare_exchange_strong(
-                        expected,
-                        AwaiterState::COMPLETED,
-                        std::memory_order_acq_rel
-                    )) {
-                    return;
-                }
-
-                auto handle = std::coroutine_handle<Promise>::from_address(s->coroAddr);
-                handle.promise().clear_outstanding();
-                resumePluginCoroutine(bridgePtr, handle);
-            },
-            holder,
-            &err
-        );
-
-        if (!st->opHandle) {
-            delete holder;
-            st->startError = takeHostError(st->host, err);
-            if (st->startError.empty()) {
-                st->startError = "plugin table call was not accepted";
-            }
+        auto expected = AwaiterState::INIT;
+        if (!st->state.compare_exchange_strong(
+                expected,
+                AwaiterState::CALLING,
+                std::memory_order_acq_rel
+            )) {
+            // 已经有结果 (或已被别的协程接管): 不挂起, 当场取结果
             return false;
         }
 
-        auto expected = AwaiterState::CALLING;
-        if (st->state.compare_exchange_strong(
-                expected,
+        auto suspended = AwaiterState::CALLING;
+        if (!st->state.compare_exchange_strong(
+                suspended,
                 AwaiterState::SUSPENDED,
                 std::memory_order_acq_rel
             )) {
-            h.promise().set_outstanding([state = st]() {
-                if (state->cancelIface && state->cancelIface->op_cancel && state->opHandle) {
-                    state->cancelIface->op_cancel(state->opHandle);
-                }
-            });
-            return true;
+            // 完成回调在安装期间到达: 结果已经记下, 这里不挂起
+            return false;
         }
-        return false;
+
+        h.promise().set_outstanding([st] {
+            if (st->cancelIface && st->cancelIface->op_cancel && st->opHandle) {
+                st->cancelIface->op_cancel(st->opHandle);
+            }
+        });
+        return true;
     }
 
     TableOpResult await_resume() {
         TableOpResult r;
-        r.status     = st->status;
-        r.payload    = std::move(st->payload);
-        r.startError = std::move(st->startError);
+        if (!st_) {
+            r.startError = "empty table op ticket";
+            return r;
+        }
+        if (st_->consumed.exchange(true, std::memory_order_acq_rel)) {
+            r.startError = "table op result was already taken";
+            return r;
+        }
+        r.status     = st_->status;
+        r.payload    = std::move(st_->payload);
+        r.startError = std::move(st_->startError);
         return r;
     }
+
+private:
+
+    std::shared_ptr<TableOpState> st_;
 };
+
+/// 提交一次表调用并返回凭据 (提交即开始, 见 [TableOpTicket])
+///
+/// `start` 把收尾三件套转交给表成员:
+/// `(PluginxxOperatorCallback cb, void* ud, PluginxxString* error_out) -> PluginxxOperatorHandle*`。
+/// 完成回调不直接恢复插件协程, 而是经协程驱动桥恢复 (同 [InvokeCapAwaiter] 的协议)。
+template<typename StartFn>
+inline TableOpTicket submitTableOp(
+    const PluginxxHost*        host,
+    const PluginxxCancelIface* cancel,
+    PollOneBridge*             bridge,
+    StartFn&&                  start
+) {
+    auto st    = std::make_shared<TableOpState>(host, cancel);
+    st->bridge = bridge;
+
+    auto*          holder = new std::shared_ptr<TableOpState>(st);
+    PluginxxString err{nullptr, 0};
+    st->opHandle = start(
+        [](void* ud, int32_t cbStatus, const PluginxxStringView* payload) {
+            auto* hp = static_cast<std::shared_ptr<TableOpState>*>(ud);
+            auto  s  = *hp;
+            delete hp;
+
+            s->status = cbStatus;
+            if (payload && payload->data && payload->size > 0) {
+                s->payload.assign(payload->data, static_cast<size_t>(payload->size));
+            }
+
+            // 状态规则见 [TableOpState]: 只有"已经挂起"才恢复协程;
+            // 其它两种情况下 await_suspend 自己会看到 COMPLETED, 不会挂起。
+            auto expected = AwaiterState::INIT;
+            if (s->state.compare_exchange_strong(
+                    expected,
+                    AwaiterState::COMPLETED,
+                    std::memory_order_acq_rel
+                )) {
+                return;
+            }
+            auto installing = AwaiterState::CALLING;
+            if (s->state.compare_exchange_strong(
+                    installing,
+                    AwaiterState::COMPLETED,
+                    std::memory_order_acq_rel
+                )) {
+                return;
+            }
+            s->state.store(AwaiterState::COMPLETED, std::memory_order_release);
+            if (s->resumeEntry) {
+                s->resumeEntry(s.get());
+            }
+        },
+        holder,
+        &err
+    );
+
+    if (!st->opHandle) {
+        delete holder;
+        st->startError = takeHostError(host, err);
+        if (st->startError.empty()) {
+            st->startError = "plugin table call was not accepted";
+        }
+        // 未受理 = 有结果 (原因在 startError), 之后的 await 不挂起
+        st->state.store(AwaiterState::COMPLETED, std::memory_order_release);
+    }
+    return TableOpTicket{std::move(st)};
+}
 
 } // namespace detail
 
@@ -3958,7 +4126,10 @@ inline detail::InvokeCapAwaiter invoke_cap(
 /// 表调用的结果类型 (`pluginxx::detail::TableOpResult` 的对外别名)
 using TableOpResult = detail::TableOpResult;
 
-/// 调用接口表成员并等结果 (**协程形态**)
+/// 表调用的凭据类型 (`pluginxx::detail::TableOpTicket` 的对外别名)
+using TableOpTicket = detail::TableOpTicket;
+
+/// 调用接口表成员 (**调用即提交**), 返回凭据, `co_await` 它拿结果
 ///
 /// `start` 把收尾三件套原样转交给表成员, 例如:
 /// ```cpp
@@ -3967,17 +4138,45 @@ using TableOpResult = detail::TableOpResult;
 /// });
 /// if (!r.ok()) { log("读会话失败: {}", r.text()); }
 /// ```
-/// - 返回 [detail::TableOpResult]: 同时带"是否受理"与执行状态, 业务失败**不抛异常**
+/// - 返回 [TableOpResult]: 同时带"是否受理"与执行状态, 业务失败**不抛异常**
 ///   (取消也是其中一种状态), 由调用方自己决定怎么处理;
+/// - 提交就发生在**本调用内** (不是等到 `co_await`), 因此可以先攒几条再一起等,
+///   也可以 `.forget()` 丢结果 (见 [TableOpTicket] 与 [whenAll]);
+/// - 调用方本来就在主程序 IO 线程时 (插件协程的常规情形), 主程序是**内联执行**的:
+///   本函数返回时操作往往已经有结果, `co_await` 不再挂起, 顺序与同步调用一致;
 /// - 协程被取消时经 `cancel.op_cancel` 取消这次调用 (协作式);
-/// - 注册类调用必须 `co_await` 完再继续 —— "登记后立刻可见"的顺序语义靠它保证。
+/// - 注册类调用仍要 `co_await` 完再继续 —— 登记本身已经生效, 但失败原因只有结果里有。
 template<typename Ctx, typename StartFn>
-inline detail::TableOpAwaiter<std::decay_t<StartFn>> tableOp(const Ctx& ctx, StartFn&& start) {
-    return detail::TableOpAwaiter<std::decay_t<StartFn>>{
-        std::make_shared<detail::TableOpState>(ctx.host, ctx.iface.cancel),
-        std::forward<StartFn>(start),
-        &ctx.bridge()
-    };
+inline detail::TableOpTicket tableOp(const Ctx& ctx, StartFn&& start) {
+    return detail::submitTableOp(
+        ctx.host,
+        ctx.iface.cancel,
+        &ctx.bridge(),
+        std::forward<StartFn>(start)
+    );
+}
+
+/// 等一批**已提交**的表调用全部完成 (总耗时 = 最慢的那条)
+///
+/// - 参数是已经提交的 ticket (`tableOp(...)` 一调用就开始了), 这里只按顺序收结果,
+///   不会把它们串起来执行;
+/// - 返回的结果与传入顺序一一对应; 某条未受理 / 失败 / 取消不影响其余条目;
+/// - 用法:
+/// ```cpp
+/// std::vector<TableOpTicket> tickets;
+/// tickets.push_back(tableOp(ctx, ...));
+/// tickets.push_back(tableOp(ctx, ...));
+/// auto results = co_await whenAll(std::move(tickets));
+/// ```
+/// - 返回 `pluginxx::Task<...>` (本包的协程类型, 不是 asio 的 awaitable —— 插件协程帧
+///   没有 asio executor), 只能在插件协程里 `co_await`。
+inline Task<std::vector<TableOpResult>> whenAll(std::vector<TableOpTicket> tickets) {
+    std::vector<TableOpResult> results;
+    results.reserve(tickets.size());
+    for (auto& ticket : tickets) {
+        results.push_back(co_await ticket);
+    }
+    co_return results;
 }
 
 /// 调用接口表成员并把结果交给回调 (**回调形态**, 任意线程)
