@@ -2769,53 +2769,101 @@ private:
 ///     return nullptr;                        // 已受理, 完成时再通知
 /// }
 /// ```
+/// 生命周期"稍后完成"的堆上状态 (主程序拿到的 provider 句柄就是它的地址)
+///
+/// 为什么要一个堆对象: 协议要求"入口返回非空句柄"才算已受理, 只有 `notify.done`
+/// 后到才算异步 —— 返回 `NULL` 且尚未 done 会被判成协议违约
+/// (见 `pluginxx/runtime/op_driver.h` 的 `PluginOperation::start`)。
+struct LifecycleJob {
+    explicit LifecycleJob(const PluginxxOperatorNotify* notify) :
+        guard(notify) {}
+
+    /// 完成守卫: 恰好一次, 全部副本销毁仍未完成则自动 FAILED
+    CompletionGuard guard;
+};
+
+/// 生命周期入口 (`start` / `mount` / `stop` / `unmount`) 的"稍后完成"凭据
+///
+/// 四个入口都是"返回句柄 = 已受理, 完成后经 `PluginxxOperatorNotify::done` 交回"
+/// 的契约, 但**异步完成必须返回非空句柄**: 返回 `NULL` 且还没调用 `done` 会被主程序
+/// 判成协议违约。本类把这两件事包在一起:
+///
+/// - 入口里 `auto later = finishLater(notify);` 拿凭据;
+/// - 需要等表调用时把它交给一条协程 (`ctx.spawn(...)`) 或后台任务, 入口
+///   `return later.provider();` 立刻放行;
+/// - 协程里 `co_await` 完注册类调用后调 `later.ok()` / `failed(原因)`;
+/// - 凭据可复制 (共享同一份状态), 全部销毁时仍未完成 -> 自动交 `FAILED`,
+///   不会让主程序永远等下去。
+///
+/// 典型写法:
+/// ```cpp
+/// void* start(void* ud, const PluginxxOperatorNotify* notify, PluginxxString*) {
+///     auto& ctx = *static_cast<MyCtx*>(ud);
+///     auto  later = pluginxx::finishLater(notify);
+///     if (!later.active()) { return nullptr; }          // 主程序没要求通知
+///     ctx.spawn([later](MyCtx& c, OpCtl&) -> pluginxx::Task<void> {
+///         co_await c.registerTool(...);                  // 表调用, 不阻塞 IO 线程
+///         later.ok();
+///         co_return;
+///     });
+///     return later.provider();                           // 已受理, 完成时再通知
+/// }
+/// ```
 class LifecycleFinisher {
 public:
 
     LifecycleFinisher() = default;
 
     /// 由 [finishLater] 构造 (`notify` 可空: 主程序没要求通知时全部方法都是空操作)
-    explicit LifecycleFinisher(const PluginxxOperatorNotify* notify) :
-        guard_(std::make_shared<CompletionGuard>(notify)) {}
+    explicit LifecycleFinisher(const PluginxxOperatorNotify* notify) {
+        if (notify && notify->done) {
+            job_ = std::make_shared<LifecycleJob>(notify);
+        }
+    }
 
-    /// 是否绑定了完成回调 (false = 主程序没要求通知)
+    /// 是否绑定了完成回调 (false = 主程序没要求通知, 入口直接用 `NULL` 同步完成)
     bool active() const noexcept {
-        return guard_ != nullptr;
+        return job_ != nullptr;
+    }
+
+    /// 交给主程序的 provider 句柄 (非空 = 已受理; `active()` 为 false 时是空)
+    void* provider() const noexcept {
+        return job_.get();
     }
 
     /// 已经交回结果
     bool completed() const noexcept {
-        return guard_ && guard_->completed();
+        return job_ && job_->guard.completed();
     }
 
     void ok(std::string_view payload = {}) const noexcept {
-        if (guard_) {
-            guard_->ok(payload);
+        if (job_) {
+            job_->guard.ok(payload);
         }
     }
 
     void failed(std::string_view error) const noexcept {
-        if (guard_) {
-            guard_->failed(error);
+        if (job_) {
+            job_->guard.failed(error);
         }
     }
 
     void canceled(std::string_view reason = {}) const noexcept {
-        if (guard_) {
-            guard_->canceled(reason);
+        if (job_) {
+            job_->guard.canceled(reason);
         }
     }
 
     /// 把当前异常映射成终态 (在 catch 块里调用; 取消异常 -> Canceled)
     void fromCurrentException() const noexcept {
-        if (guard_) {
-            guard_->fromCurrentException();
+        if (job_) {
+            job_->guard.fromCurrentException();
         }
     }
 
 private:
 
-    std::shared_ptr<CompletionGuard> guard_;
+    std::shared_ptr<LifecycleJob> job_;
 };
 
 /// 取生命周期入口的"稍后完成"凭据 (见 [LifecycleFinisher])
