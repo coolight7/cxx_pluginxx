@@ -362,7 +362,8 @@ typedef struct PluginxxCapabilitiesIface {
 /// 调度与执行体控制 (含协程驱动)
 ///
 /// 五件事回答的都是"怎么把一段执行安排到主程序这一侧、我现在在哪":
-/// - `is_io_thread`: 我在哪个线程 (只用于"能不能阻塞"的判断);
+/// - `is_io_thread`: 我在哪个线程 (只用于"能不能阻塞"的判断; 有独立插件线程时
+///   回答的是那条线程, 见成员说明);
 /// - `sleep` / `offload`: 让出 / 换线程;
 /// - `request_driver` / `cancel_driver`: 在**不阻塞**的前提下让主程序推进一段插件
 ///   自己的执行 (协程驱动 / 一次性投递)。
@@ -393,10 +394,14 @@ typedef struct PluginxxSchedulerIface {
     int32_t  version; ///< 主程序填 PLUGINXX_IFACE_SCHEDULER_VERSION
     uint32_t struct_size;
 
-    /// 当前线程是否为该实例的 IO 线程 (**同步**, 线程本地判定)
+    /// 当前线程是否为**插件代码的执行线程** (**同步**, 线程本地判定)
+    ///
+    /// 成员名沿用 v1 (改名等于 ABI 换代), 回答的问题是"在这里阻塞会不会把插件自己
+    /// 卡住": 宿主起了独立插件线程时是那条线程; 没起时等于宿主的 io 线程 (插件代码
+    /// 与 io 同线程)。
     ///
     /// 保留同步的理由: 只是比一下线程 id, 不发任务、不跨执行体、不产生任何等待。
-    /// 用途: 判断"这次能不能阻塞等结果" (kit 的 `tableOpBlocking` /
+    /// 用途: 判断"这次能不能阻塞等结果" (kit 的 `tableOpSyncWait` /
     /// `netCallBlocking` / `invoke_capability_blocking` 用它做安全闸)。
     /// **不允许**据此内联执行 driver 回调。
     int32_t(PLUGINXX_CALL* is_io_thread)(const PluginxxHost* host);

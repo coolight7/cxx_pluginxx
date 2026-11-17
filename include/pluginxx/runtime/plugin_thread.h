@@ -135,7 +135,13 @@ public:
             if (context_) {
                 context_->stop();
             }
-            thread_.join();
+            if (thread_.get_id() == std::this_thread::get_id()) {
+                // 宿主对象从插件线程自身销毁 (最后一个引用在回调里释放): 不能 join 自己。
+                // 线程已停止, 会自行退出; io_context 由线程闭包里的强引用保活到 run() 返回。
+                thread_.detach();
+            } else {
+                thread_.join();
+            }
         }
         // 不释放 context_: 交给管理器的执行器副本仍指向它, 此时派发看到"已停止"
         // 就被丢弃; 提前释放会让那份副本变成悬垂执行器。

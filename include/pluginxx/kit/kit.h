@@ -4360,13 +4360,15 @@ inline void tableOpCallback(const Ctx& ctx, StartFn&& start, DoneFn&& done) {
 /// `co_await tableOp(...)` 或 [tableOpCallback]。
 ///
 /// 线程规则:
-/// - **非 IO 线程**: 真等到完成回调, `timeoutMs > 0` 时到点先请求取消
-///   (`cancel.op_cancel`), 然后继续等 —— 取消是协作式的, 主程序**一定会**交回结果,
-///   所以不会留下悬空的等待对象;
-/// - **IO 线程上**: 不等待 (那会把主程序卡死)。主程序的表操作在调用方本来就在
-///   IO 线程时是**内联执行**的, 因此正常情况这里已经拿到结果;
-///   万一没有 (实现内部真的异步化了), 返回 `accepted() == false` 并说明原因,
-///   调用方按"没有结果"处理, 不会死锁。
+/// - **既不是 io 线程、也不是插件执行线程**: 真等到完成回调, `timeoutMs > 0` 时到点先
+///   请求取消 (`cancel.op_cancel`), 然后继续等 —— 取消是协作式的, 主程序**一定会**
+///   交回结果, 所以不会留下悬空的等待对象;
+/// - **io 线程上**: 不等待 (那会把主程序卡死)。主程序在调用方本来就在 io 线程时是
+///   **内联执行**的, 因此正常情况这里已经拿到结果; 万一没有, 返回原因文本、按
+///   "没有结果"处理, 不会死锁;
+/// - **插件执行线程上**: 不等待 —— 完成回调要投回这条线程, 而它正在这里阻塞,
+///   永远等不到 (宿主起了独立插件线程时, `start` / 回调里的注册事务都必须走异步形态:
+///   `finishLater(notify)` + 回调里 `notify`)。
 template<typename StartFn>
 inline detail::TableOpResult tableOpSyncWait(
     const PluginxxHost*           host,
@@ -4417,7 +4419,7 @@ inline detail::TableOpResult tableOpSyncWait(
 
     if (scheduler && scheduler->is_io_thread && scheduler->is_io_thread(host)) {
         out.startError
-            = "tableOpSyncWait would block on the plugin IO thread; use co_await tableOp";
+            = "tableOpSyncWait would block on the plugin execution thread; use co_await tableOp";
         return out;
     }
 
