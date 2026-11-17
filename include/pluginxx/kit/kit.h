@@ -3266,7 +3266,7 @@ bool tableOpOk(
 ///
 /// 实例上下文基类在定义之前, 所以先在这里声明 (结果类型在定义处才完整)。
 template<typename StartFn>
-detail::TableOpResult tableOpBlockingRaw(
+detail::TableOpResult tableOpSyncWait(
     const PluginxxHost*           host,
     const PluginxxCancelIface*    cancel,
     const PluginxxSchedulerIface* scheduler,
@@ -4353,9 +4353,11 @@ inline void tableOpCallback(const Ctx& ctx, StartFn&& start, DoneFn&& done) {
     }
 }
 
-/// 调用接口表成员并等结果 (**阻塞形态**)
+/// 调用接口表成员并等结果 (**同步等待**, 只给同步桥用)
 ///
-/// 适用位置: 插件自己的线程、`blocking_tool` 的实现体、初始化代码。
+/// 什么时候用: 调用方必须**当场拿到结果**, 而且**不能写成协程** —— 典型是内嵌脚本
+/// 引擎 (QuickJS 这类同步 C API) 在脚本回调里调主程序表。其它地方一律
+/// `co_await tableOp(...)` 或 [tableOpCallback]。
 ///
 /// 线程规则:
 /// - **非 IO 线程**: 真等到完成回调, `timeoutMs > 0` 时到点先请求取消
@@ -4365,15 +4367,8 @@ inline void tableOpCallback(const Ctx& ctx, StartFn&& start, DoneFn&& done) {
 ///   IO 线程时是**内联执行**的, 因此正常情况这里已经拿到结果;
 ///   万一没有 (实现内部真的异步化了), 返回 `accepted() == false` 并说明原因,
 ///   调用方按"没有结果"处理, 不会死锁。
-///
-/// 只有 `host` / `start` 的场景 (如脚本引擎) 用 [tableOpBlockingRaw]。
-template<typename Ctx, typename StartFn>
-inline detail::TableOpResult
-    tableOpBlocking(const Ctx& ctx, StartFn&& start, int64_t timeoutMs = 0);
-
-/// [tableOpBlocking] 的裸参数形态 (没有插件上下文对象时用)
 template<typename StartFn>
-inline detail::TableOpResult tableOpBlockingRaw(
+inline detail::TableOpResult tableOpSyncWait(
     const PluginxxHost*           host,
     const PluginxxCancelIface*    cancel,
     const PluginxxSchedulerIface* scheduler,
@@ -4421,7 +4416,8 @@ inline detail::TableOpResult tableOpBlockingRaw(
     }
 
     if (scheduler && scheduler->is_io_thread && scheduler->is_io_thread(host)) {
-        out.startError = "tableOpBlocking would block on the plugin IO thread; use co_await tableOp";
+        out.startError
+            = "tableOpSyncWait would block on the plugin IO thread; use co_await tableOp";
         return out;
     }
 
@@ -4449,10 +4445,11 @@ inline detail::TableOpResult tableOpBlockingRaw(
     return out;
 }
 
+/// [tableOpSyncWait] 的上下文形态 (从插件实例上下文取 host / cancel / scheduler)
 template<typename Ctx, typename StartFn>
 inline detail::TableOpResult
-    tableOpBlocking(const Ctx& ctx, StartFn&& start, int64_t timeoutMs) {
-    return tableOpBlockingRaw(
+    tableOpSyncWait(const Ctx& ctx, StartFn&& start, int64_t timeoutMs = 0) {
+    return tableOpSyncWait(
         ctx.host,
         ctx.iface.cancel,
         ctx.iface.scheduler,
@@ -4471,7 +4468,7 @@ std::string tableOpText(
     const PluginxxSchedulerIface* scheduler,
     StartFn&&                     start
 ) {
-    auto res = pluginxx::tableOpBlockingRaw(
+    auto res = pluginxx::tableOpSyncWait(
         host,
         cancel,
         scheduler,
@@ -4489,7 +4486,7 @@ bool tableOpOk(
     const PluginxxSchedulerIface* scheduler,
     StartFn&&                     start
 ) {
-    return pluginxx::tableOpBlockingRaw(
+    return pluginxx::tableOpSyncWait(
                host,
                cancel,
                scheduler,
@@ -4722,85 +4719,6 @@ inline TableOpTicket capability(
         );
     }
     return TableOpTicket{};
-}
-
-inline PluginxxString invoke_capability_blocking(
-    const PluginxxHost*              host,
-    const PluginxxCapabilitiesIface* caps,
-    const PluginxxSchedulerIface*    sched,
-    const PluginxxScopeRef*          scope,
-    std::string_view                 capability,
-    std::string_view                 args_json,
-    PluginxxString*                  error_out
-) {
-    if (!host || !caps || !caps->invoke_capability) {
-        if (error_out) {
-            *error_out = PluginString::fromCstr(host, "capabilities iface not available");
-        }
-        return PluginxxString{nullptr, 0};
-    }
-    if (sched && sched->is_io_thread && sched->is_io_thread(host)) {
-        if (error_out) {
-            *error_out = PluginString::fromCstr(
-                host,
-                "invoke_capability_blocking cannot be called on io thread; use co_await invoke_cap instead"
-            );
-        }
-        return PluginxxString{nullptr, 0};
-    }
-
-    struct SyncState {
-        std::mutex              mtx;
-        std::condition_variable cv;
-        bool                    done   = false;
-        int32_t                 status = PLUGINXX_OPERATOR_OK;
-        std::string             payload;
-    } state;
-
-    auto capSv  = PluginStringView::from(capability.data(), capability.size());
-    auto argsSv = PluginStringView::from(args_json.data(), args_json.size());
-
-    PluginxxOperatorHandle* handle = caps->invoke_capability(
-        host,
-        scope,
-        &capSv,
-        &argsSv,
-        0,
-        [](void* ud, int32_t st, const PluginxxStringView* pl) {
-            auto*           s = static_cast<SyncState*>(ud);
-            std::lock_guard lk(s->mtx);
-            s->done   = true;
-            s->status = st;
-            if (pl && pl->data && pl->size > 0) {
-                s->payload.assign(pl->data, static_cast<size_t>(pl->size));
-            }
-            s->cv.notify_one();
-        },
-        &state,
-        error_out
-    );
-
-    if (!handle) {
-        return PluginxxString{nullptr, 0};
-    }
-
-    {
-        std::unique_lock lk(state.mtx);
-        state.cv.wait(lk, [&]() {
-            return state.done;
-        });
-    }
-
-    if (state.status != PLUGINXX_OPERATOR_OK) {
-        if (error_out) {
-            auto paySv = PluginStringView::from(state.payload.data(), state.payload.size());
-            *error_out = PluginString::from(host, &paySv);
-        }
-        return PluginxxString{nullptr, 0};
-    }
-
-    auto paySv = PluginStringView::from(state.payload.data(), state.payload.size());
-    return PluginString::from(host, &paySv);
 }
 
 /* ==================== 一键式插件入口导出宏 ==================== */
