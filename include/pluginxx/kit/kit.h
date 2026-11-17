@@ -4547,19 +4547,19 @@ struct CapabilityOptions {
     const PluginxxScopeRef* scope = nullptr;
 };
 
-/// 登记一行能力实现
+/// 登记一行能力实现 (**调用即提交**)
 /// - `fn` 可返回字符串 (同步) 或 `Task<T>` (异步): 返回值就是这次调用的结果文本;
 /// - 未填 [CapabilityOptions] 时按"声明自己的名字 + 单行覆盖 + 只开放 impl 阶段"登记;
-/// - `error` 非空时写入主程序给的拒绝原因。
+/// - 返回 ticket: 登记提交就已经生效, 拿到结果只为了区分"受理/被拒"与拒绝原因;
+/// - 主程序没有能力表时 ticket 是"未受理"(`accepted() == false`), 不会挂起。
 ///
-/// - `return` 0 = 成功, `-1` = 未受理或登记被拒 (具体原因看 `error`)
+/// - `return` 表调用凭据 ([tableOp]): `co_await` 它才拿 `<是否受理, 状态, 原因>`
 template<typename Ctx, typename CapFn>
-inline int32_t capability(
-    Ctx&                    ctx,
-    std::string_view        capName,
-    CapFn&&                 fn,
-    const CapabilityOptions& opts  = {},
-    std::string*            error = nullptr
+inline TableOpTicket capability(
+    Ctx&                     ctx,
+    std::string_view         capName,
+    CapFn&&                  fn,
+    const CapabilityOptions& opts = {}
 ) {
     struct CapShim {
         Ctx*                ctx = nullptr;
@@ -4701,35 +4701,27 @@ inline int32_t capability(
         spec.run_start = run;
         spec.cancel    = cancel;
         spec.user_data = shim;
-        // 表成员是异步契约: 登记结论经完成回调交回; 不关心结果的调用方 (生命周期里
-        // 登记能力) 靠同步返回值区分“未受理”与“已受理”即可
-        auto op = tableOpBlocking(
+        // 表成员是异步契约: 提交即开始, 结果 (登记成败) 经 ticket 交回。
+        // `start` 在主程序 IO 线程上是内联执行的: 返回时行已登记, spec 也已读完
+        return tableOp(
             ctx,
-            [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
+            [&ctx, scope = opts.scope, spec](
+                PluginxxOperatorCallback cb,
+                void*                    ud,
+                PluginxxString*          err
+            ) -> PluginxxOperatorHandle* {
                 return ctx.iface.capabilities->register_capability(
                     ctx.host,
-                    opts.scope,
+                    scope,
                     &spec,
                     cb,
                     ud,
                     err
                 );
-            },
-            0
-        );
-        if (error != nullptr) {
-            if (op.ok()) {
-                error->clear();
-            } else {
-                error->assign(op.text());
-                if (error->empty()) {
-                    error->assign(op.startError);
-                }
             }
-        }
-        return op.ok() ? 0 : -1;
+        );
     }
-    return -1;
+    return TableOpTicket{};
 }
 
 inline PluginxxString invoke_capability_blocking(
