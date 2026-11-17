@@ -244,6 +244,42 @@ public:
         return tid != std::thread::id{} && tid == std::this_thread::get_id();
     }
 
+    // ==================== 插件执行器 ====================
+
+    /// 绑定插件执行器 (**初始化阶段一次**) —— 插件代码之后只在这条线程上执行
+    ///
+    /// - 不调或传空: 插件代码与 io 同线程 (与改造前一致, 嵌入宿主不需要起线程);
+    /// - `PluginExecutorThread::executor()` 或宿主自有线程的 executor 都可以,
+    ///   但必须在加载插件之前绑定;
+    /// - 插件管理器必须在插件线程**停下来之前**完成卸载 (宿主把线程声明在管理器之前
+    ///   即可保证逆序析构)。
+    void setPluginExecutor(asio::any_io_executor ex) {
+        pluginxx::bindPluginExecutor(runtime_, std::move(ex));
+    }
+
+    /// 是否配了独立的插件执行器 (false = 插件代码跑在 io 线程上)
+    bool hasPluginExecutor() const {
+        return pluginxx::hasPluginExecutor(runtime_);
+    }
+
+    /// 当前线程是不是插件代码的执行线程
+    ///
+    /// 语义是“在这里阻塞会不会把插件卡住”: 配了插件线程时是那条线程, 没配时等于
+    /// [isIoThread]。`scheduler.is_io_thread` 入口与 kit 的同步桥用它判。
+    bool isPluginThread() const {
+        return pluginxx::isRuntimePluginThread(runtime_);
+    }
+
+    /// 插件回调耗时统计 (派发次数/平均值/超预算数/dropped)
+    const pluginxx::PluginCallbackStats& pluginCallbackStats() const noexcept {
+        return runtime_->callbackStats;
+    }
+
+    /// 设置单次插件回调的耗时预算 (毫秒; 0 = 不检查)
+    void setPluginCallbackBudget(uint32_t ms) noexcept {
+        runtime_->callbackStats.budgetMs.store(ms, std::memory_order_relaxed);
+    }
+
     /// 投递到所属 IO executor。闭包自身必须拥有执行所需状态；这里不再维护
     /// 捕获 manager 裸指针的二级队列。
     void postToIo(std::function<void()> fn) const {

@@ -192,14 +192,20 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
     /// - 不受任何插件实例的启停影响 (不会因为某插件被禁用而中途断掉);
     /// - 调用方负责在停机前先取消它们, 不能留下"没人等也没人取消"的操作;
     /// - 仍然登记到 `runtime->operations` (以便统计与取消), 且完成/取消仍恒在 IO 线程。
+    ///
+    /// `callbackOwner`: 插件完成回调属于哪个实例。表调用 (`startTableOp`) 是插件发起的
+    /// 但属于无主操作, 完成回调仍然是**插件代码**, 需要投回插件执行器并持有该实例的
+    /// 执行 lease (否则回调可能在 dlclose 后落地)。空 = 回调就地执行。
     static std::shared_ptr<OpCore> createDetached(
-        std::shared_ptr<PluginRuntime> runtime,
-        std::string                    label
+        std::shared_ptr<PluginRuntime>             runtime,
+        std::string                                label,
+        std::shared_ptr<PluginInstanceBase>        callbackOwner = nullptr
     ) {
         if (!runtime || !runtime->executor) {
             throw std::runtime_error("detached operation rejected: runtime is not available");
         }
         auto core = std::shared_ptr<OpCore>(new OpCore(std::move(runtime), std::move(label)));
+        core->callbackOwner_      = std::move(callbackOwner);
         core->handle_             = std::make_shared<PluginxxOperatorHandle>();
         core->completionEndpoint_ = std::make_shared<PluginxxOperationCompletionEndpoint>();
         core->completionEndpoint_->operation = core;
@@ -279,47 +285,53 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
     /// provider 可以同步 done + NULL；只有 NULL 且没有 done 才是真正拒绝。
     /// 错误串被复制并释放，无论成功、拒绝还是违约异常均不泄漏。
     bool start(OpDrive drive, std::string& error) {
-        drive_ = std::move(drive);
-        PluginxxString startError{};
-        auto           ntf     = notify();
-        const auto     started = std::chrono::steady_clock::now();
-        try {
-            if (drive_.start) {
-                providerHandle_ = drive_.start(&ntf, &startError);
-            } else {
-                error = "plugin has no start callback";
-            }
-        } catch (const std::exception& e) {
-            error = e.what();
-        } catch (...) {
-            error = "plugin start threw unknown exception";
+        prepareStart(std::move(drive));
+        return finishStart(invokePluginStart(), error);
+    }
+
+    /// 受理一次操作 (**IO 侧协程**): 插件那一半投递到插件执行器, 状态机仍在本线程
+    ///
+    /// 宿主没有配独立插件执行器 (插件代码与 io 同线程) 时退化为同步 [start]。
+    /// 一旦配了插件执行器, 就不能在 io 线程上直接调 `drive.start`: 插件可能在里面
+    /// 读盘/等网络, 卡住的是整个主程序。
+    asio::awaitable<bool> startAsync(OpDrive drive, std::string& error) {
+        auto self = shared_from_this(); // 协程帧保活: 本对象在完成包提交前不得释放
+        if (!runtime_ || !hasPluginExecutor(runtime_)) {
+            co_return start(std::move(drive), error);
         }
-        if (startError.data) {
-            error.assign(startError.data, static_cast<size_t>(startError.size));
-            hostMemoryFree(startError.data);
+        prepareStart(std::move(drive));
+        auto target = providerTarget();
+        if (!target) {
+            // 没有插件目标 (纯宿主驱动, 例如应用实现的能力): 就地执行
+            co_return finishStart(invokePluginStart(), error);
         }
-        if (std::chrono::steady_clock::now() - started > std::chrono::milliseconds(100)) {
-            XX_LOGW("Plugin operation `{}` start blocked IO for over 100ms", label_);
-        }
-        if (submitted()) {
-            if (!error.empty()) {
-                XX_LOGW("Plugin operation `{}` returned error after done: {}", label_, error);
-                error.clear();
-            }
-        } else if (!error.empty() || !providerHandle_) {
-            if (error.empty()) {
-                error = "protocol violation: null operation without done/error";
-            }
+        auto wait = std::make_shared<StartWait>(runtime_->executor);
+        const bool queued = dispatchToPlugin(
+            target,
+            label_ + " start",
+            [self, wait] {
+                wait->outcome = self->invokePluginStart();
+                wait->done    = true;
+                // 唤醒 io 侧的等待者 (cancel 在 io 上做, 不在插件线程动 timer)
+                enqueueRuntimeAction(
+                    self->runtime_,
+                    [wait] {
+                        wait->timer.cancel();
+                    },
+                    true
+                );
+            },
+            PluginDispatchOptions{.allowClosing = true, .retainWhenStopped = true}
+        );
+        if (!queued) {
+            // 实例已在关闭 / 执行器不可用: 插件不可能受理这次调用
+            error = "plugin operation rejected: instance is closing or plugin executor is "
+                    "unavailable";
             reject();
-            return false;
+            co_return false;
         }
-        if (!completed() && state() != PluginOperationState::Rejected) {
-            state_.store(PluginOperationState::Running, std::memory_order_release);
-        }
-        if (!completed() && handle_->canceled.load(std::memory_order_acquire)) {
-            cancel();
-        }
-        return true;
+        (void)co_await wait->timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        co_return finishStart(std::move(wait->outcome), error);
     }
 
     /// register_task 与主程序 scheduler 的异步执行没有 provider start 返回值。
@@ -385,12 +397,59 @@ private:
             cancel         = drive_.cancel;
             providerHandle = providerHandle_;
         }
+        invokePluginCancel(std::move(cancel), providerHandle);
+    }
+
+    /// 插件完成回调的目标实例 (回调属于调用方: 能力调用是调用方的回调)
+    std::shared_ptr<PluginInstanceBase> callbackTarget() const {
+        if (caller_ && caller_->owner) {
+            return caller_->owner;
+        }
+        if (callbackOwner_) {
+            return callbackOwner_;
+        }
+        return providerTarget();
+    }
+
+    /// 插件 start/cancel 的目标实例 (被调方)
+    std::shared_ptr<PluginInstanceBase> providerTarget() const {
+        return provider_ ? provider_->owner : nullptr;
+    }
+
+    /// 调一次插件的 cancel (**IO 线程**)
+    ///
+    /// 配了插件执行器时投递过去 (插件可能在自己的 cancel 里等网络); 没配则就地调。
+    /// 不抛异常: cancel 是尽力而为, 失败只记日志。
+    void invokePluginCancel(std::function<void(void*)> cancel, void* handle) noexcept {
+        if (!cancel) {
+            return;
+        }
+        auto target = providerTarget();
+        if (target && runtime_ && hasPluginExecutor(runtime_)) {
+            const bool queued = dispatchToPlugin(
+                target,
+                label_ + " cancel",
+                [cancel = std::move(cancel), handle]() mutable {
+                    try {
+                        cancel(handle);
+                    } catch (const std::exception& e) {
+                        XX_LOGW("Plugin operation cancel threw: {}", e.what());
+                    } catch (...) {
+                        XX_LOGW("Plugin operation cancel threw unknown exception");
+                    }
+                },
+                PluginDispatchOptions{.allowClosing = true, .measure = false}
+            );
+            if (queued) {
+                return;
+            }
+            XX_LOGW("Plugin operation `{}` cancel could not be dispatched", label_);
+            return;
+        }
         try {
             // 不在提交锁内进入插件。插件可能同步调用 notify.done，完成端点
             // 必须能够重新获取同一把锁，否则 cancel/done 会形成自锁。
-            if (cancel) {
-                cancel(providerHandle);
-            }
+            cancel(handle);
         } catch (const std::exception& e) {
             XX_LOGW("Plugin operation `{}` cancel threw: {}", label_, e.what());
         } catch (...) {
@@ -504,6 +563,111 @@ public:
 
 private:
 
+    /// 插件 start 那一半的结果 (在插件执行器上算出来, 在 IO 线程上使用)
+    struct StartOutcome {
+        bool        started        = false; ///< 给出了非空操作句柄 = 已受理
+        void*       providerHandle = nullptr;
+        std::string error;
+        uint64_t    elapsedMicros = 0;
+    };
+
+    /// [startAsync] 的等待位: 插件线程写了 outcome 后 post 回 IO 取消 timer
+    struct StartWait {
+        asio::steady_timer timer;
+        StartOutcome       outcome;
+        bool               done = false;
+
+        explicit StartWait(const asio::any_io_executor& ex) :
+            timer(ex, std::chrono::steady_clock::time_point::max()) {}
+    };
+
+    /// IO: 登记驱动 (真正的插件调用在 [invokePluginStart])
+    void prepareStart(OpDrive drive) {
+        std::lock_guard lock(submitMutex_);
+        drive_ = std::move(drive);
+    }
+
+    /// **插件执行器**: 只做一次插件调用, 不碰任何 IO 侧状态
+    ///
+    /// 返回值与错误串都是值语义: 由调用方跨线程带回 IO 线程再用。
+    StartOutcome invokePluginStart() {
+        StartOutcome out;
+        OpDrive      local;
+        {
+            std::lock_guard lock(submitMutex_);
+            local = drive_;
+        }
+        PluginxxString startError{};
+        auto           ntf     = notify();
+        const auto     started = std::chrono::steady_clock::now();
+        try {
+            if (local.start) {
+                out.providerHandle = local.start(&ntf, &startError);
+            } else {
+                out.error = "plugin has no start callback";
+            }
+        } catch (const std::exception& e) {
+            out.error = e.what();
+        } catch (...) {
+            out.error = "plugin start threw unknown exception";
+        }
+        if (startError.data) {
+            try {
+                out.error.assign(startError.data, static_cast<size_t>(startError.size));
+            } catch (...) {
+                out.error = "plugin start returned an unreadable error";
+            }
+            hostMemoryFree(startError.data);
+        }
+        out.elapsedMicros = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started
+            )
+                .count()
+        );
+        out.started = out.providerHandle != nullptr;
+        return out;
+    }
+
+    /// IO: 按插件结论推进状态机 (与原同步 start 的后半段逐字一致)
+    bool finishStart(StartOutcome outcome, std::string& error) {
+        if (error.empty()) {
+            error = std::move(outcome.error);
+        }
+        providerHandle_ = outcome.providerHandle;
+        if (submitted()) {
+            if (!error.empty()) {
+                XX_LOGW("Plugin operation `{}` returned error after done: {}", label_, error);
+                error.clear();
+            }
+        } else if (!error.empty() || !providerHandle_) {
+            if (error.empty()) {
+                error = "protocol violation: null operation without done/error";
+            }
+            reject();
+            return false;
+        }
+        const auto current = state();
+        if (!completed() && current != PluginOperationState::Rejected
+            && current != PluginOperationState::Cancelling) {
+            state_.store(PluginOperationState::Running, std::memory_order_release);
+        }
+        if (!completed()) {
+            if (current == PluginOperationState::Cancelling) {
+                // 取消比受理早到 (插件那时还没有操作句柄): 补一次取消
+                std::function<void(void*)> cancel;
+                {
+                    std::lock_guard lock(submitMutex_);
+                    cancel = drive_.cancel;
+                }
+                invokePluginCancel(std::move(cancel), providerHandle_);
+            } else if (handle_->canceled.load(std::memory_order_acquire)) {
+                cancel();
+            }
+        }
+        return true;
+    }
+
     OpCore(std::shared_ptr<PluginRuntime> runtime, std::string label) :
         runtime_(std::move(runtime)),
         label_(std::move(label)),
@@ -520,19 +684,54 @@ private:
         providerHandle_ = nullptr;
         auto  callback  = std::exchange(callback_, nullptr);
         auto* ud        = std::exchange(callbackUd_, nullptr);
-        try {
-            if (callback) {
-                auto sv = PluginxxStringView{
-                    completion_.payload.data(),
-                    static_cast<uint64_t>(completion_.payload.size())
-                };
-                callback(ud, completion_.status, &sv);
+        /// 插件完成回调是**插件代码**: 配了插件执行器时投回去执行 (lease 在派发时取,
+        /// 因此回调执行前不会 dlclose)。搬作体很快 (唤醒协程 / 置一个标志), 但它
+        /// 可能就是插件自己的用户代码。
+        bool callbackDispatched = false;
+        if (callback) {
+            auto target = callbackTarget();
+            if (target && runtime_ && hasPluginExecutor(runtime_)) {
+                auto callbackCopy = callback;
+                auto* udCopy      = ud;
+                auto  status      = completion_.status;
+                auto  payload     = completion_.payload;
+                callbackDispatched = dispatchToPlugin(
+                    target,
+                    label_ + " completion",
+                    [callbackCopy, udCopy, status, payload]() mutable {
+                        auto sv = PluginxxStringView{
+                            payload.data(),
+                            static_cast<uint64_t>(payload.size())
+                        };
+                        callbackCopy(udCopy, status, &sv);
+                    },
+                    PluginDispatchOptions{.allowClosing = true}
+                );
+                if (!callbackDispatched) {
+                    XX_LOGW(
+                        "Plugin operation `{}` completion callback dropped: plugin executor is "
+                        "unavailable",
+                        label_
+                    );
+                }
+            } else {
+                try {
+                    auto sv = PluginxxStringView{
+                        completion_.payload.data(),
+                        static_cast<uint64_t>(completion_.payload.size())
+                    };
+                    callback(ud, completion_.status, &sv);
+                } catch (const std::exception& e) {
+                    XX_LOGW("Plugin operation `{}` completion callback threw: {}", label_, e.what());
+                } catch (...) {
+                    XX_LOGW(
+                        "Plugin operation `{}` completion callback threw unknown exception",
+                        label_
+                    );
+                }
             }
-        } catch (const std::exception& e) {
-            XX_LOGW("Plugin operation `{}` completion callback threw: {}", label_, e.what());
-        } catch (...) {
-            XX_LOGW("Plugin operation `{}` completion callback threw unknown exception", label_);
         }
+        (void)callbackDispatched;
         /// 外部 callback 违约抛异常不能跳过主程序完成处理器（例如 sleep 索引清理）。
         try {
             if (completionHandler_) {
@@ -587,6 +786,8 @@ private:
     OpDrive                                              drive_;
     void*                                                providerHandle_ = nullptr;
     OpGuardPtr                                           provider_, caller_;
+    /// 无主操作 (表调用) 的插件回调目标实例; 空 = 回调就地执行 (宿主自己发起的调用)
+    std::shared_ptr<PluginInstanceBase>                  callbackOwner_;
     std::shared_ptr<PluginxxOperatorHandle>              handle_;
     std::shared_ptr<PluginxxOperationCompletionEndpoint> completionEndpoint_;
     PluginxxOperatorCallback                             callback_   = nullptr;
@@ -707,7 +908,7 @@ inline asio::awaitable<PluginOpResult> awaitPluginOpResult(PluginOpAwaitArgs arg
     }
     auto        core = OpCore::create(runtime, args.inst, nullptr, args.label);
     std::string error;
-    if (!core->start(std::move(args.drive), error)) {
+    if (!co_await core->startAsync(std::move(args.drive), error)) {
         throw std::runtime_error(
             fmt::format("plugin `{}` op {} failed: {}", args.inst->name, args.label, error)
         );
@@ -767,7 +968,7 @@ inline asio::awaitable<bool> awaitPluginLifecycle(
         drive.start = [hook, pluginCtx](const auto* notify, auto* errorOut) -> void* {
             return hook(pluginCtx, notify, errorOut);
         };
-        if (!core->start(std::move(drive), error)) {
+        if (!co_await core->startAsync(std::move(drive), error)) {
             co_return false;
         }
         try {

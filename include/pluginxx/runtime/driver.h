@@ -142,16 +142,16 @@ struct PluginxxDriver : std::enable_shared_from_this<PluginxxDriver> {
             return false;
         }
         auto       self   = shared_from_this();
-        const bool queued = pluginxx::enqueueRuntimeAction(
+        const bool queued = pluginxx::enqueuePluginAction(
             runtime_,
             [self] {
-                self->runOnIo();
+                self->runOnPlugin();
             },
             /*retainWhenStopped=*/false
         );
         if (!queued) {
             XX_LOGW(
-                "Plugin driver `{}` could not be queued: runtime IO executor unavailable",
+                "Plugin driver `{}` could not be queued: runtime plugin executor unavailable",
                 label_
             );
             // 入队失败等价于"主程序不再提供驱动": 立刻收束请求 (释放 lease)。
@@ -232,7 +232,7 @@ private:
     static constexpr uint32_t kIdle = static_cast<uint32_t>(State::Idle);
 
     /// 唯一执行入口 (IO 线程): CAS Idle→Running 抢到所有权才调用插件回调。
-    void runOnIo() noexcept {
+    void runOnPlugin() noexcept {
         uint32_t expected = kIdle;
         if (!state_.compare_exchange_strong(
                 expected,

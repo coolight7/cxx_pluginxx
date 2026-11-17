@@ -379,6 +379,163 @@ public:
 };
 
 // =====================================================================
+// 插件代码派发（主程序 → 插件）
+// =====================================================================
+
+/// 一次派发的选项
+struct PluginDispatchOptions {
+    /// 关闭中的实例是否还要执行
+    /// - false (默认): 常规回调 —— 实例进入 Closing 后不再进插件代码;
+    /// - true: 生命周期收尾类 (stop / 取消 / 完成收尾) —— Closing 期间必须能跑,
+    ///   `Closed` 仍拒绕 (拿不到 lease)。
+    bool allowClosing = false;
+    /// 插件执行器不可用 (缺失/已停止) 时是否保留动作, 绑定/恢复后重放
+    /// - 常规回调传 false: 主程序没在执行, 这个回调已经没有意义;
+    /// - 收尾类传 true: 不该因为线程刚好停了就丢掉。
+    bool retainWhenStopped = false;
+    /// 是否计入回调耗时统计 (只用于排查; 默认计)
+    bool measure = true;
+};
+
+/// 把一段**插件代码**投递到该实例的执行器上执行
+///
+/// 这是“主程序调插件”的唯一入口。语义:
+/// - **实例 lease 在派发时取**, 排队中的派发项也算在途: 实例关闭要等它跑完
+///   (`waitInflightZero`), `dlclose` 不会越过已受理但尚未执行的回调;
+/// - 同实例严格 FIFO (单执行器天然保证); 跨实例共享线程时各自 FIFO;
+/// - 拿不到 lease (实例已在关闭/已禁用) 时直接丢弃并计入 `callbackStats.dropped`:
+///   不抛异常、不回调, 调用方无需额外处理;
+/// - 执行体抛出的异常只记日志 (跨 C ABI 抛异常属插件违约)。
+///
+/// - `return` false = 没有投递成功 (实例/运行时已失效、执行器不可用、拿不到 lease)。
+/// 一次派发的载荷 (含 move-only 的执行 lease, 因此本体放在 shared_ptr 里: `std::function`
+/// 要求可拷贝, 而 lambda 捕了 lease 就不可拷贝)
+struct PluginDispatchContext {
+    std::shared_ptr<PluginInstanceBase> inst;
+    std::string                         label;
+    std::function<void()>               fn;
+    pluginxx::InstanceLease             lease;
+    pluginxx::PluginCallbackStats*      stats = nullptr;
+};
+
+/// 执行一次投递 (测量 + 异常保护 + 统计); 内联路径与插件线程路径共用
+inline void runPluginDispatch(PluginDispatchContext& context) {
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        if (context.fn) {
+            context.fn();
+        }
+    } catch (const std::exception& e) {
+        XX_LOGE(
+            "Plugin `{}`: callback `{}` threw: {}",
+            context.inst->name,
+            context.label,
+            e.what()
+        );
+    } catch (...) {
+        XX_LOGE(
+            "Plugin `{}`: callback `{}` threw unknown exception",
+            context.inst->name,
+            context.label
+        );
+    }
+    context.fn = {};
+    // lease 提前释放: 后面的统计不需要再用锁住实例
+    context.lease.reset();
+    auto* stats = context.stats;
+    if (!stats) {
+        return;
+    }
+    const auto micros = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started
+        )
+            .count()
+    );
+    stats->callbacks.fetch_add(1, std::memory_order_relaxed);
+    stats->totalMicros.fetch_add(micros, std::memory_order_relaxed);
+    uint64_t previousMax = stats->maxMicros.load(std::memory_order_relaxed);
+    while (micros > previousMax
+           && !stats->maxMicros.compare_exchange_weak(
+               previousMax,
+               micros,
+               std::memory_order_relaxed
+           )) {
+    }
+    const auto budget = static_cast<uint64_t>(stats->budgetMs.load(std::memory_order_relaxed));
+    if (budget > 0 && micros > budget * 1000) {
+        stats->overBudget.fetch_add(1, std::memory_order_relaxed);
+        XX_LOGW(
+            "Plugin `{}`: callback `{}` blocked the plugin thread for {} ms "
+            "(budget {} ms)",
+            context.inst->name,
+            context.label,
+            micros / 1000,
+            budget
+        );
+    }
+}
+
+inline bool dispatchToPlugin(
+    const std::shared_ptr<PluginInstanceBase>& inst,
+    std::string_view                           label,
+    std::function<void()>                      fn,
+    PluginDispatchOptions                      options = {}
+) {
+    if (!inst || !fn) {
+        return false;
+    }
+    auto runtime = inst->runtime.lock();
+    auto lease   = pluginxx::InstanceLease::acquire(inst->lifetime, options.allowClosing);
+    if (inst->lifetime && !lease) {
+        if (runtime && options.measure) {
+            runtime->callbackStats.dropped.fetch_add(1, std::memory_order_relaxed);
+        }
+        XX_LOGD(
+            "Plugin `{}`: callback `{}` dropped, instance is closing or closed",
+            inst->name,
+            label
+        );
+        return false;
+    }
+    auto context   = std::make_shared<PluginDispatchContext>();
+    context->inst  = inst;
+    context->label = std::string{label};
+    context->fn    = std::move(fn);
+    context->lease = std::move(lease);
+    context->stats = (runtime && options.measure) ? &runtime->callbackStats : nullptr;
+
+    // 宿主没配独立插件执行器 (嵌入宿主 / 直接 new 管理器): 插件代码本来就在调用
+    // 线程上跑, 就地执行即可 —— 与改造前完全一致, 不多一跳。
+    if (!runtime || !pluginxx::hasPluginExecutor(runtime)) {
+        runPluginDispatch(*context);
+        return true;
+    }
+
+    const bool queued = pluginxx::enqueuePluginActionOn(
+        runtime,
+        pluginxx::pluginExecutionExecutor(runtime),
+        [runtime, context] {
+            runPluginDispatch(*context);
+            (void)runtime;
+        },
+        options.retainWhenStopped
+    );
+    if (!queued) {
+        if (options.measure) {
+            runtime->callbackStats.unschedulable.fetch_add(1, std::memory_order_relaxed);
+        }
+        XX_LOGW(
+            "Plugin `{}`: callback `{}` could not be scheduled (plugin executor is not "
+            "available)",
+            inst->name,
+            label
+        );
+    }
+    return queued;
+}
+
+// =====================================================================
 // 框架控制块 (交给插件的 host 视图)
 // =====================================================================
 

@@ -16,6 +16,7 @@
 /// 句柄) 因此无需额外加锁。
 #pragma once
 
+#include "asio/co_spawn.hpp"
 #include "asio/post.hpp"
 #include "asio/steady_timer.hpp"
 #include "pluginxx/host/abi_util.h"
@@ -563,7 +564,12 @@ public:
                                    /*lifecycle=*/false,
                                    /*callerMayStop=*/true
                                )
-                             : OpCore::createDetached(this->runtime(), std::move(label));
+                             : OpCore::createDetached(
+                                   this->runtime(),
+                                   std::move(label),
+                                   caller ? caller->template sharedSelf<InstanceT>()
+                                          : nullptr
+                               );
             };
             if (rows.empty()) {
                 /// 应用实现的能力（声明由应用给出、没有插件实现行）: 派发前把调用
@@ -1014,18 +1020,21 @@ public:
                     || !inst->lifetime->acceptsOperations()) {
                     return;
                 }
-                PluginInstanceBase::InflightGuard guard(inst);
-                if (!guard || !sub->alive.load(std::memory_order_acquire)) {
-                    return;
-                }
-                try {
-                    const auto view = detail::abiView(data);
-                    sub->handler(&view, sub->ud);
-                } catch (const std::exception& e) {
-                    XX_LOGW("Plugin `{}` broadcast handler threw: {}", inst->name, e.what());
-                } catch (...) {
-                    XX_LOGW("Plugin `{}` broadcast handler threw unknown exception", inst->name);
-                }
+                // 载荷可能很长, 也可能在发布方的栈上: 拷一份交给插件执行器
+                auto       payload = std::string{data};
+                const auto handler = sub->handler;
+                void*      ud      = sub->ud;
+                dispatchToPlugin(
+                    inst,
+                    "broadcast " + sub->broadcastId,
+                    [sub, handler, ud, payload = std::move(payload)] {
+                        if (!sub->alive.load(std::memory_order_acquire)) {
+                            return;
+                        }
+                        const auto view = detail::abiView(payload);
+                        handler(&view, ud);
+                    }
+                );
             },
             onEnd ? std::function<void(std::string_view)>([sub, onEnd](std::string_view reason) {
                 if (!sub->alive.load(std::memory_order_acquire)) {
@@ -1035,21 +1044,18 @@ public:
                 if (!inst || !inst->lifetime || !inst->lifetime->acceptsOperations()) {
                     return;
                 }
-                PluginInstanceBase::InflightGuard guard(inst);
-                if (!guard || !sub->alive.load(std::memory_order_acquire)) {
-                    return;
-                }
-                try {
-                    const auto view = detail::abiView(reason);
-                    onEnd(&view, sub->ud);
-                } catch (const std::exception& e) {
-                    XX_LOGW("Plugin `{}` broadcast end handler threw: {}", inst->name, e.what());
-                } catch (...) {
-                    XX_LOGW(
-                        "Plugin `{}` broadcast end handler threw unknown exception",
-                        inst->name
-                    );
-                }
+                auto       reasonText = std::string{reason};
+                dispatchToPlugin(
+                    inst,
+                    "broadcast end " + sub->broadcastId,
+                    [sub, onEnd, reasonText = std::move(reasonText)] {
+                        if (!sub->alive.load(std::memory_order_acquire)) {
+                            return;
+                        }
+                        const auto view = detail::abiView(reasonText);
+                        onEnd(&view, sub->ud);
+                    }
+                );
             })
                    : std::function<void(std::string_view)>{},
             options
@@ -1093,35 +1099,8 @@ public:
     }
 
     // =====================================================================
-    // scheduler 表 (IO 投递 / 睡眠 / 阻塞工作委托)
+    // scheduler 表 (睡眠 / 阻塞工作委托)
     // =====================================================================
-
-    /// 投递一次回调到 IO 线程 (**IO 线程**)
-    /// - 恒异步: 回调经 OpCore 完成协议在 IO 线程发布, 因此不会在调用栈内重入
-    PluginxxOperatorHandle*
-        postCallback(InstanceT* inst, void(PLUGINXX_CALL* fn)(void*), void* ud) {
-        if (!inst || !fn || !this->isIoThread()) {
-            return nullptr;
-        }
-        auto core = OpCore::create(
-            this->runtime(),
-            inst->template sharedSelf<InstanceT>(),
-            nullptr,
-            "scheduler post"
-        );
-        try {
-            core->setCompletionHandler([fn, ud](int32_t, std::string_view) {
-                fn(ud);
-            });
-            core->accept();
-            auto notify = core->notify();
-            notify.done(notify.host_ud, PLUGINXX_OPERATOR_OK, nullptr);
-            return core->handle();
-        } catch (...) {
-            core->reject();
-            throw;
-        }
-    }
 
     /// 定时器睡眠 (**IO 线程**); 完成/取消/失败都经完成回调恰好一次上报
     PluginxxOperatorHandle* sleep(
@@ -1225,15 +1204,24 @@ public:
             core             = OpCore::create(this->runtime(), owner, nullptr, "scheduler offload");
             auto result      = std::make_shared<WorkResult>();
             auto cancelState = std::make_shared<OffloadCancelState>();
-            core->setCompletionHandler([result, done, ud](int32_t status, std::string_view error) {
+            core->setCompletionHandler([owner, result, done, ud](int32_t status, std::string_view error) {
                 if (!done) {
                     return;
                 }
-                auto view = detail::abiView(error);
-                if (status == PLUGINXX_OPERATOR_FAILED && error.empty()) {
-                    view = detail::abiView("plugin offload failed");
-                }
-                done(ud, status, result->value, &view);
+                // 插件侧 done 是插件代码: 投回插件执行器, 异常只记日志
+                auto errorText = std::string{error};
+                dispatchToPlugin(
+                    owner,
+                    "scheduler offload done",
+                    [result, done, ud, status, errorText = std::move(errorText)] {
+                        auto view = detail::abiView(errorText);
+                        if (status == PLUGINXX_OPERATOR_FAILED && errorText.empty()) {
+                            view = detail::abiView("plugin offload failed");
+                        }
+                        done(ud, status, result->value, &view);
+                    },
+                    PluginDispatchOptions{.allowClosing = true}
+                );
             });
             core->accept([cancelState] {
                 cancelState->requested.store(true, std::memory_order_release);
@@ -1485,9 +1473,51 @@ protected:
             if (finished) {
                 return;
             }
-            while (index < rows.size()) {
+            auto self = this->shared_from_this();
+            try {
+                asio::co_spawn(
+                    host->ioExecutor(),
+                    advance(),
+                    [self](std::exception_ptr error) {
+                        if (!error) {
+                            return;
+                        }
+                        try {
+                            std::rethrow_exception(error);
+                        } catch (const std::exception& e) {
+                            XX_LOGE(
+                                "capability `{}`: chain step failed: {}",
+                                self->capability,
+                                e.what()
+                            );
+                            self->finish(PLUGINXX_OPERATOR_FAILED, e.what());
+                        } catch (...) {
+                            XX_LOGE(
+                                "capability `{}`: chain step failed unexpectedly",
+                                self->capability
+                            );
+                            self->finish(
+                                PLUGINXX_OPERATOR_FAILED,
+                                "capability chain failed unexpectedly"
+                            );
+                        }
+                    }
+                );
+            } catch (const std::exception& e) {
+                XX_LOGE("capability `{}`: cannot advance chain: {}", capability, e.what());
+                finish(PLUGINXX_OPERATOR_FAILED, e.what());
+            }
+        }
+
+        /// 推进到下一行并启动 (**IO 协程**)
+        ///
+        /// 每行的 `run_start` 是插件代码: 配了独立插件执行器时要投递过去等结论,
+        /// 不能再在本线程直接调 (插件里读一次慢盘就卡住整个主程序);
+        /// `onRowDone` 里再调 [startNext], 每行一个协程帧, 不递归堆栈。
+        asio::awaitable<void> advance() {
+            while (!finished && index < rows.size()) {
                 const CapabilityProvider row = rows[index];
-                auto provider = host->find(row.provider);
+                auto                     provider = host->find(row.provider);
                 if (!provider || !provider->enabled) {
                     XX_LOGW(
                         "capability `{}`: provider `{}` is not available, skipped",
@@ -1556,11 +1586,11 @@ protected:
                     }
                 };
                 std::string error;
-                if (!op->start(std::move(drive), error)) {
+                if (!co_await op->startAsync(std::move(drive), error)) {
                     current.reset();
                     if (row.phase == CapabilityPhase_e::Impl) {
                         finish(PLUGINXX_OPERATOR_FAILED, error);
-                        return;
+                        co_return;
                     }
                     XX_LOGW(
                         "capability `{}`: provider `{}` did not start: {}",
@@ -1571,7 +1601,7 @@ protected:
                     ++index;
                     continue;
                 }
-                return;
+                co_return;
             }
             finish(PLUGINXX_OPERATOR_OK, hasResult ? result : std::string{"null"});
         }

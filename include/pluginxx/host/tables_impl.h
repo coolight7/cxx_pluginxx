@@ -122,7 +122,8 @@ PluginxxOperatorHandle* asyncTableOp(
         std::move(label),
         [keep, work = std::forward<Fn>(work)]() mutable -> std::string {
             return work(keep.instance(), keep.manager());
-        }
+        },
+        keep.inst
     );
 }
 
@@ -1031,10 +1032,11 @@ struct GenericTableEntries {
     // =====================================================================
 
     static int32_t PLUGINXX_CALL isIoThreadEntry(const PluginxxHost* host) {
-        // 只读查询：关闭过程中仍允许回答（返回 0 表示"不是 IO 线程"）
+        // 语义: “当前线程是不是该插件的执行线程”, 也就是“在这里阻塞会不会卡住插件”。
+        // 名字沿用 ABI 老名 (避免换代), 但配了插件线程后回答的是插件线程。
         auto call = enterHost(host, /*allowClosing=*/true);
         auto mgr  = call.manager();
-        return (mgr && mgr->isIoThread()) ? 1 : 0;
+        return (mgr && mgr->isPluginThread()) ? 1 : 0;
     }
 
     static PluginxxOperatorHandle* PLUGINXX_CALL sleepEntry(

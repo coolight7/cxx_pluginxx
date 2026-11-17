@@ -63,15 +63,19 @@ inline void setTableOpError(PluginxxString* error_out, std::string_view message)
 /// - `cb` / `ud`: 完成回调 (可空 = 只受理不回程);
 /// - `error_out`: 未受理的原因 (可空);
 /// - `label`: 诊断名 (出现在未终结操作摘要与日志里, 形如 `session.get_messages`);
-/// - `work`: 工作体, 返回结果正文; 抛 [TableOpError] / 任何标准异常 = 本次失败。
+/// - `work`: 工作体, 返回结果正文; 抛 [TableOpError] / 任何标准异常 = 本次失败;
+/// - `callbackOwner`: 完成回所属的插件实例。表调用是无主操作 (没有实例租约), 但
+///   完成回调是**插件代码**: 配了独立插件执行器时它要投回那条线程, 并持有该实例的
+///   执行 lease (否则回调可能在 `dlclose` 之后落地)。空 = 回调就地执行。
 ///
 /// 回调时机:
-/// - **调用方本来就在自己的 IO 线程**: 工作体当场执行, `cb` **在本次调用返回之前**
-///   (同一个栈上) 被调用一次 —— 注册类调用"登记后立刻可见"的语义与同步调用一致,
-///   插件也不必为自己的线程多等一次 executor 轮次;
-/// - **其它线程**: 工作体排队到 IO 线程执行, `cb` 在 IO 线程发出 (不内联)。
+/// - **调用方本来就在主程序 IO 线程**: 工作体当场执行, `cb` **在本次调用返回之前**
+///   (同一个栈上) 被调用一次 —— 主程序自己调自己的表时行为与同步调用一致;
+/// - **插件执行线程**: 工作体投递到 IO 线程排队执行, `cb` 在插件执行线程发出
+///   (不内联 —— 主程序 io 线程上不执行插件代码);
+/// - **其它线程**: 同上, `cb` 在那条线程发出。
 ///
-/// 两种情况下 `cb` 都恰好一次, 且都在 IO 线程上。
+/// 三种情况下 `cb` 都恰好一次。
 ///
 /// 返回非 NULL = 已受理 (结果经 `cb` 恰好一次); 返回 NULL = 未受理 (已写 `error_out`)。
 template<typename Mgr, typename Fn>
@@ -81,7 +85,8 @@ PluginxxOperatorHandle* startTableOp(
     void*                    ud,
     PluginxxString*          error_out,
     std::string              label,
-    Fn&&                     work
+    Fn&&                     work,
+    std::shared_ptr<PluginInstanceBase> callbackOwner = nullptr
 ) noexcept {
     if (!mgr) {
         setTableOpError(error_out, "plugin runtime is unavailable");
@@ -96,7 +101,7 @@ PluginxxOperatorHandle* startTableOp(
             return nullptr;
         }
         inlineIo = mgr->isIoThread();
-        core     = OpCore::createDetached(runtime, label);
+        core     = OpCore::createDetached(runtime, label, std::move(callbackOwner));
         if (!inlineIo) {
             core->setCallback(cb, ud);
         }

@@ -4,12 +4,20 @@
 /// 所有类型仅供主程序内部使用, 不属于 C ABI。
 ///
 /// 内容:
-/// - [PluginRuntime]: 不捕获 manager 裸指针的公共运行时状态 (io executor / 操作表 /
-///   待重放动作队列), 由主程序管理器持有;
+/// - [PluginRuntime]: 不捕获 manager 裸指针的公共运行时状态 (io executor / 插件
+///   executor / 操作表 / 待重放动作队列), 由主程序管理器持有;
 /// - [InstanceLifetime] / [InstanceLease]: 实例状态机与执行 lease (关闭等待覆盖
 ///   所有已进入插件代码的执行);
-/// - [enqueueRuntimeAction] / [replayRuntimeActions]: 经 runtime 投递动作, 并在
-///   executor 停止期间保留、恢复后重放。
+/// - [enqueueRuntimeAction] / [replayRuntimeActions]: 经 io executor 投递动作, 并在
+///   executor 停止期间保留、恢复后重放;
+/// - [enqueuePluginAction] / [replayPluginActions]: 同上, 但投到**插件执行器** (所有
+///   "主程序调用插件" 的回调都从这里进插件代码);
+/// - [pluginExecutionExecutor] / [isRuntimePluginThread]: 插件执行器的取值与线程判定。
+///
+/// 两个执行器:
+/// - `executor` (io): 主程序状态机 (会话/注册表/图/定时器) 与全部受理动作;
+/// - `pluginExecutor` (插件线程): 插件代码 (回调/协程驱动/插件侧取消) 只在这条线程上
+///   执行; 为空表示宿主没有起插件线程, 此时插件代码与 io 同线程 (行为与改造前一致)。
 #pragma once
 
 #include "utilxx_base/asio_error.h"
@@ -58,6 +66,12 @@ bool enqueueRuntimeAction(
     bool                                  retainWhenStopped
 ) noexcept;
 void replayRuntimeActions(const std::shared_ptr<PluginRuntime>& runtime) noexcept;
+bool enqueuePluginAction(
+    const std::shared_ptr<PluginRuntime>& runtime,
+    std::function<void()>                 fn,
+    bool                                  retainWhenStopped
+) noexcept;
+void replayPluginActions(const std::shared_ptr<PluginRuntime>& runtime) noexcept;
 
 enum class PluginInstanceState : uint32_t {
     Loading,
@@ -374,18 +388,50 @@ private:
 
 struct OpCore;
 
+/// 一次插件回调的耗时统计 (跨实例汇总; 每次派发更新)
+///
+/// 只在插件执行器空闲可用时计算: 排队时长不计入回调耗时, 因为队头阻塞本身就是
+/// "某个别的回调跑久了"的症状, 记在同一个数上会让定位失去指向性。
+struct PluginCallbackStats {
+    /// 已执行的回调数
+    std::atomic<uint64_t> callbacks{0};
+    /// 起止时间跨度累计 (微秒): 除以 callbacks 得到平均回调耗时
+    std::atomic<uint64_t> totalMicros{0};
+    /// 最长的一次回调耗时 (微秒)
+    std::atomic<uint64_t> maxMicros{0};
+    /// 超过预算的回调数
+    std::atomic<uint64_t> overBudget{0};
+    /// 派发时拿不到实例 lease 而丢弃的回调数 (实例已在关闭)
+    std::atomic<uint64_t> dropped{0};
+    /// 插件执行器不可用 (缺失/已停止) 而丢弃的派发数
+    std::atomic<uint64_t> unschedulable{0};
+    /// 单次回调耗时预算 (毫秒); 超过记 WARN 并计入 [overBudget]
+    std::atomic<uint32_t> budgetMs{100};
+};
+
 /// 不捕获 manager 裸指针的公共运行时状态。Operation 表只由 IO 线程操作。
 /// 已接受 Operation 持有 runtime，runtime 持有 Operation，直到最终清理时断开；
 /// 等待者取消或 manager 被错误销毁不能提前释放仍在执行的 DSO/context。
 struct PluginRuntime {
     asio::any_io_executor        executor;
     std::atomic<std::thread::id> ioThreadId{};
+    /// 插件执行器 (所有插件代码在这里执行); 空 = 与 [executor] 同一个
+    ///
+    /// 绑定只发生在初始化阶段 (管理器建立时), 之后只读, 因此不需要锁。
+    asio::any_io_executor pluginExecutor;
+    /// 插件执行器的工作线程; 由投递闭包在目标线程上记录 (绑定阶段未知)
+    std::atomic<std::thread::id> pluginThreadId{};
+    /// 插件回调的耗时统计
+    PluginCallbackStats callbackStats{};
     /// 正常路径只在 IO 线程访问；executor 停止后，完成线程仍可能需要
     /// 收束一个已接受 Operation，因此为这条故障路径提供最小互斥保护。
     mutable std::mutex                          operationsMutex;
     std::map<uint64_t, std::shared_ptr<OpCore>> operations;
     mutable std::mutex                          pendingMutex;
     std::deque<std::shared_ptr<RuntimeAction>>  pendingActions;
+    /// 插件执行器停止期间保留的派发项 (与 io 那条队列分开, 恢复时各自重放)
+    mutable std::mutex                          pendingPluginMutex;
+    std::deque<std::shared_ptr<RuntimeAction>>  pendingPluginActions;
     uint64_t                                    nextOperationId = 1;
     uint64_t                                    nextGeneration  = 1;
 
@@ -436,16 +482,93 @@ inline bool isRuntimeIoThread(const std::shared_ptr<PluginRuntime>& runtime) noe
     return tid != std::thread::id{} && tid == std::this_thread::get_id();
 }
 
+/// 宿主是否给这个运行时配了**独立的**插件执行器
+///
+/// - false: 插件代码与 io 同线程 (与改造前一致, 直接 new 管理器嵌入的宿主就是这种);
+/// - true: 插件代码只在 [PluginRuntime::pluginExecutor] 上执行。
+inline bool hasPluginExecutor(const std::shared_ptr<PluginRuntime>& runtime) noexcept {
+    return runtime && static_cast<bool>(runtime->pluginExecutor);
+}
+
+/// 插件代码的执行执行器 (未配独立插件执行器时退回 io executor)
+inline asio::any_io_executor pluginExecutionExecutor(const std::shared_ptr<PluginRuntime>& runtime
+) noexcept {
+    if (!runtime) {
+        return {};
+    }
+    return runtime->pluginExecutor ? runtime->pluginExecutor : runtime->executor;
+}
+
+/// 当前线程是不是这个运行时的插件执行线程
+///
+/// 语义: "在这里阻塞会不会把插件代码卡住"。有独立插件执行器时比对插件线程;
+/// 没有时插件代码就跑在 io 线程上, 退回 [isRuntimeIoThread] 的结论。
+/// kit 的同步桥 (`tableOpSyncWait`) 与 `scheduler.is_io_thread` 用这个判定。
+inline bool isRuntimePluginThread(const std::shared_ptr<PluginRuntime>& runtime) noexcept {
+    if (!runtime) {
+        return false;
+    }
+    if (hasPluginExecutor(runtime)) {
+        if (runtimeExecutorStopped(runtime->pluginExecutor)) {
+            return false;
+        }
+        const auto tid = runtime->pluginThreadId.load(std::memory_order_acquire);
+        return tid != std::thread::id{} && tid == std::this_thread::get_id();
+    }
+    return isRuntimeIoThread(runtime);
+}
+
+/// 绑定插件执行器 (**初始化阶段, 只调一次**)
+///
+/// - 传入空 executor 等于取消绑定, 插件代码回到 io 线程执行;
+/// - 插件线程 id 在这里清空, 由第一次投递在实际工作线程上记录 (绑定调用方自己不
+///   一定是那条线程);
+/// - 绑定后重放上一轮停止期间保留的派发项。
+inline void bindPluginExecutor(
+    const std::shared_ptr<PluginRuntime>& runtime,
+    asio::any_io_executor                 executor
+) noexcept {
+    if (!runtime) {
+        return;
+    }
+    runtime->pluginExecutor = std::move(executor);
+    runtime->pluginThreadId.store(std::thread::id{}, std::memory_order_release);
+    if (runtime->pluginExecutor && !runtimeExecutorStopped(runtime->pluginExecutor)) {
+        replayPluginActions(runtime);
+    }
+}
+
+/// 待重放队列的选择 (两条队列的登记/摘除逻辑完全对称, 只差落哪个成员)
+enum class RuntimeQueue : uint8_t {
+    Io,
+    Plugin,
+};
+
+inline std::mutex& runtimeQueueMutex(PluginRuntime& runtime, RuntimeQueue queue) noexcept {
+    return queue == RuntimeQueue::Io ? runtime.pendingMutex : runtime.pendingPluginMutex;
+}
+
+inline std::deque<std::shared_ptr<RuntimeAction>>&
+    runtimeQueueOf(PluginRuntime& runtime, RuntimeQueue queue) noexcept {
+    return queue == RuntimeQueue::Io ? runtime.pendingActions : runtime.pendingPluginActions;
+}
+
 inline void runRuntimeAction(
     const std::weak_ptr<PluginRuntime>&   weakRuntime,
-    const std::shared_ptr<RuntimeAction>& action
+    const std::shared_ptr<RuntimeAction>& action,
+    RuntimeQueue                          queue = RuntimeQueue::Io
 ) noexcept {
     if (!action || action->claimed.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
     if (auto runtime = weakRuntime.lock()) {
-        std::lock_guard lock(runtime->pendingMutex);
-        std::erase(runtime->pendingActions, action);
+        std::lock_guard lock(runtimeQueueMutex(*runtime, queue));
+        std::erase(runtimeQueueOf(*runtime, queue), action);
+        if (queue == RuntimeQueue::Plugin) {
+            // 插件执行器的工作线程只在这里得知 (绑定发生在初始化阶段, 那时还不知道
+            // 哪条线程会跑)。`isPluginThread` / `scheduler.is_io_thread` 靠它回答。
+            runtime->pluginThreadId.store(std::this_thread::get_id(), std::memory_order_release);
+        }
     }
     try {
         if (action->fn) {
@@ -458,23 +581,25 @@ inline void runRuntimeAction(
     }
 }
 
-inline bool enqueueRuntimeAction(
+/// 投递到指定执行器, 并把动作登记在指定队列里 (停止期间保留 / 恢复后重放)
+inline bool enqueueRuntimeActionOn(
     const std::shared_ptr<PluginRuntime>& runtime,
+    asio::any_io_executor                 executor,
+    RuntimeQueue                          queue,
     std::function<void()>                 fn,
     bool                                  retainWhenStopped
 ) noexcept {
     if (!runtime || !fn) {
         return false;
     }
-    auto action   = std::make_shared<RuntimeAction>();
-    action->fn    = std::move(fn);
-    auto executor = runtime->executor;
+    auto action = std::make_shared<RuntimeAction>();
+    action->fn  = std::move(fn);
     if (!executor) {
         if (!retainWhenStopped) {
             return false;
         }
-        std::lock_guard lock(runtime->pendingMutex);
-        runtime->pendingActions.push_back(action);
+        std::lock_guard lock(runtimeQueueMutex(*runtime, queue));
+        runtimeQueueOf(*runtime, queue).push_back(action);
         return true;
     }
     if (!retainWhenStopped && runtimeExecutorStopped(executor)) {
@@ -484,37 +609,90 @@ inline bool enqueueRuntimeAction(
     // (自然空闲的 context 同样报告 stopped), 此时已投递的 handler 与这里的
     // 待执行记录通过 RuntimeAction::claimed 安全竞争, 只会执行一次。
     if (retainWhenStopped) {
-        std::lock_guard lock(runtime->pendingMutex);
-        runtime->pendingActions.push_back(action);
+        std::lock_guard lock(runtimeQueueMutex(*runtime, queue));
+        runtimeQueueOf(*runtime, queue).push_back(action);
     }
     try {
         const std::weak_ptr<PluginRuntime> weakRuntime = runtime;
-        asio::post(executor, [weakRuntime, action] {
-            runRuntimeAction(weakRuntime, action);
+        asio::post(executor, [weakRuntime, action, queue] {
+            runRuntimeAction(weakRuntime, action, queue);
         });
         return true;
     } catch (...) {
-        if (retainWhenStopped) {
-            std::lock_guard lock(runtime->pendingMutex);
-            if (std::find(runtime->pendingActions.begin(), runtime->pendingActions.end(), action)
-                == runtime->pendingActions.end()) {
-                runtime->pendingActions.push_back(std::move(action));
-            }
-            return true;
+        if (!retainWhenStopped) {
+            return false;
         }
-        return false;
+        std::lock_guard lock(runtimeQueueMutex(*runtime, queue));
+        auto&           pending = runtimeQueueOf(*runtime, queue);
+        if (std::find(pending.begin(), pending.end(), action) == pending.end()) {
+            pending.push_back(std::move(action));
+        }
+        return true;
     }
 }
 
-inline void replayRuntimeActions(const std::shared_ptr<PluginRuntime>& runtime) noexcept {
-    if (!runtime || !runtime->executor || runtimeExecutorStopped(runtime->executor)) {
+inline bool enqueueRuntimeAction(
+    const std::shared_ptr<PluginRuntime>& runtime,
+    std::function<void()>                 fn,
+    bool                                  retainWhenStopped
+) noexcept {
+    return enqueueRuntimeActionOn(
+        runtime,
+        runtime ? runtime->executor : asio::any_io_executor{},
+        RuntimeQueue::Io,
+        std::move(fn),
+        retainWhenStopped
+    );
+}
+
+/// 投递一段**插件代码**到插件执行器 (未配独立执行器时退回 io executor)
+///
+/// 与 [enqueueRuntimeAction] 的差别只有落到哪个执行器/队列: 两个方向共用同一套
+/// "停止期间保留 + 恢复后重放 + 只执行一次" 语义。
+inline bool enqueuePluginAction(
+    const std::shared_ptr<PluginRuntime>& runtime,
+    std::function<void()>                 fn,
+    bool                                  retainWhenStopped
+) noexcept {
+    return enqueueRuntimeActionOn(
+        runtime,
+        pluginExecutionExecutor(runtime),
+        RuntimeQueue::Plugin,
+        std::move(fn),
+        retainWhenStopped
+    );
+}
+
+/// 同上, 但显式指定执行器 (实例自带执行器的预留入口)
+inline bool enqueuePluginActionOn(
+    const std::shared_ptr<PluginRuntime>& runtime,
+    asio::any_io_executor                 executor,
+    std::function<void()>                 fn,
+    bool                                  retainWhenStopped
+) noexcept {
+    return enqueueRuntimeActionOn(
+        runtime,
+        std::move(executor),
+        RuntimeQueue::Plugin,
+        std::move(fn),
+        retainWhenStopped
+    );
+}
+
+inline void replayRuntimeActionsInternal(
+    const std::shared_ptr<PluginRuntime>& runtime,
+    asio::any_io_executor                 executor,
+    RuntimeQueue                          queue
+) noexcept {
+    if (!runtime || !executor || runtimeExecutorStopped(executor)) {
         return;
     }
     std::vector<std::shared_ptr<RuntimeAction>> pending;
     {
-        std::lock_guard lock(runtime->pendingMutex);
-        pending.reserve(runtime->pendingActions.size());
-        for (const auto& action : runtime->pendingActions) {
+        std::lock_guard lock(runtimeQueueMutex(*runtime, queue));
+        auto&           source = runtimeQueueOf(*runtime, queue);
+        pending.reserve(source.size());
+        for (const auto& action : source) {
             if (action && !action->claimed.load(std::memory_order_acquire)) {
                 pending.push_back(action);
             }
@@ -523,12 +701,24 @@ inline void replayRuntimeActions(const std::shared_ptr<PluginRuntime>& runtime) 
     for (const auto& action : pending) {
         try {
             const std::weak_ptr<PluginRuntime> weakRuntime = runtime;
-            asio::post(runtime->executor, [weakRuntime, action] {
-                runRuntimeAction(weakRuntime, action);
+            asio::post(executor, [weakRuntime, action, queue] {
+                runRuntimeAction(weakRuntime, action, queue);
             });
         } catch (...) { /* retain the action for the next executor binding */
         }
     }
+}
+
+inline void replayRuntimeActions(const std::shared_ptr<PluginRuntime>& runtime) noexcept {
+    replayRuntimeActionsInternal(
+        runtime,
+        runtime ? runtime->executor : asio::any_io_executor{},
+        RuntimeQueue::Io
+    );
+}
+
+inline void replayPluginActions(const std::shared_ptr<PluginRuntime>& runtime) noexcept {
+    replayRuntimeActionsInternal(runtime, pluginExecutionExecutor(runtime), RuntimeQueue::Plugin);
 }
 
 } // namespace pluginxx
