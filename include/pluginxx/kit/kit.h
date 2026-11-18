@@ -4329,29 +4329,36 @@ inline Task<std::vector<TableOpResult>> whenAll(std::vector<TableOpTicket> ticke
 template<typename Ctx, typename StartFn, typename DoneFn>
 inline void tableOpCallback(const Ctx& ctx, StartFn&& start, DoneFn&& done) {
     using Done = std::decay_t<DoneFn>;
-    auto* work = new Done(std::forward<DoneFn>(done));
+    /// 回调上下文: 第一个字段是 "不是同步桥" 的标记
+    /// - 主程序在完成时会对 `user_data` 按指针读 8 字节标记 (见 [isSyncBridgeCallback]),
+    ///   所以不能直接把很小的函子当 `user_data` 用 (空函子只占 1 字节 → 越界读)
+    struct Holder {
+        uint64_t magic = 0;
+        Done     done;
+    };
+    auto* work = new Holder{0, std::forward<DoneFn>(done)};
     PluginxxString err{nullptr, 0};
     auto handle = start(
         [](void* ud, int32_t status, const PluginxxStringView* payload) {
-            std::unique_ptr<Done> fn(static_cast<Done*>(ud));
+            std::unique_ptr<Holder> fn(static_cast<Holder*>(ud));
             detail::TableOpResult r;
             r.status = status;
             if (payload && payload->data && payload->size > 0) {
                 r.payload.assign(payload->data, static_cast<size_t>(payload->size));
             }
-            (*fn)(r);
+            (fn->done)(r);
         },
         work,
         &err
     );
     if (!handle) {
-        std::unique_ptr<Done> fn(work);
-        detail::TableOpResult r;
+        std::unique_ptr<Holder> fn(work);
+        detail::TableOpResult  r;
         r.startError = detail::takeHostError(ctx.host, err);
         if (r.startError.empty()) {
             r.startError = "plugin table call was not accepted";
         }
-        (*fn)(std::move(r));
+        (fn->done)(std::move(r));
     }
 }
 
