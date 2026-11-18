@@ -66,7 +66,7 @@ inline void setTableOpError(PluginxxString* error_out, std::string_view message)
 /// - `work`: 工作体, 返回结果正文; 抛 [TableOpError] / 任何标准异常 = 本次失败;
 /// - `callbackOwner`: 完成回所属的插件实例。表调用是无主操作 (没有实例租约), 但
 ///   完成回调是**插件代码**: 配了独立插件执行器时它要投回那条线程, 并持有该实例的
-///   执行 lease (否则回调可能在 `dlclose` 之后落地)。空 = 回调就地执行。
+///   执行 lease (否则回调可能在 `dlclose` 之后执行)。空 = 回调就地执行。
 ///
 /// 回调时机:
 /// - **调用方本来就在主程序 IO 线程**: 工作体当场执行, `cb` **在本次调用返回之前**

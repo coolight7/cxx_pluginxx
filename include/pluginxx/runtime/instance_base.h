@@ -505,7 +505,7 @@ inline bool dispatchToPlugin(
     context->lease = std::move(lease);
     context->stats = (runtime && options.measure) ? &runtime->callbackStats : nullptr;
 
-    // 宿主没配独立插件执行器 (嵌入宿主 / 直接 new 管理器): 插件代码本来就在调用
+    // 没配独立插件执行器 (嵌入方程序 / 直接 new 管理器): 插件代码本来就在调用
     // 线程上跑, 就地执行即可 —— 与改造前完全一致, 不多一跳。
     if (!runtime || !pluginxx::hasPluginExecutor(runtime)) {
         runPluginDispatch(*context);

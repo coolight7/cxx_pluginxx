@@ -248,10 +248,10 @@ public:
 
     /// 绑定插件执行器 (**初始化阶段一次**) —— 插件代码之后只在这条线程上执行
     ///
-    /// - 不调或传空: 插件代码与 io 同线程 (与改造前一致, 嵌入宿主不需要起线程);
-    /// - `PluginExecutorThread::executor()` 或宿主自有线程的 executor 都可以,
+    /// - 不调或传空: 插件代码与 io 同线程 (与改造前一致, 嵌入方程序不需要起线程);
+    /// - `PluginExecutorThread::executor()` 或主程序自有线程的 executor 都可以,
     ///   但必须在加载插件之前绑定;
-    /// - 插件管理器必须在插件线程**停下来之前**完成卸载 (宿主把线程声明在管理器之前
+    /// - 插件管理器必须在插件线程**停下来之前**完成卸载 (主程序把线程声明在管理器之前
     ///   即可保证逆序析构)。
     void setPluginExecutor(asio::any_io_executor ex) {
         pluginxx::bindPluginExecutor(runtime_, std::move(ex));

@@ -4367,7 +4367,7 @@ inline void tableOpCallback(const Ctx& ctx, StartFn&& start, DoneFn&& done) {
 ///   **内联执行**的, 因此正常情况这里已经拿到结果; 万一没有, 返回原因文本、按
 ///   "没有结果"处理, 不会死锁;
 /// - **插件执行线程上**: 不等待 —— 完成回调要投回这条线程, 而它正在这里阻塞,
-///   永远等不到 (宿主起了独立插件线程时, `start` / 回调里的注册事务都必须走异步形态:
+///   永远等不到 (主程序起了独立插件线程时, `start` / 回调里的注册事务都必须走异步形态:
 ///   `finishLater(notify)` + 回调里 `notify`)。
 template<typename StartFn>
 inline detail::TableOpResult tableOpSyncWait(

@@ -195,7 +195,7 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
     ///
     /// `callbackOwner`: 插件完成回调属于哪个实例。表调用 (`startTableOp`) 是插件发起的
     /// 但属于无主操作, 完成回调仍然是**插件代码**, 需要投回插件执行器并持有该实例的
-    /// 执行 lease (否则回调可能在 dlclose 后落地)。空 = 回调就地执行。
+    /// 执行 lease (否则回调可能在 dlclose 后执行)。空 = 回调就地执行。
     static std::shared_ptr<OpCore> createDetached(
         std::shared_ptr<PluginRuntime>             runtime,
         std::string                                label,
@@ -291,7 +291,7 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
 
     /// 受理一次操作 (**IO 侧协程**): 插件那一半投递到插件执行器, 状态机仍在本线程
     ///
-    /// 宿主没有配独立插件执行器 (插件代码与 io 同线程) 时退化为同步 [start]。
+    /// 主程序没有配独立插件执行器 (插件代码与 io 同线程) 时退化为同步 [start]。
     /// 一旦配了插件执行器, 就不能在 io 线程上直接调 `drive.start`: 插件可能在里面
     /// 读盘/等网络, 卡住的是整个主程序。
     asio::awaitable<bool> startAsync(OpDrive drive, std::string& error) {
@@ -302,7 +302,7 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
         prepareStart(std::move(drive));
         auto target = providerTarget();
         if (!target) {
-            // 没有插件目标 (纯宿主驱动, 例如应用实现的能力): 就地执行
+            // 没有插件目标 (纯主程序驱动, 例如应用实现的能力): 就地执行
             co_return finishStart(invokePluginStart(), error);
         }
         auto wait = std::make_shared<StartWait>(runtime_->executor);
@@ -786,7 +786,7 @@ private:
     OpDrive                                              drive_;
     void*                                                providerHandle_ = nullptr;
     OpGuardPtr                                           provider_, caller_;
-    /// 无主操作 (表调用) 的插件回调目标实例; 空 = 回调就地执行 (宿主自己发起的调用)
+    /// 无主操作 (表调用) 的插件回调目标实例; 空 = 回调就地执行 (主程序自己发起的调用)
     std::shared_ptr<PluginInstanceBase>                  callbackOwner_;
     std::shared_ptr<PluginxxOperatorHandle>              handle_;
     std::shared_ptr<PluginxxOperationCompletionEndpoint> completionEndpoint_;

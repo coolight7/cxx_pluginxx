@@ -1,11 +1,11 @@
 /// 插件执行线程 (一条 io_context + 一条工作线程)
 ///
-/// 定位: 宿主 (主程序) 想把"插件代码"与自己的 io 线程分开时, 需要有一条专跑插件
+/// 定位: 主程序想把"插件代码"与自己的 io 线程分开时, 需要有一条专跑插件
 /// 回调的工作线程。本类把这件事收敛到一处: 建立 io_context、持有 work guard、
 /// 起线程、停机时 join。
 ///
 /// 用法 (顺序很重要):
-/// 1. 宿主在创建插件管理器**之前**声明本对象并 `start("agentxx-plugin")`;
+/// 1. 主程序在创建插件管理器**之前**声明本对象并 `start("agentxx-plugin")`;
 /// 2. 把 `executor()` 交给管理器 (`PluginManagerBase::setPluginExecutor`);
 /// 3. 成员声明顺序: 本对象在管理器之前 —— 逆序析构时管理器先走, 线程后停。
 ///    管理器析构时已经 `shutdownAll()`/`shutdownAsync()`, 不会再投递新派发项。
@@ -75,7 +75,7 @@ public:
 
     ~PluginExecutorThread() {
         stop();
-        // io_context 只在对象销毁时才释放: 宿主可能仍在别处存着这个执行器的副本
+        // io_context 只在对象销毁时才释放: 主程序可能仍在别处存着这个执行器的副本
         // (管理器里的 `PluginRuntime::pluginExecutor`), 提前释放会让那份副本变成
         // 悬垂执行器 —— 停线程后再派发就会读到已释放的 io_context。
         context_.reset();
@@ -93,7 +93,7 @@ public:
             auto        context = std::make_shared<asio::io_context>();
             auto        work    = std::make_unique<WorkGuard>(asio::make_work_guard(*context));
             std::string tag{name};
-            // 线程持有 context 的强引用: 即使宿主在 run() 期间销毁本对象, io_context
+            // 线程持有 context 的强引用: 即使主程序在 run() 期间销毁本对象, io_context
             // 也活到 run() 返回, 不会出现"线程用已释放的 context"。
             std::thread thread([context, tag] {
                 setCurrentThreadName(tag);
@@ -136,7 +136,7 @@ public:
                 context_->stop();
             }
             if (thread_.get_id() == std::this_thread::get_id()) {
-                // 宿主对象从插件线程自身销毁 (最后一个引用在回调里释放): 不能 join 自己。
+                // 主程序对象从插件线程自身销毁 (最后一个引用在回调里释放): 不能 join 自己。
                 // 线程已停止, 会自行退出; io_context 由线程闭包里的强引用保活到 run() 返回。
                 thread_.detach();
             } else {

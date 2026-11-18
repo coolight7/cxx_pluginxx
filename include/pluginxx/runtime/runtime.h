@@ -17,7 +17,7 @@
 /// 两个执行器:
 /// - `executor` (io): 主程序状态机 (会话/注册表/图/定时器) 与全部受理动作;
 /// - `pluginExecutor` (插件线程): 插件代码 (回调/协程驱动/插件侧取消) 只在这条线程上
-///   执行; 为空表示宿主没有起插件线程, 此时插件代码与 io 同线程 (行为与改造前一致)。
+///   执行; 为空表示主程序没有起插件线程, 此时插件代码与 io 同线程 (行为与改造前一致)。
 #pragma once
 
 #include "utilxx_base/asio_error.h"
@@ -482,9 +482,9 @@ inline bool isRuntimeIoThread(const std::shared_ptr<PluginRuntime>& runtime) noe
     return tid != std::thread::id{} && tid == std::this_thread::get_id();
 }
 
-/// 宿主是否给这个运行时配了**独立的**插件执行器
+/// 主程序是否给这个运行时配了**独立的**插件执行器
 ///
-/// - false: 插件代码与 io 同线程 (与改造前一致, 直接 new 管理器嵌入的宿主就是这种);
+/// - false: 插件代码与 io 同线程 (与改造前一致, 直接 new 管理器嵌入的程序就是这种);
 /// - true: 插件代码只在 [PluginRuntime::pluginExecutor] 上执行。
 inline bool hasPluginExecutor(const std::shared_ptr<PluginRuntime>& runtime) noexcept {
     return runtime && static_cast<bool>(runtime->pluginExecutor);
