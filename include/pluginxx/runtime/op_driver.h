@@ -24,6 +24,7 @@
 #include "asio/use_awaitable.hpp"
 #include "fmt/format.h"
 #include "pluginxx/api/abi.h"
+#include "pluginxx/api/sync_bridge.h"
 #include "pluginxx/runtime/instance_base.h"
 #include "pluginxx/runtime/runtime.h"
 #include "utilxx/cancel.h"
@@ -690,7 +691,9 @@ private:
         bool callbackDispatched = false;
         if (callback) {
             auto target = callbackTarget();
-            if (target && runtime_ && hasPluginExecutor(runtime_)) {
+            // 同步桥 (kit 的 `tableOpSyncWait`): 调用方线程正阻塞等这次回调, 投回插件
+            // 执行器就是自己等自己。就地调用 (完成线程上) 只跑唤醒体, 不跑插件业务。
+            if (target && runtime_ && hasPluginExecutor(runtime_) && !isSyncBridgeCallback(ud)) {
                 auto callbackCopy = callback;
                 auto* udCopy      = ud;
                 auto  status      = completion_.status;

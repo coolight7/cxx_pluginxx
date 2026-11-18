@@ -28,6 +28,7 @@
 #include "fmt/ranges.h"
 #include "pluginxx/api/abi.h"
 #include "pluginxx/api/iface_meta.h"
+#include "pluginxx/api/sync_bridge.h"
 #include "pluginxx/api/tables.h"
 #include "utilxx_base/container_util.h"
 #include "utilxx_base/json.h"
@@ -3271,7 +3272,8 @@ detail::TableOpResult tableOpSyncWait(
     const PluginxxCancelIface*    cancel,
     const PluginxxSchedulerIface* scheduler,
     StartFn&&                     start,
-    int64_t                       timeoutMs
+    int64_t                       timeoutMs,
+    SyncWaitThreadPolicy          pluginThreadPolicy
 );
 
 /* ==================== 插件实例上下文基类 (通用部分) ==================== */
@@ -4366,16 +4368,20 @@ inline void tableOpCallback(const Ctx& ctx, StartFn&& start, DoneFn&& done) {
 /// - **io 线程上**: 不等待 (那会把主程序卡死)。主程序在调用方本来就在 io 线程时是
 ///   **内联执行**的, 因此正常情况这里已经拿到结果; 万一没有, 返回原因文本、按
 ///   "没有结果"处理, 不会死锁;
-/// - **插件执行线程上**: 不等待 —— 完成回调要投回这条线程, 而它正在这里阻塞,
-///   永远等不到 (主程序起了独立插件线程时, `start` / 回调里的注册事务都必须走异步形态:
-///   `finishLater(notify)` + 回调里 `notify`)。
+/// - **插件执行线程上**: 默认不等待 (agent 侧 `call_tool` / 能力调用可能把工作体派发到
+///   同一条线程, 两边互等); 传 `SyncWaitThreadPolicy::allowOnPluginThread` 时真等 ——
+///   前提是主程序保证工作体不会派回本插件的执行线程 (client 表就是这样)。
+///
+/// 完成回调怎么回来: 本函数把回调包成**同步桥** (`pluginxx/api/sync_bridge.h`)，
+/// 主程序就地调用它而不投回插件执行器 —— 否则阻塞中的线程永远等不到自己。
 template<typename StartFn>
 inline detail::TableOpResult tableOpSyncWait(
     const PluginxxHost*           host,
     const PluginxxCancelIface*    cancel,
     const PluginxxSchedulerIface* scheduler,
     StartFn&&                     start,
-    int64_t                       timeoutMs = 0
+    int64_t                       timeoutMs            = 0,
+    SyncWaitThreadPolicy          pluginThreadPolicy   = SyncWaitThreadPolicy::refuseOnPluginThread
 ) {
     detail::TableOpResult out;
 
@@ -4399,9 +4405,16 @@ inline detail::TableOpResult tableOpSyncWait(
         w.cv.notify_all();
     };
 
+    // 同步桥: 主程序看到标记就就地调用, 不投回插件执行器 (否则就是自己等自己)
+    auto* bridge = new SyncBridgeCallback();
+    bridge->fn   = waitOn;
+    bridge->ud   = new std::shared_ptr<Wait>(holder);
     PluginxxString err{nullptr, 0};
-    auto           handle = start(waitOn, new std::shared_ptr<Wait>(holder), &err);
+    auto           handle = start(&invokeSyncBridge, bridge, &err);
     if (!handle) {
+        // 未受理: 回调不会被调用, 包装块自己释放
+        delete static_cast<std::shared_ptr<Wait>*>(bridge->ud);
+        delete bridge;
         out.startError = detail::takeHostError(host, err);
         if (out.startError.empty()) {
             out.startError = "plugin table call was not accepted";
@@ -4417,7 +4430,8 @@ inline detail::TableOpResult tableOpSyncWait(
         return out;
     }
 
-    if (scheduler && scheduler->is_io_thread && scheduler->is_io_thread(host)) {
+    if (pluginThreadPolicy == SyncWaitThreadPolicy::refuseOnPluginThread && scheduler
+        && scheduler->is_io_thread && scheduler->is_io_thread(host)) {
         out.startError
             = "tableOpSyncWait would block on the plugin execution thread; use co_await tableOp";
         return out;
@@ -4449,14 +4463,19 @@ inline detail::TableOpResult tableOpSyncWait(
 
 /// [tableOpSyncWait] 的上下文形态 (从插件实例上下文取 host / cancel / scheduler)
 template<typename Ctx, typename StartFn>
-inline detail::TableOpResult
-    tableOpSyncWait(const Ctx& ctx, StartFn&& start, int64_t timeoutMs = 0) {
+inline detail::TableOpResult tableOpSyncWait(
+    const Ctx&           ctx,
+    StartFn&&            start,
+    int64_t              timeoutMs          = 0,
+    SyncWaitThreadPolicy pluginThreadPolicy = SyncWaitThreadPolicy::refuseOnPluginThread
+) {
     return tableOpSyncWait(
         ctx.host,
         ctx.iface.cancel,
         ctx.iface.scheduler,
         std::forward<StartFn>(start),
-        timeoutMs
+        timeoutMs,
+        pluginThreadPolicy
     );
 }
 
