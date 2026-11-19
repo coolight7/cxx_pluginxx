@@ -810,6 +810,32 @@ inline void revokeSubscription(PluginxxSubscription* sub) noexcept {
     }
 }
 
+/// 按频道 id 清掉实例订阅表里**已失效**的条目 (见 pluginxx/host/broadcast_registry.h)
+/// - 用于“不等簿记完成”的撤销路径: 那条路径不持有句柄, 因此只能按频道 id 清理;
+/// - 仍有效的条目 (同一频道重新订阅后的新句柄) 不动。
+inline void
+    forgetSubscription(PluginInstanceBase* inst, std::string_view broadcastId) noexcept {
+    if (!inst || broadcastId.empty()) {
+        return;
+    }
+    try {
+        auto& subs = inst->subscriptions;
+        subs.erase(
+            std::remove_if(
+                subs.begin(),
+                subs.end(),
+                [broadcastId](const std::shared_ptr<PluginxxSubscription>& entry) {
+                    return entry && entry->broadcastId == broadcastId
+                           && !entry->alive.load(std::memory_order_acquire);
+                }
+            ),
+            subs.end()
+        );
+    } catch (...) {
+        XX_LOGW("Plugin subscription bookkeeping failed: unknown exception");
+    }
+}
+
 } // namespace detail
 
 /// 解析插件传入的 host 视图对应的控制块。

@@ -337,15 +337,26 @@ namespace detail {
 /// 本头只能前置声明实例类型, 不能在这里访问其成员。
 void revokeSubscription(PluginxxSubscription* sub) noexcept;
 
+/// 按频道 id 清掉实例订阅表里**已失效**的条目 (**须在主程序 IO 线程执行**)
+///
+/// 用在“不等簿记完成”的撤销路径上: 那条路径不持有句柄, 因此按频道 id 清理;
+/// 仍有效的条目不动。定义同样在 `pluginxx/runtime/instance_base.h`。
+void forgetSubscription(PluginInstanceBase* inst, std::string_view broadcastId) noexcept;
+
 } // namespace detail
 
-/// 撤销广播订阅 (**幂等**, 任意线程可调用)
+/// 撤销广播订阅 (**幂等**, 任意线程可调用, **不等 IO 完成簿记**)
 ///
 /// 步骤:
-/// 1. 原子置 `alive=false`: 之后到达的发布立即不再回调插件, 不必等待簿记完成;
-/// 2. 在主程序 IO 线程撤销注册表订阅并移出实例的订阅表 (非 IO 线程时同步等待投递完成);
+/// 1. 原子置 `alive=false`: 之后到达的发布立即不再回调插件;
+/// 2. 把簿记需要的状态**按值**带走 (注册表 / 令牌 / 频道 id / 实例弱引用),
+///    投递到主程序 IO 线程后立即返回;
 /// 3. 运行时不可投递 (io executor 缺失/已停止) 时就地完成簿记 —— 此时实例正在
 ///    关闭, 不再有并发访问实例订阅表的执行体。
+///
+/// 为什么闭包不持有句柄: 句柄本体的保活归实例 (`subscriptionHandles`, 随实例析构释放),
+/// 而投递出去的簿记可能比实例活得久; 只带值就不存在“闭包访问已释放句柄”的窗口。
+/// 实例订阅表里那一条由簿记本身按频道 id 清掉 (只删已失效的项)。
 ///
 /// 句柄本体的保活由实例的 `subscriptionHandles` 负责 (随实例析构释放), 因此插件在
 /// 撤销之后再传同一裸指针进来也只会命中 [detail::revokeSubscription] 的空操作分支。
@@ -364,22 +375,36 @@ inline void unsubscribePluginBroadcast(PluginxxSubscription* sub) {
         return;
     }
 
-    auto       done   = std::make_shared<std::promise<void>>();
-    auto       fut    = done->get_future();
+    // 先搞掉令牌: 重复撤销与迟到执行都变成空操作 (不必再看句柄)
+    const uint64_t token          = sub->token;
+    auto           registry       = sub->registry;
+    auto           inst           = sub->inst;
+    std::string    broadcastId    = sub->broadcastId;
+    sub->token                    = 0;
+
     const bool queued = enqueueRuntimeAction(
         runtime,
-        [runtime, sub, done]() {
+        [runtime, registry, token, inst, broadcastId = std::move(broadcastId)]() {
             runtime->ioThreadId.store(std::this_thread::get_id(), std::memory_order_release);
-            detail::revokeSubscription(sub);
-            done->set_value();
+            if (registry && token != 0) {
+                try {
+                    registry->unsubscribe(broadcastId, token);
+                } catch (const std::exception& e) {
+                    XX_LOGW("Plugin broadcast unsubscribe failed: {}", e.what());
+                } catch (...) {
+                    XX_LOGW("Plugin broadcast unsubscribe failed: unknown exception");
+                }
+            }
+            if (auto owner = inst.lock()) {
+                detail::forgetSubscription(owner.get(), broadcastId);
+            }
         },
         false
     );
     if (!queued) {
-        detail::revokeSubscription(sub);
-        return;
+        // 投递不了: 运行时已不可用, 注册表随实例收尾一起拆, 只解掉实例引用
+        sub->inst.reset();
     }
-    fut.wait();
 }
 
 } // namespace pluginxx
