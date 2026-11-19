@@ -419,16 +419,16 @@ const Iface* queryInterface(const PluginxxHost* host, const char* iid) noexcept 
 /// 由主程序在自己的聚合体中补充: 主程序那侧的聚合体是本聚合的超集,
 /// 可直接作为 [PluginBaseT] 的模板实参。
 struct PluginIfaceCore {
-    const PluginxxLogIface*          log          = nullptr; ///< "<应用名>.log"
-    const PluginxxJsonIface*         json         = nullptr; ///< "<应用名>.json"
-    const PluginxxConfigIface*       config       = nullptr; ///< "<应用名>.config"
-    const PluginxxPluginsIface*      plugins      = nullptr; ///< "<应用名>.plugins"
-    const PluginxxBroadcastsIface*   broadcasts   = nullptr; ///< "<应用名>.broadcasts"
-    const PluginxxCapabilitiesIface* capabilities = nullptr; ///< "<应用名>.capabilities"
-    const PluginxxSchedulerIface*    scheduler    = nullptr; ///< "<应用名>.scheduler"
-    /// "<应用名>.cancel": 异步操作句柄的唯一取消入口
+    const PluginxxLogIface*          log          = nullptr; ///< "<应用名>_plugin_log"
+    const PluginxxJsonIface*         json         = nullptr; ///< "<应用名>_plugin_json"
+    const PluginxxConfigIface*       config       = nullptr; ///< "<应用名>_plugin_config"
+    const PluginxxPluginsIface*      plugins      = nullptr; ///< "<应用名>_plugin_plugins"
+    const PluginxxBroadcastsIface*   broadcasts   = nullptr; ///< "<应用名>_plugin_broadcasts"
+    const PluginxxCapabilitiesIface* capabilities = nullptr; ///< "<应用名>_plugin_capabilities"
+    const PluginxxSchedulerIface*    scheduler    = nullptr; ///< "<应用名>_plugin_scheduler"
+    /// "<应用名>_plugin_cancel": 异步操作句柄的唯一取消入口
     const PluginxxCancelIface* cancel = nullptr;
-    const PluginxxTasksIface*  tasks  = nullptr; ///< "<应用名>.tasks"
+    const PluginxxTasksIface*  tasks  = nullptr; ///< "<应用名>_plugin_tasks"
 
     /// 从主程序查询全部通用接口表 (host 为空时返回全 NULL 聚合)
     static PluginIfaceCore query(const PluginxxHost* host) {
@@ -4791,6 +4791,154 @@ inline void autoStopSpawns(Ctx* ctx) noexcept {
     }
 }
 
+/// 写插件元信息 (导出宏的 `get_info` 实现)
+///
+/// 框架给结构体并填好了 `api_version` / `struct_size`, 这里只写插件侧的字段:
+/// `name` / `version` / `description` 借用字面量 (框架当场复制), `min_api_version` 是
+/// 本 SDK 的头文件版本 (低版本主程序会直接拒绕)。
+inline int32_t fillPluginInfo(
+    PluginxxInfo* out,
+    const char*   name,
+    const char*   version,
+    const char*   description,
+    int32_t       minApiVersion
+) noexcept {
+    if (!out || out->struct_size < PLUGINXX_INFO_BASELINE_SIZE) {
+        return -1;
+    }
+    out->min_api_version = minApiVersion;
+    out->flags           = 0;
+    out->name            = PluginStringView::fromCstr(name);
+    out->version         = PluginStringView::fromCstr(version);
+    out->description     = PluginStringView::fromCstr(description);
+    return 0;
+}
+
+/// 生命周期失败收尾: 写错误串并直接 `done(FAILED, 原因)` (导出宏使用)
+inline void notifyLifecycleFailure(
+    const PluginxxHost*           host,
+    const PluginxxOperatorNotify* notify,
+    PluginxxString*               err,
+    std::string_view              message
+) noexcept {
+    try {
+        PluginString::set(host, err, message);
+    } catch (...) {
+    }
+    if (notify && notify->done) {
+        auto sv = PluginStringView::from(message.data(), message.size());
+        notify->done(notify->host_ud, PLUGINXX_OPERATOR_FAILED, &sv);
+    }
+}
+
+/// 生命周期入口公共守卫 (void 版): 异常 / 参数错误都转成 `done(FAILED, 原因)`
+///
+/// 与 [callLifecycleEntry] 同一道守卫, 只是不再用"返回值"表达结果 ——
+/// 新协议的入口一律 `void` + 完成通知。
+template<typename Fn>
+inline void callLifecycleEntryVoid(
+    const PluginxxHost*           host,
+    void*                         plugin_ctx,
+    const PluginxxOperatorNotify* notify,
+    PluginxxString*               err,
+    const char*                   label,
+    Fn&&                          fn
+) noexcept {
+    if (!notify || !notify->done) {
+        try {
+            PluginString::set(host, err, fmt::format("{}: null completion notify", label));
+        } catch (...) {
+        }
+        return;
+    }
+    if (!plugin_ctx) {
+        notifyLifecycleFailure(host, notify, err, fmt::format("{}: null plugin context", label));
+        return;
+    }
+    try {
+        fn();
+    } catch (const std::exception& e) {
+        notifyLifecycleFailure(host, notify, err, e.what());
+    } catch (...) {
+        notifyLifecycleFailure(host, notify, err, fmt::format("{}: unknown exception", label));
+    }
+}
+
+/// 实例创建入口的公共实现: 构造上下文 (**可重入**) + 注册事务
+///
+/// - `*plugin_ctx` 非空 = 同一实例的第二次 `create` (禁用后再启用): 不重建上下文,
+///   只跑注册事务;
+/// - 构造失败、注册抛异常都按失败收尾 (`done(FAILED, 原因)`), 调用方 (主程序) 负责回滚;
+/// - `createFn` 为空 = 只构造 (插件没有注册事务)。
+/// - `name` 只用于诊断 (构造失败时写进错误串) —— 不能在这里打日志:
+///   本头不依赖主程序的日志设施 (框架的通用 `log` 表要等实例构造完成才能用)。
+template<typename CtxType>
+inline void createInstanceEntry(
+    const PluginxxHost*           host,
+    void**                        plugin_ctx,
+    const PluginxxOperatorNotify* notify,
+    PluginxxString*               err,
+    const char*                   name,
+    void (*createFn)(CtxType&, const PluginxxOperatorNotify*, PluginxxString*)
+) noexcept {
+    if (!plugin_ctx) {
+        notifyLifecycleFailure(host, notify, err, "plugin create: null plugin context");
+        return;
+    }
+    auto* ctx = static_cast<CtxType*>(*plugin_ctx);
+    if (!ctx) {
+        try {
+            auto fresh = std::make_unique<CtxType>();
+            fresh->init(host);
+            ctx         = fresh.release();
+            *plugin_ctx = ctx;
+        } catch (const std::exception& e) {
+            notifyLifecycleFailure(
+                host,
+                notify,
+                err,
+                fmt::format("plugin create{}: {}", name ? name : "", e.what())
+            );
+            return;
+        } catch (...) {
+            notifyLifecycleFailure(host, notify, err, "plugin create: unknown exception");
+            return;
+        }
+    }
+    callLifecycleEntryVoid(host, ctx, notify, err, "plugin create", [&]() {
+        if (createFn) {
+            createFn(*ctx, notify, err);
+        } else {
+            notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, nullptr);
+        }
+    });
+}
+
+/// 实例销毁入口的公共实现: 释放本地对象并交回完成通知
+///
+/// `cleanup` 只做本地释放 (不调主程序接口、不起异步工作); 完成后主程序才 `dlclose`。
+template<typename CtxType, typename CleanupFn>
+inline void destroyInstanceEntry(
+    const PluginxxHost*           host,
+    CtxType*                      ctx,
+    const PluginxxOperatorNotify* notify,
+    PluginxxString*               err,
+    CleanupFn&&                   cleanup
+) noexcept {
+    try {
+        cleanup(ctx);
+    } catch (const std::exception& e) {
+        notifyLifecycleFailure(host, notify, err, e.what());
+        return;
+    } catch (...) {
+        notifyLifecycleFailure(host, notify, err, "plugin destroy: unknown exception");
+        return;
+    }
+    if (notify && notify->done) {
+        notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, nullptr);
+    }
+}
+
 } // namespace detail
 
 /// create 阶段异常上报 (上下文可能尚未构造成功, 直接经主程序日志接口输出)
@@ -4820,134 +4968,126 @@ inline void logCreateFailure(
 #define PLUGINXX_ENTRY_SYMBOL_JOIN_(Prefix, Suffix)  PLUGINXX_ENTRY_SYMBOL_JOIN__(Prefix, Suffix)
 #define PLUGINXX_ENTRY_SYMBOL(Prefix, Suffix)        PLUGINXX_ENTRY_SYMBOL_JOIN_(Prefix, Suffix)
 
-/// 插件入口导出 (生成 `<SymbolPrefix>get_info/create/start/stop/destroy` 五个符号)。
+/// 插件入口导出 (生成 `<SymbolPrefix>get_info/create/stop/destroy` 四个符号)。
 ///
-/// `SymbolPrefix` 是主程序命名空间前缀 (形如 `<主程序前缀>_plugin_<端>_` /
-/// `<主程序前缀>_plugin_client_`); 运行时主程序必须经 `entrySymbols()` 交出同一批符号名
-/// (见 `pluginxx/api/entry.h`), 两侧不一致时加载失败。
+/// `SymbolPrefix` 是主程序命名空间前缀 (形如 `<应用名>_<端>_plugin_`)。
+/// 完整形态是 `<应用名>_agent_plugin_` / `<应用名>_client_plugin_`; 运行时主程序必须经
+/// `entrySymbols()` 交出同一批符号名 (见 `pluginxx/api/entry.h`), 两侧不一致时加载失败。
 ///
-/// 主程序按以下顺序调用, 插件必须遵守 (见 docs/zh-cn/design/plugins.md):
-/// - `create`: 只构造上下文 (`new CtxType` + `init(host)`), 不注册任何工具/通知/能力/
-///   订阅, 不启动线程;
-/// - `start`: **注册事务**, 在主程序 IO 线程执行; 同步完成时 `notify->done(OK)` 后返回 NULL,
-///   失败时返回 NULL 并写出 `error_out` (主程序回滚本次注册并撤销实例);
-/// - `stop`: 撤销自管资源 (线程/定时器/订阅), 可重复调用; 完成后主程序才调用 destroy;
-/// - `destroy`: 只释放本地对象, 不调用主程序接口、不创建异步工作。
+/// 生命周期只有一个协议: **调用 → 恰好一次 `notify->done`**。
+/// - `get_info`: 框架给结构体 (`PluginxxInfo`), 插件只填名字/版本/描述与最低版本;
+/// - `create`: 构造上下文 + 做注册事务。上下文走 `void**` 出参且必须同步写出;
+///   可重入 (同一实例第二次 create 时 `*plugin_ctx` 已经是上一次的上下文,
+///   于是只重新注册, 不重建对象);
+/// - `stop`: 撤销注册与自管资源 (线程/定时器/订阅), 可重复调用, 上下文保留;
+/// - `destroy`: 释放本地对象 (可慢); 完成后主程序才在自己的工作线程上 `dlclose`。
 ///
-/// `StartFn` / `StopFn` 形如
-/// `void*(CtxType&, const PluginxxOperatorNotify*, PluginxxString* error_out)`。
-#define PLUGINXX_EXPORT_PLUGIN(SymbolPrefix, CtxType, Name, Ver, Desc, StartFn, StopFn)            \
-    extern "C" PLUGINXX_EXPORT const PluginxxInfo* PLUGINXX_CALL                                   \
-        PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, get_info)(void) {                                      \
-        static const PluginxxInfo info{                                                            \
-            PLUGINXX_API_VERSION,                                                                  \
-            0,                                                                                     \
-            pluginxx::PluginStringView::fromCstr(Name),                                            \
-            pluginxx::PluginStringView::fromCstr(Ver),                                             \
-            pluginxx::PluginStringView::fromCstr(Desc),                                            \
-        };                                                                                         \
-        return &info;                                                                              \
-    }                                                                                              \
-    extern "C" PLUGINXX_EXPORT int32_t PLUGINXX_CALL                                               \
-        PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, create)(const PluginxxHost* host, void** plugin_ctx) { \
-        if (!host || !plugin_ctx) {                                                                \
-            return -1;                                                                             \
-        }                                                                                          \
-        try {                                                                                      \
-            auto ctx = std::make_unique<CtxType>();                                                \
-            ctx->init(host);                                                                       \
-            *plugin_ctx = ctx.release();                                                           \
-            return 0;                                                                              \
-        } catch (const std::exception& e) {                                                        \
-            pluginxx::logCreateFailure(host, Name, e.what());                                      \
-        } catch (...) {                                                                            \
-            pluginxx::logCreateFailure(host, Name, "unknown exception");                           \
-        }                                                                                          \
-        return -1;                                                                                 \
-    }                                                                                              \
-    extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, start)(     \
-        void*                         plugin_ctx,                                                  \
-        const PluginxxOperatorNotify* notify,                                                      \
-        PluginxxString*               err                                                          \
+/// 插件只需给出两个业务函数:
+/// - `CreateFn`: 注册事务, 形如 `void(CtxType&, const PluginxxOperatorNotify*, PluginxxString*)`,
+///   参数与旧的 `start` 完全一样 (同步完成时先 `notify->done(OK)` 再返回);
+/// - `StopFn`: 撤销事务, 同一形态。
+///
+/// 上下文构造被包在 `create` 里 (`new CtxType` + `init(host)`), 因此插件不能再把
+/// "创建对象"和"注册"分开写 —— 也不再需要"create 不许读表/不许起线程"这类无法执行的约定。
+#define PLUGINXX_EXPORT_PLUGIN(SymbolPrefix, CtxType, Name, Ver, Desc, CreateFn, StopFn)         \
+    extern "C" PLUGINXX_EXPORT int32_t PLUGINXX_CALL                                             \
+        PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, get_info)(PluginxxInfo* out) {                        \
+        return pluginxx::detail::fillPluginInfo(out, Name, Ver, Desc, PLUGINXX_MIN_API_VERSION);  \
+    }                                                                                             \
+    extern "C" PLUGINXX_EXPORT void PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, create)(    \
+        const PluginxxHost*           host,                                                       \
+        void**                        plugin_ctx,                                                 \
+        const PluginxxOperatorNotify* notify,                                                     \
+        PluginxxString*               err                                                         \
+    ) {                                                                                           \
+        auto createFn = static_cast<                                                              \
+            void (*)(CtxType&, const PluginxxOperatorNotify*, PluginxxString*)>(CreateFn);         \
+        pluginxx::detail::createInstanceEntry<CtxType>(                                           \
+            host,                                                                                 \
+            plugin_ctx,                                                                           \
+            notify,                                                                               \
+            err,                                                                                  \
+            Name,                                                                                 \
+            createFn                                                                              \
+        );                                                                                        \
+    }                                                                                             \
+    extern "C" PLUGINXX_EXPORT void PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, stop)(      \
+        void*                         plugin_ctx,                                                 \
+        const PluginxxOperatorNotify* notify,                                                     \
+        PluginxxString*               err                                                         \
     ) {                                                                                            \
-        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                             \
-        return pluginxx::detail::callLifecycleEntry(                                               \
-            ctx ? ctx->host : nullptr,                                                             \
-            plugin_ctx,                                                                            \
-            notify,                                                                                \
-            err,                                                                                   \
-            "plugin start",                                                                        \
-            [&]() -> void* {                                                                       \
-                return (StartFn)(*ctx, notify, err);                                               \
-            }                                                                                      \
-        );                                                                                         \
-    }                                                                                              \
-    extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, stop)(      \
-        void*                         plugin_ctx,                                                  \
-        const PluginxxOperatorNotify* notify,                                                      \
-        PluginxxString*               err                                                          \
+        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                            \
+        auto  stopFn = static_cast<                                                                 \
+            void (*)(CtxType&, const PluginxxOperatorNotify*, PluginxxString*)>(StopFn);           \
+        pluginxx::detail::callLifecycleEntryVoid(                                                 \
+            ctx ? ctx->host : nullptr,                                                            \
+            plugin_ctx,                                                                           \
+            notify,                                                                               \
+            err,                                                                                  \
+            "plugin stop",                                                                        \
+            [&]() {                                                                               \
+                pluginxx::detail::autoStopSpawns(ctx);                                            \
+                if (stopFn) {                                                                     \
+                    stopFn(*ctx, notify, err);                                                    \
+                } else {                                                                          \
+                    /* 没有自定义 stop 事务, 仍要给出完成信号 */                                 \
+                    if (notify && notify->done) {                                                 \
+                        notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, nullptr);             \
+                    }                                                                             \
+                }                                                                                 \
+            }                                                                                     \
+        );                                                                                        \
+    }                                                                                             \
+    extern "C" PLUGINXX_EXPORT void PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, destroy)(   \
+        void*                         plugin_ctx,                                                 \
+        const PluginxxOperatorNotify* notify,                                                     \
+        PluginxxString*               err                                                         \
     ) {                                                                                            \
-        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                             \
-        return pluginxx::detail::callLifecycleEntry(                                               \
-            ctx ? ctx->host : nullptr,                                                             \
-            plugin_ctx,                                                                            \
-            notify,                                                                                \
-            err,                                                                                   \
-            "plugin stop",                                                                         \
-            [&]() -> void* {                                                                       \
-                pluginxx::detail::autoStopSpawns(ctx);                                             \
-                return (StopFn)(*ctx, notify, err);                                                \
-            }                                                                                      \
-        );                                                                                         \
-    }                                                                                              \
-    extern "C" PLUGINXX_EXPORT void PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, destroy)(    \
-        void* plugin_ctx                                                                           \
-    ) {                                                                                            \
-        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                             \
-        if (ctx) {                                                                                 \
-            delete ctx;                                                                            \
-        }                                                                                          \
+        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                            \
+        pluginxx::detail::destroyInstanceEntry<CtxType>(                                          \
+            ctx ? ctx->host : nullptr,                                                            \
+            ctx,                                                                                  \
+            notify,                                                                               \
+            err,                                                                                  \
+            [](CtxType* c) {                                                                      \
+                if (!c) {                                                                         \
+                    return;                                                                       \
+                }                                                                                 \
+                pluginxx::detail::autoStopSpawns(c);                                              \
+                delete c;                                                                         \
+            }                                                                                     \
+        );                                                                                        \
     }
 
-/// 只导出 start/stop 两个入口 (供手写 create/destroy 的插件使用)。
+/// 只导出 `stop` 入口 (供手写 create/destroy 的插件使用)。
 ///
 /// 少数插件需要自己控制实例构造或销毁 (如按平台条件创建运行时对象、加自定义日志),
 /// 它们手写 `<SymbolPrefix>create` / `<SymbolPrefix>destroy`, 但仍用本宏生成带异常保护的
-/// start/stop trampoline —— 与 [PLUGINXX_EXPORT_PLUGIN] 的生命周期部分同语义。
-#define PLUGINXX_EXPORT_PLUGIN_LIFECYCLE(SymbolPrefix, CtxType, StartFn, StopFn)               \
-    extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, start)( \
-        void*                         plugin_ctx,                                              \
-        const PluginxxOperatorNotify* notify,                                                  \
-        PluginxxString*               err                                                      \
-    ) {                                                                                        \
-        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                         \
-        return pluginxx::detail::callLifecycleEntry(                                           \
-            ctx ? ctx->host : nullptr,                                                         \
-            plugin_ctx,                                                                        \
-            notify,                                                                            \
-            err,                                                                               \
-            "plugin start",                                                                    \
-            [&]() -> void* {                                                                   \
-                return (StartFn)(*ctx, notify, err);                                           \
-            }                                                                                  \
-        );                                                                                     \
-    }                                                                                          \
-    extern "C" PLUGINXX_EXPORT void* PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, stop)(  \
-        void*                         plugin_ctx,                                              \
-        const PluginxxOperatorNotify* notify,                                                  \
-        PluginxxString*               err                                                      \
-    ) {                                                                                        \
-        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                         \
-        return pluginxx::detail::callLifecycleEntry(                                           \
-            ctx ? ctx->host : nullptr,                                                         \
-            plugin_ctx,                                                                        \
-            notify,                                                                            \
-            err,                                                                               \
-            "plugin stop",                                                                     \
-            [&]() -> void* {                                                                   \
-                pluginxx::detail::autoStopSpawns(ctx);                                         \
-                return (StopFn)(*ctx, notify, err);                                            \
-            }                                                                                  \
-        );                                                                                     \
+/// stop trampoline —— 与 [PLUGINXX_EXPORT_PLUGIN] 的 stop 部分同语义。
+#define PLUGINXX_EXPORT_PLUGIN_LIFECYCLE(SymbolPrefix, CtxType, StopFn)                          \
+    extern "C" PLUGINXX_EXPORT void PLUGINXX_CALL PLUGINXX_ENTRY_SYMBOL(SymbolPrefix, stop)(     \
+        void*                         plugin_ctx,                                                \
+        const PluginxxOperatorNotify* notify,                                                    \
+        PluginxxString*               err                                                        \
+    ) {                                                                                          \
+        auto* ctx = static_cast<CtxType*>(plugin_ctx);                                           \
+        auto  stopFn = static_cast<                                                                \
+            void (*)(CtxType&, const PluginxxOperatorNotify*, PluginxxString*)>(StopFn);          \
+        pluginxx::detail::callLifecycleEntryVoid(                                                \
+            ctx ? ctx->host : nullptr,                                                           \
+            plugin_ctx,                                                                          \
+            notify,                                                                              \
+            err,                                                                                 \
+            "plugin stop",                                                                       \
+            [&]() {                                                                              \
+                pluginxx::detail::autoStopSpawns(ctx);                                           \
+                if (stopFn) {                                                                    \
+                    stopFn(*ctx, notify, err);                                                   \
+                } else if (notify && notify->done) {                                             \
+                    /* 没有自定义 stop 事务, 仍要给出完成信号 */                                 \
+                    notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, nullptr);                \
+                }                                                                                \
+            }                                                                                    \
+        );                                                                                       \
     }
 } // namespace pluginxx

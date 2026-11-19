@@ -6,7 +6,7 @@
 /// - 跨边界字符串类型 (`PluginxxStringView` / `PluginxxString`)
 /// - 统一异步操作原语 (完成通知器 / 回调 / 取消令牌 / 句柄)
 /// - 核心主程序函数表 (`PluginxxHostVtable` / `PluginxxHost`)
-/// - 入口函数指针类型、内置合并编译的描述结构
+/// - 入口函数指针类型 (元信息填表 + 生命周期"调用 → 恰好一次完成通知")
 ///   (入口**符号名**由主程序提供, 见 `pluginxx/api/entry.h`)
 ///
 /// 契约稳定性: 本头中的 **C 符号名 / 结构体名 / 宏名 / 表名一律冻结**,
@@ -66,9 +66,10 @@ extern "C" {
 
 /// 框架支持的最低插件 API 版本 (默认 1; 覆盖方式同 [PLUGINXX_API_VERSION])
 ///
-/// 检查规则只有这一条: 插件 `PluginxxInfo.api_version >= PLUGINXX_MIN_API_VERSION`。
-/// 插件声明更高版本不再被拒绝 (更高版本意味着它可能用了当前框架没有的能力, 由插件
-/// 自己在 `get_info` 里读 `PLUGINXX_API_VERSION` 决定要不要降级)。
+/// 版本协商只看插件自己填的 `PluginxxInfo.min_api_version`:
+/// 加载时校验 `min_api_version <= PLUGINXX_API_VERSION` (填 0 = 不检查),
+/// 不再拿全局常量与插件声明直接比 —— 每个插件要求的版本可能不同。
+/// 本宏保留给构建配置与诊断输出使用。
 #ifndef PLUGINXX_MIN_API_VERSION
 #define PLUGINXX_MIN_API_VERSION 1
 #endif
@@ -127,13 +128,22 @@ static inline int32_t pluginxx_scope_ref_ok(const PluginxxScopeRef* ref) {
 
 /// ==================== 插件元信息 ====================
 
+/// - 框架在调用 `get_info` 前先填好 `api_version` 与 `struct_size`, 插件只写其余字段;
+/// - 版本协商用插件自己填的 `min_api_version`: 高于框架支持的版本就直接拒绝加载,
+///   因此老主程序不会把新插件加载起来再用错布局;
+/// - 结构体带 `struct_size`: 以后追加字段时老插件只写基线以内的部分, 框架按长度读。
 typedef struct PluginxxInfo {
-    int32_t                 api_version; ///< 必须 >= PLUGINXX_MIN_API_VERSION
-    uint32_t                _reserved;   ///< 8 字节补齐
+    int32_t                 api_version;     ///< 框架写入: 当前主程序的插件 API 版本
+    int32_t                 min_api_version; ///< 插件写入: 需要的最低 API 版本 (0 = 不检查)
+    uint32_t                struct_size;     ///< 框架写入: sizeof(PluginxxInfo)
+    uint32_t                flags;           ///< 插件写入: 预留, 填 0
     PluginxxStringView name;        ///< 唯一标识 (只读借用)
-    PluginxxStringView version;
-    PluginxxStringView description;
+    PluginxxStringView version;     ///< 插件版本 (只读借用, 可空)
+    PluginxxStringView description; ///< 一句话说明 (只读借用, 可空)
 } PluginxxInfo;
+
+/// 基线: 重置时 = 完整布局; 以后追加字段保持不变 (改为 offsetof(第一个追加字段))
+#define PLUGINXX_INFO_BASELINE_SIZE sizeof(PluginxxInfo)
 
 /// ==================== 统一异步操作原语 ====================
 
@@ -231,27 +241,57 @@ struct PluginxxHost {
 
 /* ==================== 插件入口符号 (dlsym) ==================== */
 
-typedef const PluginxxInfo*(PLUGINXX_CALL* PluginxxGetInfoFn)(void);
-typedef int32_t(PLUGINXX_CALL* PluginxxCreateFn)(
-    const PluginxxHost* host,
-    void**                   plugin_ctx
-);
-typedef void(PLUGINXX_CALL* PluginxxDestroyFn)(void* plugin_ctx);
+/// 元信息入口: 框架填好 `api_version` / `struct_size`, 插件填其余字段并返回 0
+/// - 返回非 0 或 `name` 为空 = 元信息不可用, 加载失败;
+/// - 这是唯一个**同步**入口: 只写几个常量字段, 不读盘、不建对象。
+typedef int32_t(PLUGINXX_CALL* PluginxxGetInfoFn)(PluginxxInfo* out);
 
-/// 实例生命周期入口 (必备, 见 plugin_kit.h 的导出宏):
-/// - create 只构造上下文, 不做注册、不起线程;
-/// - start 是注册事务, 在插件所属 IO executor 上执行;
-/// - stop 撤销自管资源, 主程序在 Closing 阶段调用, 完成后才调用 destroy。
-typedef void*(PLUGINXX_CALL* PluginxxStartFn)(
-    void*                              plugin_ctx,
+/// 实例创建入口 (构造 + 注册合为一体; 在插件执行线程上调用)
+///
+/// 协议 (与其它生命周期入口一致): **调用 → 恰好一次 `notify->done`**。
+/// - `*plugin_ctx`: 入参为已有的插件上下文 (首次创建时为 NULL), **出参必须同步写出**;
+///   插件在这里 `new Ctx` + `init(host)`, 把指针存进 `*plugin_ctx`;
+/// - 然后可以直接 `notify->done(OK)` 表示同步完成, 也可以先返回、稍后
+///   (协程/工作线程) 再 done —— 主程序会等到完成包才继续加载;
+/// - 失败: `notify->done(FAILED, 原因)` (或 `error_out`), 主程序撤销已生效的注册、
+///   调一次 `destroy` 然后关库。
+///
+/// **可重入**: 同一个实例第二次调用 `create` (禁用后再启用) 时 `*plugin_ctx` 已是
+/// 上次的上下文 (非 NULL), 插件据此只做注册、不要重建上下文:
+/// ```c
+/// if (*plugin_ctx == NULL) { ctx = new Ctx(); ctx->init(host); *plugin_ctx = ctx; }
+/// else { ctx = static_cast<Ctx*>(*plugin_ctx); }
+/// // 然后做注册事务
+/// ```
+typedef void(PLUGINXX_CALL* PluginxxCreateFn)(
+    const PluginxxHost*           host,
+    void**                        plugin_ctx,
     const PluginxxOperatorNotify* notify,
     PluginxxString*               error_out
 );
-typedef void*(PLUGINXX_CALL* PluginxxStopFn)(
-    void*                              plugin_ctx,
+
+/// 停用入口: 撤销注册与自管资源 (线程/定时器/订阅), **保留插件上下文**
+/// - 可重复调用 (已停用时直接 done(OK));
+/// - 停止后可再次 `create` 重新注册 (上下文不重建)。
+typedef void(PLUGINXX_CALL* PluginxxStopFn)(
+    void*                         plugin_ctx,
     const PluginxxOperatorNotify* notify,
     PluginxxString*               error_out
 );
+
+/// 销毁入口: 释放本地对象 (**在插件执行线程上调用, 可以慢**)
+/// - 完成后主程序才在工作线程 `dlclose`, 所以入口里**不要**自己关库;
+/// - 完成后 `plugin_ctx` 即失效, 主程序不再使用它。
+typedef void(PLUGINXX_CALL* PluginxxDestroyFn)(
+    void*                         plugin_ctx,
+    const PluginxxOperatorNotify* notify,
+    PluginxxString*               error_out
+);
+
+/// 全部生命周期入口的公共约定:
+/// - `create` / `stop` / `destroy` 一律 `void` + 完成通知, 不用"返回值表示成败";
+/// - 只有每作用域的 `mount` 返回 user data (否则 `unmount` 拿不到它);
+/// - 异常必须由插件自己捕获 (跨越 C ABI 抛异常是未定义行为), SDK 的导出宏兜住了这一层。
 
 /* ==================== 插件入口符号名 (由主程序定义, 见 pluginxx/api/entry.h) ==================== */
 
@@ -264,10 +304,9 @@ typedef void*(PLUGINXX_CALL* PluginxxStopFn)(
 typedef struct PluginxxBuiltinInfo {
     PluginxxStringView name; ///< 插件唯一名 (如 "example_plugin"); NULL = 空表占位
     PluginxxGetInfoFn get_info; ///< 可空 (加载前元信息校验, 与 dlsym 可选符号同语义)
-    PluginxxCreateFn create; ///< 必需 (实例创建, 与 get_info 同一导出宏生成)
-    PluginxxDestroyFn destroy; ///< 可空 (实例销毁)
-    PluginxxStartFn start; ///< 可空 (create 后的注册/启动事务)
+    PluginxxCreateFn create; ///< 必需 (实例创建 = 构造 + 注册, 与 get_info 同一导出宏生成)
     PluginxxStopFn  stop;  ///< 可空 (关闭事务, destroy 前调用)
+    PluginxxDestroyFn destroy; ///< 可空 (实例销毁)
     /// 主程序的"每作用域挂载"入口 (可空; 类型由主程序解释, 框架只原样转发)
     void* mount;
     void* unmount;

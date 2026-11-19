@@ -93,41 +93,32 @@ struct PluginInstanceBase {
     bool pluginDestroyed = false;
     /// 同步关闭发现活动 lease 时，等待最后一个 lease 释放后再执行 destroy。
     bool destroyDeferred = false;
-    /// 实例生命周期入口 (加载成功的插件必有这两个符号, 见 plugin_api.h):
-    /// - start: 注册事务 (工具/通知/能力/订阅/自管线程), 在主程序 IO 线程执行;
-    /// - stop: 撤销自管资源, destroy 之前必须先完成。
-    PluginxxStartFn lifecycleStart = nullptr;
-    PluginxxStopFn  lifecycleStop  = nullptr;
-    /// start 事务是否已成功完成 (加载成功即置位)。
+    /// 实例的创建 / 停用 / 销毁入口 (加载成功的插件必有这三个符号, 见 plugin_api.h):
+    /// - create: 构造 (首次) + 注册事务; 可重入 (第二次只做注册);
+    /// - stop: 撤销注册与自管资源, 上下文保留 (可以再次 create 重新注册);
+    /// - destroy: 释放本地对象, 完成后主程序才 dlclose。
+    ///
+    /// 三个入口都是"调用 → 恰好一次完成通知"的协议, 由
+    /// [pluginxx::awaitPluginLifecycleVoid] 驱动。
+    PluginxxCreateFn  lifecycleCreate  = nullptr;
+    PluginxxStopFn    lifecycleStop    = nullptr;
+    PluginxxDestroyFn lifecycleDestroy = nullptr;
+    /// 注册事务 (create) 是否已成功完成 (加载成功即置位)。
     bool lifecycleStarted = false;
     /// stop 事务是否已执行完成 (destroy 的前提)。
     bool lifecycleStopped = false;
-
-    /// 本端 destroy 入口符号名 (符号名由主程序定义, 形如
-    /// `<主程序前缀>_plugin_agent_destroy` / `<主程序前缀>_plugin_client_destroy`);
-    /// 由派生实例类实现。
-    /// 两端的入口符号名不同, 因此 [destroyPlugin] 需要它来查找动态库符号。
-    virtual const char* pluginDestroySymbol() const noexcept = 0;
 
     /// 日志前缀 (借用它的主程序实例类可覆写以区分日志来源; 默认无前缀)
     virtual std::string_view logTag() const noexcept {
         return {};
     }
 
-    /// 在所有活动 lease 归零后销毁插件上下文；析构时也作为最后一道安全收尾。
-    /// 返回 false 表示仍有活动 lease，调用方不得关闭动态库。
+    /// 销毁结束后的收尾: 上下文作废 + 退休框架控制块
     ///
-    /// 语义 (各端一致):
-    /// - 已有活动 lease: 置 destroyDeferred 并拒绝销毁 (调用方保留 DSO);
-    /// - create 未成功 (pluginCreated=false): 只退休框架控制块 (或已销毁则直接返回);
-    /// - 否则查找 destroy 入口 (内置插件用 [builtinUnload], 动态库插件按
-    ///   [pluginDestroySymbol] 查符号) 并调用, 随后退休框架控制块 —— 插件上下文
-    ///   销毁后, 插件持有的旧 host 指针只能安全失败。
-    /// - 幂等: 已销毁时直接返回 true。
-    ///
-    /// 返回 true 之后调用方应调用 [closeLibraryHandle] 释放动态库: 插件代码不会再
-    /// 执行了 (stop 已补齐、lease 已归零), 再留着句柄只会占住插件文件。
-    bool destroyPlugin() noexcept;
+    /// 调用时机: 插件的 destroy 入口已经完成后 (活动 lease 已归零, 插件代码
+    /// 不会再执行), 或插件从未建出上下文。调用后插件持有的旧 host 指针只能
+    /// 安全失败, 旧 ctx 指针不得再使用。
+    void finishDestroy() noexcept;
 
     /// 关闭动态库句柄, 释放主程序对插件文件的占用。
     ///
@@ -655,54 +646,121 @@ inline void PluginInstanceBase::retireHostControl() noexcept {
     }
 }
 
-inline bool PluginInstanceBase::destroyPlugin() noexcept {
-    if (pluginDestroyed) {
-        return true;
-    }
-    if (lifetime && lifetime->leaseCount() != 0) {
-        destroyDeferred = true;
-        XX_LOGE(
-            "{}`{}` destroy deferred while {} lease(s) are still active",
-            logTag(),
-            name,
-            lifetime->leaseCount()
-        );
+/// C ABI 堆内存释放 (定义在本文件后半部分, 这里先声明: destroy 收尾要用到)
+inline void hostMemoryFree(void* ptr);
+
+namespace detail {
+
+/// 投一次"destroy 完成后再关库"的收尾 (**不等结果**)
+///
+/// 用在无法 `co_await` 的同步路径 (owner 即将析构、进程退出前清场):
+/// - 整段 (调 destroy → 退休上下文 → `dlclose`) 在插件/调用线程上跑, io 线程不等它;
+/// - 派发项持有实例强引用, 因此实例 / 上下文 / DSO 都会等到 destroy 完成才释放;
+/// - destroy 可能异步完成(插件在工作线程里 done), 所以完成端点用引用计数保活;
+/// - `onFinished` 在完成时调一次(任意线程), 供调用方补状态。
+///
+/// - `return` false = 没能派发 (实例/运行时已失效), 调用方自行保留实例。
+inline bool destroyInstanceNoWait(
+    const std::shared_ptr<PluginInstanceBase>& inst,
+    std::function<void()>                      onFinished = {}
+) {
+    if (!inst) {
         return false;
     }
-    if (!pluginCreated) {
-        pluginDestroyed = true;
-        destroyDeferred = false;
-        retireHostControl();
+    if (inst->pluginDestroyed) {
+        inst->closeLibraryHandle();
+        if (onFinished) {
+            onFinished();
+        }
         return true;
     }
+    // 没有 destroy 入口 (从未建出上下文 / 主程序构造的伪实例): 只是本地收尾,
+    // 不需要运行时与执行线程 —— 先判这一条, 否则缺运行时的实例会变成永远关不掉
+    if (!inst->pluginCreated || !inst->lifecycleDestroy) {
+        inst->finishDestroy();
+        inst->closeLibraryHandle();
+        if (onFinished) {
+            onFinished();
+        }
+        return true;
+    }
+    auto runtime = inst->runtime.lock();
+    if (!runtime || !inst->lifetime) {
+        return false;
+    }
 
-    PluginxxDestroyFn destroy = builtinUnload;
-    if (dlHandle) {
-        std::string err;
-        destroy = reinterpret_cast<PluginxxDestroyFn>(
-            NativeLoader::sym(dlHandle, pluginDestroySymbol(), err)
-        );
-        if (!destroy && !err.empty()) {
-            XX_LOGW("{}`{}` has no destroy entry: {}", logTag(), name, err);
+    /// 完成端点: 插件可能稍后才 `done`, 因此这里只能有一份状态堆内存
+    struct DestroyOnce {
+        std::shared_ptr<PluginInstanceBase> inst;
+        std::function<void()>               onFinished;
+        std::atomic<bool>                   finished{false};
+
+        static void PLUGINXX_CALL
+            onDone(void* ud, int32_t status, const PluginxxStringView* payload) noexcept {
+            auto* self = static_cast<DestroyOnce*>(ud);
+            if (!self) {
+                return;
+            }
+            if (!self->finished.exchange(true, std::memory_order_acq_rel)) {
+                if (status != PLUGINXX_OPERATOR_OK && payload && payload->data) {
+                    XX_LOGW(
+                        "Plugin `{}` destroy finished with failure: {}",
+                        self->inst->name,
+                        std::string(payload->data, static_cast<size_t>(payload->size))
+                    );
+                }
+                self->inst->finishDestroy();
+                self->inst->closeLibraryHandle();
+                if (self->onFinished) {
+                    self->onFinished();
+                }
+            }
+            delete self;
         }
+    };
+
+    auto* once = new DestroyOnce{inst, std::move(onFinished), false};
+    auto  destroyFn = inst->lifecycleDestroy;
+    auto ctx       = inst->pluginCtx;
+    const bool queued = dispatchToPlugin(
+        inst,
+        "plugin destroy",
+        [destroyFn, ctx, once] {
+            PluginxxOperatorNotify notify{&DestroyOnce::onDone, once};
+            try {
+                PluginxxString err{nullptr, 0};
+                destroyFn(ctx, &notify, &err);
+                if (err.data) {
+                    hostMemoryFree(err.data);
+                }
+            } catch (const std::exception& e) {
+                XX_LOGW("Plugin destroy threw: {}", e.what());
+                DestroyOnce::onDone(once, PLUGINXX_OPERATOR_FAILED, nullptr);
+            } catch (...) {
+                XX_LOGW("Plugin destroy threw unknown exception");
+                DestroyOnce::onDone(once, PLUGINXX_OPERATOR_FAILED, nullptr);
+            }
+        },
+        PluginDispatchOptions{.allowClosing = true, .retainWhenStopped = true, .measure = false}
+    );
+    if (!queued) {
+        delete once;
+        return false;
     }
-    if (destroy) {
-        try {
-            destroy(pluginCtx);
-        } catch (const std::exception& e) {
-            XX_LOGW("{}`{}` destroy threw: {}", logTag(), name, e.what());
-        } catch (...) {
-            XX_LOGW("{}`{}` destroy threw unknown exception", logTag(), name);
-        }
-    }
-    pluginCtx       = nullptr;
-    pluginDestroyed = true;
-    destroyDeferred = false;
-    // 插件上下文已销毁：之后插件持有的旧 host 指针只能安全失败。
-    retireHostControl();
     return true;
 }
 
+} // namespace detail
+
+/// 销毁完成后的收尾: 上下文作废 + 退休框架控制块 (之后插件持有的旧 host 指针只能安全失败)。
+/// - 调 [destroyEntry] 之后由加载/卸载路径调用, 调用前须确认活动 lease 已归零;
+/// - `pluginCreated == false` 也要调 (插件从未建出上下文, 只需退休控制块)。
+inline void PluginInstanceBase::finishDestroy() noexcept {
+    pluginCtx       = nullptr;
+    pluginDestroyed = true;
+    destroyDeferred = false;
+    retireHostControl();
+}
 namespace detail {
 
 /// 事件订阅撤销的簿记动作 (见 pluginxx/host/broadcast_registry.h 的声明)

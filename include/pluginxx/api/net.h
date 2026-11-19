@@ -1,4 +1,4 @@
-/// 插件网络能力接口表 (`<应用名>.net`) 与结果码
+/// 插件网络能力接口表 (`<应用名>_plugin_net`) 与结果码
 ///
 /// 归属: 这张表**只依赖"op + 参数 JSON → 结果 JSON"这套通用写法**, 不需要主程序业务语义,
 /// 所以放在通用表这一侧 (与 `capabilities` / `broadcasts` 同样由应用名拼出 IID)。
@@ -52,9 +52,9 @@ extern "C" {
 
 #include "pluginxx/api/result.h"
 
-/* ==================== 接口表: 网络 (<应用名>.net) ==================== */
+/* ==================== 接口表: 网络 (<应用名>_plugin_net) ==================== */
 
-#define PLUGINXX_IFACE_NET PLUGINXX_APP_ID("net")
+#define PLUGINXX_IFACE_NET PLUGINXX_TABLE_ID("plugin_net")
 /// v1: 同步 call / 异步 call_async / cancel
 /// v2: `call_async` 删掉, `call` 本身改成异步操作契约 (`request_id` 变成出参, 结果经
 ///     完成回调交回); `cancel` 不变 (投递即返回, 没有结果)。基线随本次布局变化重置

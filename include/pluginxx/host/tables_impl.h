@@ -1101,7 +1101,7 @@ struct GenericTableEntries {
         });
     }
 
-    /// Operation 取消由 `<应用名>.cancel` 表唯一提供 (`op_cancel`), 本集合不再自带一份
+    /// Operation 取消由 `<应用名>_plugin_cancel` 表唯一提供 (`op_cancel`), 本集合不再自带一份
 
     // =====================================================================
     // 协程驱动 (v2 起并入 scheduler 表)
@@ -1176,7 +1176,7 @@ struct GenericTableEntries {
         });
     }
 
-    /// Operation 取消 (`<应用名>.cancel` 表的唯一入口; tasks 表复用它)
+    /// Operation 取消 (`<应用名>_plugin_cancel` 表的唯一入口; tasks 表复用它)
     static void PLUGINXX_CALL opCancelEntry(PluginxxOperatorHandle* op) {
         cancelPluginOperation(op);
     }
@@ -1326,22 +1326,24 @@ struct GenericTableEntries {
     }
 };
 
-/// 通用表的表名清单 (IID 里 `<应用名>.` 之后那一段): 应用名不一致时用来给提示
+/// 通用表的表名清单 (IID 里 `<应用名>_` 之后那一段, 均以 `plugin_` 开头):
+/// 应用名不一致时用来给提示
 inline constexpr std::string_view kGenericTableNames[] = {
-    "log",  "json",      "config",    "plugins",  "broadcasts",
-    "capabilities", "scheduler", "tasks", "cancel",
+    "plugin_log",   "plugin_json",        "plugin_config", "plugin_plugins",
+    "plugin_broadcasts", "plugin_capabilities", "plugin_scheduler", "plugin_tasks",
+    "plugin_cancel", "plugin_net",
 };
 
-/// `iid` 是否以 `.<已知通用表名>` 结尾
+/// `iid` 是否以 `_<已知通用表名>` 结尾
 ///
-/// 只做后缀比较, 不按点切分 (应用名 / 表名都可以含点)。
+/// 只做后缀比较, 不按分切 (应用名 / 表名都可以含任意字符)。
 inline bool looksLikeGenericTableIid(std::string_view iid) {
     for (const auto name : kGenericTableNames) {
         if (iid.size() <= name.size() + 1) {
             continue;
         }
         const auto suffixAt = iid.size() - name.size();
-        if (iid[suffixAt - 1] == '.' && iid.compare(suffixAt, name.size(), name) == 0) {
+        if (iid[suffixAt - 1] == '_' && iid.compare(suffixAt, name.size(), name) == 0) {
             return true;
         }
     }
@@ -1350,8 +1352,10 @@ inline bool looksLikeGenericTableIid(std::string_view iid) {
 
 /// 按 IID 查询**通用表** (未命中返回 nullptr, 主程序继续查自己的业务表)
 /// - 覆盖 10 张通用表; IID 为编译期常量字符串, 比较用 string_view (不构造临时串)
-/// - 未命中但形如 `<别的应用名>.<通用表名>` 时记一条日志: 主程序与插件必须用同一个
-///   应用名 (`PLUGINXX_APP_NAME`) 编译, 否则插件拿不到表 (只提示, 不改行为)
+/// - 未命中但形如 `<别的应用名>_<通用表名>` 时记一条日志: 主程序与插件必须用同一个
+///   应用名 (`PLUGINXX_APP_NAME`) 编译, 否则插件拿不到表 (只提示, 不改行为);
+///   本进程前缀的 IID 不属于这种情形 —— 它可能是主程序自己实现、名字与通用表同形的
+///   表 (如网络表由主程序实现), 未命中就交给主程序继续查, 不唠叨
 template<typename InstanceT, typename ManagerT>
 const void* queryGenericPluginIface(std::string_view iid) {
     using Entries = GenericTableEntries<InstanceT, ManagerT>;
@@ -1382,12 +1386,12 @@ const void* queryGenericPluginIface(std::string_view iid) {
     if (iid == PLUGINXX_IFACE_CANCEL) {
         return &Entries::cancelIface();
     }
-    if (looksLikeGenericTableIid(iid)) {
+    if (!iid.starts_with(pluginxx::appTableIdPrefix()) && looksLikeGenericTableIid(iid)) {
         utilxx_base::xxLogPrint(
             utilxx_base::LogLevel::Warn,
             "pluginxx",
             "query_interface: `" + std::string{iid} + "` 未命中; 本进程的通用表 IID 以 `"
-                + std::string{pluginxx::appIdPrefix()}
+                + std::string{pluginxx::appTableIdPrefix()}
                 + "` 开头 —— 主程序与插件必须用同一个应用名 (PLUGINXX_APP_NAME) 编译"
         );
     }

@@ -1003,6 +1003,71 @@ inline asio::awaitable<bool> awaitPluginLifecycle(
     }
 }
 
+/// 驱动一个"`void` + 完成通知"形态的生命周期入口 (create / stop / destroy)
+///
+/// 与 [awaitPluginLifecycle] 的唯一差别是入口不再用返回值表示结果:
+/// 入口调用本身只负责提交, 结论一律等完成包 (`notify.done`) 交回。
+/// 所以驱动回调总是给出一个**非空哨兵句柄**让 Operation 进入 Running, 否则
+/// OpCore 会按"既没 done 也没句柄"把它当成拒绝。
+///
+/// - `call`: `(const PluginxxOperatorNotify*, PluginxxString*) -> void`, 在插件执行线程执行;
+/// - 返回 true = 完成包状态为 OK; false = 未受理 / 失败 / 取消 (原因写 `error`)。
+template<typename CallFn>
+inline asio::awaitable<bool> awaitPluginLifecycleVoid(
+    const std::shared_ptr<PluginRuntime>&      runtime,
+    const std::shared_ptr<PluginInstanceBase>& instance,
+    CallFn&&                                   call,
+    std::string_view                           label,
+    std::string&                               error
+) {
+    error.clear();
+    if (!runtime || !instance) {
+        co_return true;
+    }
+    std::shared_ptr<OpCore> core;
+    try {
+        core      = OpCore::create(runtime, instance, nullptr, std::string(label), true);
+        OpDrive drive;
+        drive.start = [call = std::forward<CallFn>(call)](
+                          const PluginxxOperatorNotify* notify,
+                          PluginxxString*               errorOut
+                      ) mutable -> void* {
+            call(notify, errorOut);
+            // 非空哨兵: "已受理, 结论看完成包"
+            return reinterpret_cast<void*>(static_cast<uintptr_t>(1));
+        };
+        if (!co_await core->startAsync(std::move(drive), error)) {
+            co_return false;
+        }
+        try {
+            co_await core->wait();
+        } catch (const std::exception& e) {
+            error = e.what();
+            co_return false;
+        } catch (...) {
+            error = "plugin lifecycle wait failed";
+            co_return false;
+        }
+        if (core->status() != PLUGINXX_OPERATOR_OK) {
+            error = core->payload().empty() ? "plugin lifecycle hook failed" : core->payload();
+            co_return false;
+        }
+        co_return true;
+    } catch (const std::exception& e) {
+        if (core && !core->submitted()) {
+            core->reject();
+        }
+        error = e.what();
+        co_return false;
+    } catch (...) {
+        if (core && !core->submitted()) {
+            core->reject();
+        }
+        error = "plugin lifecycle hook failed unexpectedly";
+        co_return false;
+    }
+}
+
 } // namespace pluginxx
 
 #endif /* PLUGINXX_RUNTIME_OP_DRIVER_H */

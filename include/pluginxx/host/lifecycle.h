@@ -125,37 +125,36 @@ public:
         }
 
         // 入口符号名由主程序提供 (插件框架不硬编码任何主程序专名, 见 pluginxx/api/entry.h):
-        // 未提供 create 时无法加载, 直接失败并说明原因 (不去猜主程序专名)。
+        // 缺 create / stop / destroy 任一都无法完成生命周期, 直接失败并说明原因。
         const PluginEntrySymbols entries = entrySymbols();
-        if (!entries.valid() || !entries.lifecyclePaired()) {
+        if (!entries.valid()) {
             NativeLoader::close(dl);
             XX_LOGE(
-                "{}Plugin `{}` load failed: host did not provide plugin entry symbols "
-                "(create={}, start={}, stop={})",
+                "{}Plugin `{}` load failed: host did not provide plugin entry symbols (missing "
+                "`{}`)",
                 logTag(),
                 path,
-                entries.create.empty() ? "missing" : "ok",
-                entries.start.empty() ? "missing" : "ok",
-                entries.stop.empty() ? "missing" : "ok"
+                std::string{entries.firstMissing()}
             );
             co_return nullptr;
         }
 
-        auto lookupSymbol = [&dl](std::string_view name, std::string& e) -> void* {
-            if (name.empty()) {
+        auto lookupSymbol = [&dl](std::string_view symbol, std::string& e) -> void* {
+            if (symbol.empty()) {
                 return nullptr;
             }
-            const std::string owned{name};
+            const std::string owned{symbol};
             return NativeLoader::sym(dl, owned.c_str(), e);
         };
 
         auto getInfoFn = reinterpret_cast<PluginxxGetInfoFn>(lookupSymbol(entries.getInfo, err));
         std::string createErr;
         auto createFn = reinterpret_cast<PluginxxCreateFn>(lookupSymbol(entries.create, createErr));
-        std::string startErr;
-        auto startFn = reinterpret_cast<PluginxxStartFn>(lookupSymbol(entries.start, startErr));
         std::string stopErr;
         auto        stopFn = reinterpret_cast<PluginxxStopFn>(lookupSymbol(entries.stop, stopErr));
+        std::string destroyErr;
+        auto        destroyFn
+            = reinterpret_cast<PluginxxDestroyFn>(lookupSymbol(entries.destroy, destroyErr));
 
         if (!createFn) {
             NativeLoader::close(dl);
@@ -172,48 +171,74 @@ public:
             );
             co_return nullptr;
         }
-        // start/stop 是必备入口 (create 只构造, start 注册, stop 撤销):
-        // 缺少任一符号说明插件未按当前契约导出, 直接拒绝加载。
-        if (!startFn || !stopFn) {
+        // stop / destroy 也是必备入口: 缺任一说明插件未按当前契约导出, 拒绝加载。
+        if (!stopFn || !destroyFn) {
             NativeLoader::close(dl);
             XX_LOGE(
                 "{}Plugin `{}` missing lifecycle entry ({}: {}; {}: {}); plugins must export "
-                "start/stop",
+                "stop/destroy",
                 logTag(),
                 path,
-                std::string{entries.start},
-                startFn ? "ok" : startErr,
                 std::string{entries.stop},
-                stopFn ? "ok" : stopErr
+                stopFn ? "ok" : stopErr,
+                std::string{entries.destroy},
+                destroyFn ? "ok" : destroyErr
             );
             co_return nullptr;
         }
 
-        const PluginxxInfo* info = nullptr;
-        try {
-            info = getInfoFn ? getInfoFn() : nullptr;
-        } catch (const std::exception& e) {
-            XX_LOGW("{}Plugin `{}` get_info threw: {}", logTag(), path, e.what());
-        } catch (...) {
-            XX_LOGW("{}Plugin `{}` get_info threw unknown exception", logTag(), path);
+        // 元信息: 框架给结构体, 插件填写; 三个字符串当场复制 (插件的视图只保证本次调用期间有效)
+        PluginxxInfo info{};
+        info.api_version = hostApiVersion();
+        info.struct_size = static_cast<uint32_t>(sizeof(PluginxxInfo));
+        bool infoReady = false;
+        if (getInfoFn) {
+            std::string infoError;
+            try {
+                const int32_t rc = getInfoFn(&info);
+                if (rc == 0 && info.name.data && info.name.size > 0) {
+                    infoReady = true;
+                } else {
+                    infoError = fmt::format("get_info returned {}", rc);
+                }
+            } catch (const std::exception& e) {
+                infoError = fmt::format("get_info threw: {}", e.what());
+            } catch (...) {
+                infoError = "get_info threw unknown exception";
+            }
+            if (!infoError.empty()) {
+                NativeLoader::close(dl);
+                XX_LOGE("{}Plugin `{}` metadata rejected: {}", logTag(), path, infoError);
+                co_return nullptr;
+            }
+            if (info.min_api_version > hostApiVersion()) {
+                // 先把取值取出来再关库 (关库后插件常量段可能已释放, 再读 info 就是非法访问)
+                const auto required = info.min_api_version;
+                NativeLoader::close(dl);
+                XX_LOGE(
+                    "{}Plugin `{}` requires API version {} but this host supports {}",
+                    logTag(),
+                    path,
+                    required,
+                    hostApiVersion()
+                );
+                co_return nullptr;
+            }
         }
-        if (info && info->api_version < PLUGINXX_MIN_API_VERSION) {
-            // info 指向插件内部内存: 先把取值取出来再关库 (关库后插件代码段/常量段
-            // 可能已释放, 再读 info 就是访问已卸载的内存 —— 实测 ASan 报 access-violation)
-            const auto pluginApiVersion = info->api_version;
-            NativeLoader::close(dl);
-            XX_LOGE(
-                "{}Plugin `{}` API version too old (got {}, framework requires >= {})",
-                logTag(),
-                path,
-                pluginApiVersion,
-                PLUGINXX_MIN_API_VERSION
-            );
-            co_return nullptr;
-        }
+        const std::string infoVersion
+            = infoReady && info.version.data
+                  ? std::string(info.version.data, static_cast<size_t>(info.version.size))
+                  : std::string{};
+        const std::string infoDescription
+            = infoReady && info.description.data
+                  ? std::string(
+                        info.description.data,
+                        static_cast<size_t>(info.description.size)
+                    )
+                  : std::string{};
 
-        std::string name = info && info->name.data ? std::string(info->name.data, info->name.size)
-                                                   : std::filesystem::path(path).stem().string();
+        std::string name = infoReady ? std::string(info.name.data, static_cast<size_t>(info.name.size))
+                                     : std::filesystem::path(path).stem().string();
         if (name.starts_with("lib")) {
             name = name.substr(3);
         }
@@ -228,52 +253,38 @@ public:
             co_return nullptr;
         }
 
-        auto inst        = makeInstance(std::move(name), info, path, startFn, stopFn);
+        auto inst = makeInstance(
+            std::move(name),
+            infoVersion,
+            infoDescription,
+            path,
+            createFn,
+            stopFn,
+            destroyFn
+        );
         inst->dlHandle   = dl;
         inst->interfaces = interfaces;
         applyLoadOptions(*inst, options);
 
         this->plugins_[inst->name] = inst;
-        int rc                     = -1;
-        // `create` 是插件的构造期: 允许读配置/建索引, 但不允许注册与起线程。
-        // 和其它阻塞动作一样不放在主程序 IO 线程上 (派生类可改投线程池)。
-        auto createError = co_await runLoaderTask([&]() -> std::string {
-            try {
-                rc = createFn(inst->hostView(), &inst->pluginCtx);
-                // 即使 create 返回失败，只要把上下文交出去了，destroy 仍是主程序的责任。
-                inst->pluginCreated = (inst->pluginCtx != nullptr);
-            } catch (const std::exception& e) {
-                rc = -1;
-                return fmt::format("create threw: {}", e.what());
-            } catch (...) {
-                rc = -1;
-                return std::string{"create threw unknown exception"};
-            }
-            if (rc == 0) {
-                return std::string{};
-            }
-            return fmt::format("create failed (code={})", rc);
-        });
-
-        if (!createError.empty()) {
-            XX_LOGE("{}Plugin `{}` {}, performing rollback", logTag(), inst->name, createError);
-            rollbackLoad(inst, /*closeHandle=*/true);
-            co_return nullptr;
-        }
-
-        std::string startError;
-        if (!co_await awaitPluginLifecycle(
+        // 创建事务 = 构造 + 注册, 一个完成包定成败 (在插件执行线程上跑)。
+        inst->pluginCtx    = nullptr;
+        std::string createError;
+        if (!co_await awaitPluginLifecycleVoid(
                 this->runtime(),
                 inst,
-                inst->pluginCtx,
-                inst->lifecycleStart,
-                "plugin start",
-                startError
+                [&](const PluginxxOperatorNotify* notify, PluginxxString* errorOut) {
+                    createFn(inst->hostView(), &inst->pluginCtx, notify, errorOut);
+                },
+                "plugin create",
+                createError
             )) {
-            XX_LOGE("{}Plugin `{}` start failed: {}", logTag(), inst->name, startError);
-            rollbackLoad(inst, /*closeHandle=*/true);
+            XX_LOGE("{}Plugin `{}` create failed: {}", logTag(), inst->name, createError);
+            inst->pluginCreated = (inst->pluginCtx != nullptr);
+            co_await rollbackLoadAsync(inst, /*closeHandle=*/true);
             co_return nullptr;
         }
+        inst->pluginCreated    = (inst->pluginCtx != nullptr);
         inst->lifecycleStarted = true;
 
         finishLoad(inst, resources);
@@ -300,24 +311,60 @@ public:
             XX_LOGE("{}Built-in plugin `{}` not found in registry", logTag(), name);
             co_return nullptr;
         }
-        if (!entry->create || !entry->start || !entry->stop) {
-            XX_LOGE("{}Built-in plugin `{}` does not export create/start/stop", logTag(), name);
-            co_return nullptr;
-        }
-
-        const PluginxxInfo* info = entry->get_info ? entry->get_info() : nullptr;
-        // 判据与动态库插件一致: 只拒绝"低于最低支持版本"; 更高的声明不拒绝
-        // (插件可能用了当前框架没有的能力, 由插件自己读 PLUGINXX_API_VERSION 决定降级)
-        if (info && info->api_version < PLUGINXX_MIN_API_VERSION) {
+        if (!entry->create || !entry->stop || !entry->destroy) {
             XX_LOGE(
-                "{}Builtin plugin `{}` API version below minimum (got {}, framework requires >= {})",
+                "{}Built-in plugin `{}` does not export create/stop/destroy",
                 logTag(),
-                name,
-                info->api_version,
-                PLUGINXX_MIN_API_VERSION
+                name
             );
             co_return nullptr;
         }
+
+        // 元信息: 与动态库插件同一套填表协议
+        PluginxxInfo info{};
+        info.api_version = hostApiVersion();
+        info.struct_size = static_cast<uint32_t>(sizeof(PluginxxInfo));
+        bool infoReady = false;
+        if (entry->get_info) {
+            std::string infoError;
+            try {
+                const int32_t rc = entry->get_info(&info);
+                if (rc == 0 && info.name.data && info.name.size > 0) {
+                    infoReady = true;
+                } else {
+                    infoError = fmt::format("get_info returned {}", rc);
+                }
+            } catch (const std::exception& e) {
+                infoError = fmt::format("get_info threw: {}", e.what());
+            } catch (...) {
+                infoError = "get_info threw unknown exception";
+            }
+            if (!infoError.empty()) {
+                XX_LOGE("{}Builtin plugin `{}` metadata rejected: {}", logTag(), name, infoError);
+                co_return nullptr;
+            }
+            if (info.min_api_version > hostApiVersion()) {
+                XX_LOGE(
+                    "{}Builtin plugin `{}` requires API version {} but this host supports {}",
+                    logTag(),
+                    name,
+                    info.min_api_version,
+                    hostApiVersion()
+                );
+                co_return nullptr;
+            }
+        }
+        const std::string infoVersion
+            = infoReady && info.version.data
+                  ? std::string(info.version.data, static_cast<size_t>(info.version.size))
+                  : std::string{};
+        const std::string infoDescription
+            = infoReady && info.description.data
+                  ? std::string(
+                        info.description.data,
+                        static_cast<size_t>(info.description.size)
+                    )
+                  : std::string{};
 
         if (!this->reservePluginName(name)) {
             XX_LOGE(
@@ -328,7 +375,15 @@ public:
             co_return nullptr;
         }
 
-        auto inst             = makeInstance(name, info, path, entry->start, entry->stop);
+        auto inst = makeInstance(
+            name,
+            infoVersion,
+            infoDescription,
+            path,
+            entry->create,
+            entry->stop,
+            entry->destroy
+        );
         inst->builtinUnload   = entry->destroy;
         inst->depends         = std::move(depends);
         inst->optionalDepends = std::move(optionalDepends);
@@ -336,41 +391,23 @@ public:
         applyLoadOptions(*inst, options);
 
         this->plugins_[inst->name] = inst;
-        int rc                     = -1;
-        try {
-            rc                  = entry->create(inst->hostView(), &inst->pluginCtx);
-            inst->pluginCreated = (inst->pluginCtx != nullptr);
-        } catch (const std::exception& e) {
-            XX_LOGE("{}Builtin plugin `{}` create threw: {}", logTag(), inst->name, e.what());
-            rc = -1;
-        } catch (...) {
-            XX_LOGE("{}Builtin plugin `{}` create threw unknown exception", logTag(), inst->name);
-            rc = -1;
-        }
-        if (rc != 0) {
-            XX_LOGE(
-                "{}Builtin plugin `{}` create failed (code={}), performing rollback",
-                logTag(),
-                inst->name,
-                rc
-            );
-            rollbackLoad(inst, /*closeHandle=*/false);
-            co_return nullptr;
-        }
-
-        std::string startError;
-        if (!co_await awaitPluginLifecycle(
+        inst->pluginCtx            = nullptr;
+        std::string createError;
+        if (!co_await awaitPluginLifecycleVoid(
                 this->runtime(),
                 inst,
-                inst->pluginCtx,
-                inst->lifecycleStart,
-                "plugin start",
-                startError
+                [&](const PluginxxOperatorNotify* notify, PluginxxString* errorOut) {
+                    entry->create(inst->hostView(), &inst->pluginCtx, notify, errorOut);
+                },
+                "plugin create",
+                createError
             )) {
-            XX_LOGE("{}Builtin plugin `{}` start failed: {}", logTag(), inst->name, startError);
-            rollbackLoad(inst, /*closeHandle=*/false);
+            XX_LOGE("{}Builtin plugin `{}` create failed: {}", logTag(), inst->name, createError);
+            inst->pluginCreated = (inst->pluginCtx != nullptr);
+            co_await rollbackLoadAsync(inst, /*closeHandle=*/false);
             co_return nullptr;
         }
+        inst->pluginCreated    = (inst->pluginCtx != nullptr);
         inst->lifecycleStarted = true;
 
         finishLoad(inst, resources);
@@ -707,11 +744,12 @@ public:
             co_return;
         }
         std::string error;
-        if (!co_await awaitPluginLifecycle(
+        if (!co_await awaitPluginLifecycleVoid(
                 this->runtime(),
                 inst,
-                inst->pluginCtx,
-                inst->lifecycleStop,
+                [&](const PluginxxOperatorNotify* notify, PluginxxString* errorOut) {
+                    inst->lifecycleStop(inst->pluginCtx, notify, errorOut);
+                },
                 "plugin stop",
                 error
             )) {
@@ -727,7 +765,7 @@ public:
     }
 
     asio::awaitable<void> startForEnable(InstancePtr inst) {
-        if (!inst || !inst->lifecycleStart) {
+        if (!inst || !inst->lifecycleCreate) {
             co_return;
         }
         // enable 事务可能落后于 unload: 关闭/已关闭的实例不得被重新置为 Ready
@@ -739,15 +777,16 @@ public:
         if (!inst->enabled) {
             co_return;
         }
-        // disable 的 stop 事务可能还在排队或正在执行：必须先停干净再 start，
+        // disable 的 stop 事务可能还在排队或正在执行：必须先停干净再 create，
         // 否则新注册会叠加在未撤销的旧状态之上。
         if (inst->lifecycleStopPending()) {
             std::string stopError;
-            if (!co_await awaitPluginLifecycle(
+            if (!co_await awaitPluginLifecycleVoid(
                     this->runtime(),
                     inst,
-                    inst->pluginCtx,
-                    inst->lifecycleStop,
+                    [&](const PluginxxOperatorNotify* notify, PluginxxString* errorOut) {
+                        inst->lifecycleStop(inst->pluginCtx, notify, errorOut);
+                    },
                     "plugin stop",
                     stopError
                 )) {
@@ -771,20 +810,22 @@ public:
         }
         if (inst->lifetime->closeRequested()
             || inst->lifetime->state() == PluginInstanceState::Closed) {
-            // 等待 stop 期间实例开始关闭: 不再 start。
+            // 等待 stop 期间实例开始关闭: 不再 create。
             co_return;
         }
 
+        // 重新注册 = 可重入 create: 上下文保留 (非空的 `*plugin_ctx` 让插件跳过构造)
         std::string error;
-        if (!co_await awaitPluginLifecycle(
+        if (!co_await awaitPluginLifecycleVoid(
                 this->runtime(),
                 inst,
-                inst->pluginCtx,
-                inst->lifecycleStart,
-                "plugin start",
+                [&](const PluginxxOperatorNotify* notify, PluginxxString* errorOut) {
+                    inst->lifecycleCreate(inst->hostView(), &inst->pluginCtx, notify, errorOut);
+                },
+                "plugin create",
                 error
             )) {
-            // start 失败: 回到 Disabled 且不留部分注册；实例保持"stop 仍欠着"，
+            // create 失败: 回到 Disabled 且不留部分注册；实例保持"stop 仍欠着"，
             // 卸载或下次启用时先 stop 清理, 保证回滚顺序为"先撤销注册, 再释放资源"。
             inst->enabled               = false;
             inst->blockedByDependencies = false;
@@ -793,7 +834,7 @@ public:
             }
             detachInstanceRegistrations(inst.get());
             clearPluginOwnedRegistrations(inst.get());
-            XX_LOGE("{}Plugin `{}` start failed while enabling: {}", logTag(), inst->name, error);
+            XX_LOGE("{}Plugin `{}` create failed while enabling: {}", logTag(), inst->name, error);
             co_return;
         }
         inst->lifecycleStopped = false;
@@ -848,6 +889,15 @@ protected:
     /// - `destroy` 不在此列: 它由实例类的 [InstanceT::pluginDestroySymbol] 给出。
     virtual PluginEntrySymbols entrySymbols() const {
         return {};
+    }
+
+    /// 本端主程序支持的全局 API 版本 (填充给 `PluginxxInfo.api_version`, 并用做
+    /// 插件 `min_api_version` 的上限)
+    ///
+    /// - 默认取构建期覆盖的 `PLUGINXX_API_VERSION` (两端同源);
+    /// - 两端各自抬代次的主程序 (本应用: agent 侧与 client 侧版本号不同) 在这里分开返回。
+    virtual int32_t hostApiVersion() const noexcept {
+        return PLUGINXX_API_VERSION;
     }
 
     // =====================================================================
@@ -971,24 +1021,26 @@ protected:
 
     /// 加载实例的通用部分 (主程序的自定义加载路径也应调用它)
     ///
-    /// - 生命周期入口 (start/stop);
+    /// - 生命周期入口 (stop / destroy);
     /// - 基类自引用: 通用表实现与完成回调只依赖 `ownerSelf` (不依赖管理器类型);
     /// - 生命周期控制块 (状态机 + 执行 lease); `makeLifetime` 同时写入实例的运行时弱引用;
     /// - 交给插件的框架控制块: host 视图必须在进程级稳定地址上, 插件卸载后继续使用
     ///   旧指针时各 vtable 入口只会安全失败 (tombstone 语义, 见 instance_base.h)。
     void attachInstance(
-        const InstancePtr&    inst,
-        const PluginxxStartFn startFn,
-        const PluginxxStopFn  stopFn
+        const InstancePtr&      inst,
+        const PluginxxCreateFn createFn,
+        const PluginxxStopFn    stopFn,
+        const PluginxxDestroyFn destroyFn
     ) {
         if (!inst) {
             return;
         }
-        inst->lifecycleStart = startFn;
-        inst->lifecycleStop  = stopFn;
-        inst->ownerSelf      = inst;
-        inst->lifetime       = this->makeLifetime(inst);
-        inst->hostControl    = PluginHostControl::create(inst, hostVtable());
+        inst->lifecycleCreate  = createFn;
+        inst->lifecycleStop    = stopFn;
+        inst->lifecycleDestroy = destroyFn;
+        inst->ownerSelf        = inst;
+        inst->lifetime         = this->makeLifetime(inst);
+        inst->hostControl      = PluginHostControl::create(inst, hostVtable());
     }
 
     /// 探测 plugin.yaml 的基准目录 (可执行目录优先, 其次当前工作目录)
@@ -1020,28 +1072,26 @@ protected:
 
     /// 插件实例的公共加载 (两种加载路径共用): 元信息/生命周期入口/框架控制块
     InstancePtr makeInstance(
-        std::string           name,
-        const PluginxxInfo*   info,
-        std::string           path,
-        const PluginxxStartFn startFn,
-        const PluginxxStopFn  stopFn
+        std::string             name,
+        std::string             version,
+        std::string             description,
+        std::string             path,
+        const PluginxxCreateFn  createFn,
+        const PluginxxStopFn    stopFn,
+        const PluginxxDestroyFn destroyFn
     ) {
         auto inst = createInstance(std::move(name));
         if (!inst) {
             return nullptr;
         }
-        inst->version     = info && info->version.data
-                                ? std::string(info->version.data, info->version.size)
-                                : "1.0.0";
-        inst->description = info && info->description.data
-                                ? std::string(info->description.data, info->description.size)
-                                : "";
+        inst->version     = version.empty() ? "1.0.0" : std::move(version);
+        inst->description = std::move(description);
         inst->path        = std::move(path);
-        attachInstance(inst, startFn, stopFn);
+        attachInstance(inst, createFn, stopFn, destroyFn);
         return inst;
     }
 
-    /// create + start 都成功后的公共收尾: 应用声明式资源、主程序收尾、置 Ready。
+    /// create 成功后的公共收尾: 应用声明式资源、主程序收尾、置 Ready。
     void finishLoad(const InstancePtr& inst, const PluginManifestResources& resources) {
         applyDeclaredResources(*inst, resources);
         onInstanceLoaded(*inst);
@@ -1049,22 +1099,67 @@ protected:
         this->releasePluginName(inst->name);
     }
 
-    /// 加载失败 / start 失败的统一回滚: 摘除主程序侧注册 → 释放资源 → 销毁插件上下文
-    /// → 移出插件表 → 释放名称预占 (动态库句柄由调用方决定是否关闭)。
-    void rollbackLoad(const InstancePtr& inst, bool closeHandle) {
+    /// 加载失败 / create 失败的统一回滚: 摘除主程序侧注册 → 释放资源 → 销毁插件上下文
+    /// → 移出插件表 → 释放名称预占 → (按需) 在工作线程关闭动态库。
+    asio::awaitable<void> rollbackLoadAsync(const InstancePtr& inst, bool closeHandle) {
         if (!inst) {
-            return;
+            co_return;
         }
         detachInstanceRegistrations(inst.get());
         releaseInstanceResources(*inst);
-        const bool destroyed = inst->destroyPlugin();
+        co_await destroyInstanceAsync(inst);
         this->plugins_.erase(inst->name);
         this->releasePluginName(inst->name);
-        /// destroy 被活动 lease 挡下时不关句柄: 插件代码可能还在运行, 这时候卸载
-        /// 动态库会直接崩 (实例随最后一个引用释放时由析构函数保证)。
-        if (closeHandle && destroyed) {
-            inst->closeLibraryHandle();
+        if (closeHandle) {
+            co_await runLoaderTask([&inst]() -> std::string {
+                inst->closeLibraryHandle();
+                return {};
+            });
         }
+        co_return;
+    }
+
+    /// 销毁一个实例的插件上下文 (**协程**, 在管理器的 IO executor 上等待完成包)
+    ///
+    /// - 没有活动 lease 才执行 (关闭路径先等 inflight 归零);
+    /// - `lifecycleDestroy` 为空 (插件从未建出上下文 / 测试伪实例) 时只退休控制块;
+    /// - 完成后调 [PluginInstanceBase::finishDestroy], 旧 host 指针与旧 ctx 一起作废。
+    asio::awaitable<void> destroyInstanceAsync(const InstancePtr& inst) {
+        if (!inst) {
+            co_return;
+        }
+        if (inst->pluginDestroyed) {
+            co_return;
+        }
+        if (inst->lifetime && inst->lifetime->leaseCount() != 0) {
+            inst->destroyDeferred = true;
+            XX_LOGE(
+                "{}`{}` destroy deferred while {} lease(s) are still active",
+                logTag(),
+                inst->name,
+                inst->lifetime->leaseCount()
+            );
+            co_return;
+        }
+        if (!inst->pluginCreated || !inst->lifecycleDestroy) {
+            inst->finishDestroy();
+            co_return;
+        }
+        std::string error;
+        if (!co_await awaitPluginLifecycleVoid(
+                this->runtime(),
+                inst,
+                [&](const PluginxxOperatorNotify* notify, PluginxxString* errorOut) {
+                    inst->lifecycleDestroy(inst->pluginCtx, notify, errorOut);
+                },
+                "plugin destroy",
+                error
+            )) {
+            // 销毁失败也要退休: 保留一个已无用的 ctx 只会让旧 host 指针继续指向活对象
+            XX_LOGE("{}Plugin `{}` destroy failed: {}", logTag(), inst->name, error);
+        }
+        inst->finishDestroy();
+        co_return;
     }
 
     /// 同步关闭单个实例 (级联卸载依赖者)
@@ -1114,20 +1209,26 @@ protected:
             return;
         }
 
-        inst->destroyPlugin();
-        if (!inst->pluginDestroyed) {
+        // destroy 是异步事务: 同步路径不等它, 而是把"destroy → 退休 → dlclose"
+        // 整段投到插件执行线程, 完成后由派生线程关句柄 (dlclose 也可能慢, 不占 io 线程)。
+        if (!requestAsyncDestroy(inst)) {
             XX_LOGW("{}Plugin shutdown deferred after destroy attempt: `{}`", logTag(), inst->name);
             return;
         }
-        /// 插件上下文已销毁: 关闭动态库句柄, 释放对插件文件的占用
-        /// (否则卸载后插件目录仍删不掉、库文件也换不掉)。
-        inst->closeLibraryHandle();
         if (inst->lifetime) {
             inst->lifetime->setState(PluginInstanceState::Closed);
         }
         onInstanceUnloaded(*inst);
         this->plugins_.erase(inst->name);
         XX_LOGI("{}Plugin shutdown: {}", logTag(), inst->name);
+    }
+
+    /// 投一次"destroy 完成后再关库"的收尾 (**不等结果**, 供同步析构路径使用)
+    ///
+    /// 派发项持有实例强引用, 因此实例、上下文与 DSO 都会等到 destroy 完成才释放。
+    /// 返回 false = 未能派发 (实例/运行时已失效), 调用方保留实例等待异步 owner 收尾。
+    bool requestAsyncDestroy(const InstancePtr& inst) {
+        return detail::destroyInstanceNoWait(inst);
     }
 
     /// 同步 owner 即将析构时，保留实例和 DSO 到最后一个 lease 释放。
@@ -1151,14 +1252,17 @@ protected:
                     );
                     return;
                 }
-                if (!inst->destroyPlugin()) {
-                    XX_LOGE("Plugin `{}` idle cleanup still has active leases", inst->name);
-                    return;
+                // destroy 是异步事务: 这里投出去不等结果 (完成回调里退休上下文并关库)。
+                // 实例与 DSO 由派发项持有的强引用保持到完成后。
+                if (!inst->pluginCreated || !inst->lifecycleDestroy) {
+                    inst->finishDestroy();
+                    inst->closeLibraryHandle();
+                    inst->lifetime->setState(PluginInstanceState::Closed);
+                } else {
+                    detail::destroyInstanceNoWait(inst, [lifetime = inst->lifetime] {
+                        lifetime->setState(PluginInstanceState::Closed);
+                    });
                 }
-                /// 上下文已销毁: 动态库句柄在这里关掉 (实例可能已经没有别的持有者,
-                /// 句柄不关就会被占住到进程退出)。
-                inst->closeLibraryHandle();
-                inst->lifetime->setState(PluginInstanceState::Closed);
                 // 管理器仍存活时释放同一实例的名称预占，使后续加载可以重试。
                 // manager 已析构时 weak_ptr 为空，实例会在 cleanup 返回后自然释放。
                 if (auto base = weakBase.lock()) {
@@ -1313,8 +1417,8 @@ protected:
         if (!inst) {
             return;
         }
-        if (!inst->lifecycleStart) {
-            // 没有 start 可投: 直接级联
+        if (!inst->lifecycleCreate) {
+            // 没有 create 可投: 直接级联
             resumeDependents(inst);
             return;
         }
@@ -1393,11 +1497,12 @@ protected:
 
         if (inst->lifecycleStopPending()) {
             std::string stopError;
-            if (!co_await awaitPluginLifecycle(
+            if (!co_await awaitPluginLifecycleVoid(
                     this->runtime(),
                     inst,
-                    inst->pluginCtx,
-                    inst->lifecycleStop,
+                    [&](const PluginxxOperatorNotify* notify, PluginxxString* errorOut) {
+                        inst->lifecycleStop(inst->pluginCtx, notify, errorOut);
+                    },
                     "plugin stop",
                     stopError
                 )) {
@@ -1447,14 +1552,21 @@ protected:
             co_return false;
         }
 
-        inst->destroyPlugin();
+        // destroy 是异步事务 (在插件执行线程上跑, 可以慢); 完成之后才 dlclose。
+        co_await destroyInstanceAsync(inst);
         if (!inst->pluginDestroyed) {
             XX_LOGW("{}Plugin `{}` unload deferred after destroy attempt", logTag(), inst->name);
             co_return false;
         }
-        /// 插件上下文已销毁、lease 已归零: 关闭动态库句柄, 让插件文件在卸载之后
-        /// 可以删除/替换 (不关的话 Windows 上目录与库文件都被占住)。
-        inst->closeLibraryHandle();
+        /// 插件上下文已销毁、lease 已归零: 在工作线程关闭动态库句柄, 让插件文件在
+        /// 卸载之后可以删除/替换 (`dlclose` 也可能慢, 不占 io 线程)。
+        /// - 没有句柄 (内置插件/主程序构造的伪实例) 时不必绕一趟线程池
+        if (inst->dlHandle) {
+            co_await runLoaderTask([&inst]() -> std::string {
+                inst->closeLibraryHandle();
+                return {};
+            });
+        }
         if (inst->lifetime) {
             inst->lifetime->setState(PluginInstanceState::Closed);
         }

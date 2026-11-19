@@ -8,9 +8,15 @@
 /// 侧 UI/事件/会话/线路) 的表由主程序定义与实现。
 ///
 /// 契约稳定性: 全部 C 名、结构体名、表名冻结 (见 abi.h 说明)。
-/// **通用表的 IID 由 `PLUGINXX_APP_ID("<表名>")` 拼出**: 表名部分冻结, 应用名由构建配置
-/// 给出 (CMake 缓存变量 `PLUGINXX_APP_NAME`, 见 `pluginxx/api/app.h`), 所以同一份源码
-/// 在不同主程序里编出来是 `<应用名>.<表名>`。
+/// **通用表的 IID 由 `PLUGINXX_TABLE_ID("plugin_<表名>")` 拼出**: 名字部分冻结,
+/// 应用名由构建配置给出 (CMake 缓存变量 `PLUGINXX_APP_NAME`, 见 `pluginxx/api/app.h`),
+/// 所以同一份源码在不同主程序里编出来是 `<应用名>_plugin_<表名>`。
+///
+/// 两段划分与拼法:
+/// - 通用表 (本头) 的名字一律以 `plugin_` 开头, IID = `<应用名>_plugin_*`;
+/// - 应用业务表 (主程序自己定义) 带端/域前缀, IID = `<应用名>_<域>_*`
+///   (本应用是 `<应用名>_agent_*` / `<应用名>_client_*`);
+/// - 点分的 `<应用名>.<名字>` 只用于官方能力 / 广播 / 功能埋点 id, 不用作表 IID。
 ///
 /// ════════════════════════════════════════════════════════════════════
 /// 接口表的版本与布局规则 (本头每张表都适用)
@@ -92,9 +98,9 @@ extern "C" {
 #define PLUGINXX_BROADCAST_SCOPE_APP    0
 #define PLUGINXX_BROADCAST_SCOPE_SYSTEM 1
 
-/* ==================== 接口表: 广播 (<应用名>.broadcasts) ==================== */
+/* ==================== 接口表: 广播 (<应用名>_plugin_broadcasts) ==================== */
 
-#define PLUGINXX_IFACE_BROADCASTS         PLUGINXX_APP_ID("broadcasts")
+#define PLUGINXX_IFACE_BROADCASTS         PLUGINXX_TABLE_ID("plugin_broadcasts")
 /// v1: 频道声明 + 发布 + 订阅 + 读当前值 (取代 `pluginxx.events` v3)
 /// v2: `subscribe_broadcast` 多一个 `options_json` (每个订阅方自己声明通知频率);
 ///     声明字段 `writable` 改名 `publish`, 宏改成 `PLUGINXX_BROADCAST_PUBLISH_*`
@@ -219,13 +225,13 @@ typedef struct PluginxxBroadcastsIface {
     );
 } PluginxxBroadcastsIface;
 
-/* ==================== 接口表: 能力 (<应用名>.capabilities) ==================== */
+/* ==================== 接口表: 能力 (<应用名>_plugin_capabilities) ==================== */
 
-#define PLUGINXX_IFACE_CAPABILITIES       PLUGINXX_APP_ID("capabilities")
+#define PLUGINXX_IFACE_CAPABILITIES       PLUGINXX_TABLE_ID("plugin_capabilities")
 /// v4: 声明 + 多实现行 (阶段 / 优先级 / 合并), 取代 v3 的"唯一提供者"
 /// v5: 表尾追加 `invoke_capability_ex` (带本次调用的超时), 基线与最低版本不变
 /// v6: 表尾追加 `unregister_capability_ex` (按作用域注销一条实现行), 基线不变
-/// v7: 删 `op_cancel` (并入 `<应用名>.cancel` 唯一入口)。基线随本次布局变化重置
+/// v7: 删 `op_cancel` (并入 `<应用名>_plugin_cancel` 唯一入口)。基线随本次布局变化重置
 /// v8: 登记 / 注销 / 自省四个成员改成异步操作契约 (`invoke_capability(_ex)` 本来就是
 ///     操作契约, 不变): 登记与注销的结论经完成回调交回, `capability_info` /
 ///     `list_capabilities` 的清单 JSON 在 `payload` 里, 细分原因 (如 `not_declared`)
@@ -357,7 +363,7 @@ typedef struct PluginxxCapabilitiesIface {
     );
 } PluginxxCapabilitiesIface;
 
-/* ==================== 接口表: 任务调度 (<应用名>.scheduler) ==================== */
+/* ==================== 接口表: 任务调度 (<应用名>_plugin_scheduler) ==================== */
 
 /// 调度与执行体控制 (含协程驱动)
 ///
@@ -381,10 +387,10 @@ typedef struct PluginxxCapabilitiesIface {
 ///   已 post 的 continuation), 不得在无工作时持续申请 ticket (那是隐藏轮询);
 /// - 重复 wake 由插件适配器自行合并 (同一实例同时只登记一次 ticket); 主程序另做
 ///   ticket 去重与关闭时取消作为最后防线。
-#define PLUGINXX_IFACE_SCHEDULER          PLUGINXX_APP_ID("scheduler")
+#define PLUGINXX_IFACE_SCHEDULER          PLUGINXX_TABLE_ID("plugin_scheduler")
 /// v2: 删 `post_to_io` (它自己就是一次阻塞往返) 与 `op_cancel` (并入
-///     `<应用名>.cancel`); `request_driver` / `cancel_driver` 从已删除的
-///     `<应用名>.coroutine_runtime` 表搬来。基线随本次签名变化重置
+///     `<应用名>_plugin_cancel`); `request_driver` / `cancel_driver` 从已删除的
+///     `<应用名>_plugin_coroutine_runtime` 表搬来。基线随本次签名变化重置
 #define PLUGINXX_IFACE_SCHEDULER_VERSION     2
 #define PLUGINXX_IFACE_SCHEDULER_MIN_VERSION 2
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
@@ -445,9 +451,9 @@ typedef struct PluginxxSchedulerIface {
     void(PLUGINXX_CALL* cancel_driver)(PluginxxDriver* driver);
 } PluginxxSchedulerIface;
 
-/* ==================== 接口表: 插件互查 (<应用名>.plugins) ==================== */
+/* ==================== 接口表: 插件互查 (<应用名>_plugin_plugins) ==================== */
 
-#define PLUGINXX_IFACE_PLUGINS            PLUGINXX_APP_ID("plugins")
+#define PLUGINXX_IFACE_PLUGINS            PLUGINXX_TABLE_ID("plugin_plugins")
 /// v2: 三个成员改成异步操作契约 (受理即返回, 清单 JSON 经完成回调的 `payload` 交回)
 #define PLUGINXX_IFACE_PLUGINS_VERSION     2
 #define PLUGINXX_IFACE_PLUGINS_MIN_VERSION 2
@@ -482,9 +488,9 @@ typedef struct PluginxxPluginsIface {
     );
 } PluginxxPluginsIface;
 
-/* ==================== 接口表: 主程序配置 (<应用名>.config) ==================== */
+/* ==================== 接口表: 主程序配置 (<应用名>_plugin_config) ==================== */
 
-#define PLUGINXX_IFACE_CONFIG             PLUGINXX_APP_ID("config")
+#define PLUGINXX_IFACE_CONFIG             PLUGINXX_TABLE_ID("plugin_config")
 /// v3: 移出主程序业务成员 (工具提示词 / 指定键的工作目录), 改由主程序业务表提供;
 /// 本表只保留与业务无关的配置读取
 /// v4: 五个成员改成异步操作契约 (受理即返回, 配置 JSON / 语言代码经 `payload` 交回)
@@ -541,9 +547,9 @@ typedef struct PluginxxConfigIface {
     );
 } PluginxxConfigIface;
 
-/* ==================== 接口表: 异步操作取消 (<应用名>.cancel) ==================== */
+/* ==================== 接口表: 异步操作取消 (<应用名>_plugin_cancel) ==================== */
 
-#define PLUGINXX_IFACE_CANCEL             PLUGINXX_APP_ID("cancel")
+#define PLUGINXX_IFACE_CANCEL             PLUGINXX_TABLE_ID("plugin_cancel")
 /// v3: 移出主程序业务的"指定键是否已取消"查询 (改由主程序业务表提供);
 /// 本表只保留通用的一处取消入口
 #define PLUGINXX_IFACE_CANCEL_VERSION     3
@@ -560,9 +566,9 @@ typedef struct PluginxxCancelIface {
     void(PLUGINXX_CALL* op_cancel)(PluginxxOperatorHandle* op);
 } PluginxxCancelIface;
 
-/* ==================== 接口表: JSON 辅助 (<应用名>.json) ==================== */
+/* ==================== 接口表: JSON 辅助 (<应用名>_plugin_json) ==================== */
 
-#define PLUGINXX_IFACE_JSON               PLUGINXX_APP_ID("json")
+#define PLUGINXX_IFACE_JSON               PLUGINXX_TABLE_ID("plugin_json")
 #define PLUGINXX_IFACE_JSON_VERSION     1
 #define PLUGINXX_IFACE_JSON_MIN_VERSION 1
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
@@ -585,9 +591,9 @@ typedef struct PluginxxJsonIface {
     );
 } PluginxxJsonIface;
 
-/* ==================== 接口表: 日志 (<应用名>.log) ==================== */
+/* ==================== 接口表: 日志 (<应用名>_plugin_log) ==================== */
 
-#define PLUGINXX_IFACE_LOG                PLUGINXX_APP_ID("log")
+#define PLUGINXX_IFACE_LOG                PLUGINXX_TABLE_ID("plugin_log")
 #define PLUGINXX_IFACE_LOG_VERSION     1
 #define PLUGINXX_IFACE_LOG_MIN_VERSION 1
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
@@ -601,9 +607,9 @@ typedef struct PluginxxLogIface {
              log)(const PluginxxHost* host, int32_t level, const PluginxxStringView* msg);
 } PluginxxLogIface;
 
-/* ==================== 接口表: 后台任务 (<应用名>.tasks) ==================== */
+/* ==================== 接口表: 后台任务 (<应用名>_plugin_tasks) ==================== */
 
-#define PLUGINXX_IFACE_TASKS              PLUGINXX_APP_ID("tasks")
+#define PLUGINXX_IFACE_TASKS              PLUGINXX_TABLE_ID("plugin_tasks")
 #define PLUGINXX_IFACE_TASKS_VERSION     1
 #define PLUGINXX_IFACE_TASKS_MIN_VERSION 1
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
