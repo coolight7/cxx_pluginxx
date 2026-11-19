@@ -427,13 +427,14 @@ struct PluginRuntime {
     /// 收束一个已接受 Operation，因此为这条故障路径提供最小互斥保护。
     mutable std::mutex                          operationsMutex;
     std::map<uint64_t, std::shared_ptr<OpCore>> operations;
+    /// 操作编号 (任意线程分配: 受理已经前移到调用线程)
+    std::atomic<uint64_t>                       nextOperationId{1};
     mutable std::mutex                          pendingMutex;
     std::deque<std::shared_ptr<RuntimeAction>>  pendingActions;
     /// 插件执行器停止期间保留的派发项 (与 io 那条队列分开, 恢复时各自重放)
     mutable std::mutex                          pendingPluginMutex;
     std::deque<std::shared_ptr<RuntimeAction>>  pendingPluginActions;
-    uint64_t                                    nextOperationId = 1;
-    uint64_t                                    nextGeneration  = 1;
+    uint64_t                                    nextGeneration = 1;
 
     /// 无主操作 (主程序自己发起、没有实例租约) 的句柄保活表
     ///

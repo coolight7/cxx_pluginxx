@@ -234,6 +234,59 @@ public:
     }
 
     // =====================================================================
+    // 受理与投递
+    // =====================================================================
+
+    /// 把"已经在调用线程上受理完"的操作交给工作体继续 (**任意线程可调用**)
+    ///
+    /// 四个提交即返回的入口 (`capabilities.invoke_*` / `scheduler.sleep` /
+    /// `scheduler.offload` / `tasks.register_task`) 的受理动作都在调用线程做完:
+    /// 建 Operation、取实例租约、登记句柄 —— 句柄立刻交回插件。之后需要 IO 线程
+    /// 状态的那部分 (能力链、定时器、工作池、登记表) 由 `body` 在 IO 线程执行。
+    ///
+    /// - 调用线程就是 IO 线程时直接执行 `body` (主程序自己发起 的调用、测试与
+    ///   嵌入方的旧路径都走这一支, 时序与改造前一致);
+    /// - `body` 抛出的异常一律转成失败完成包 ([OpCore::pluginFailure]), 不会留下
+    ///   一个"已经交出去但永远不会完成"的句柄;
+    /// - 投递不成功 (运行时不可用) 时同样以失败完成包收尾。
+    ///
+    /// - `return` 就是 `core` 的操作句柄, 调用方直接交给插件
+    template<typename Body>
+    PluginxxOperatorHandle* acceptOnIo(const std::shared_ptr<OpCore>& core, Body&& body) {
+        if (!core) {
+            return nullptr;
+        }
+        auto* handle = core->handle();
+        if (this->isIoThread()) {
+            try {
+                body();
+            } catch (const std::exception& e) {
+                core->pluginFailure(e.what());
+            } catch (...) {
+                core->pluginFailure("plugin operation failed");
+            }
+            return handle;
+        }
+        const bool queued = enqueueRuntimeAction(
+            this->runtime(),
+            [core, body = std::forward<Body>(body)]() mutable {
+                try {
+                    body();
+                } catch (const std::exception& e) {
+                    core->pluginFailure(e.what());
+                } catch (...) {
+                    core->pluginFailure("plugin operation failed");
+                }
+            },
+            /*retainWhenStopped=*/true
+        );
+        if (!queued) {
+            core->pluginFailure("plugin runtime is unavailable");
+        }
+        return handle;
+    }
+
+    // =====================================================================
     // capabilities 表 (声明 / 登记 / 撤销 / 调用 / 自省)
     // =====================================================================
 
@@ -460,13 +513,16 @@ public:
         inst->capabilityRegistrations.clear();
     }
 
-    /// 调用能力 (**IO 线程**; ABI 入口已把跨线程调用投递过来)
+    /// 调用能力 (**任意线程**: 受理在调用线程完成, 工作体在 IO 线程执行)
     /// - `phase` 为 0: 走完整链 before → impl → after; 否则只跑该阶段;
     /// - `after` 阶段倒序执行; 每一行各自持有提供者的执行 lease;
     /// - `timeoutMs` 是本次调用的超时 (<0 = 用声明里的值): 只对应用实现的能力生效
     ///   (插件行各有自己的超时语义);
-    /// - 完成通知经 [OpCore] 恒在 IO 线程发布 (即使插件同步 done);
-    /// - 真正拒绝 (没有声明 / 没有可用实现) 返回 NULL 并写 `error_out`, 此时不调用 `cb`。
+    /// - 返回非空即已受理: 句柄在调用线程上立即可用, 完成通知恒在调用方线程之外发布
+    ///   (IO 线程提交, 插件回调投回插件执行器);
+    /// - 只有"受理不了"才返回 NULL 并写 `error_out` (运行时不可用 / 调用方实例已收尾);
+    ///   "能力没声明 / 没有实现"是**业务失败**, 经完成通知以 `PLUGINXX_OPERATOR_FAILED`
+    ///   + 原因上报 —— 句柄已经交给插件, 收不回来。
     PluginxxOperatorHandle* invokeCapabilityAsync(
         InstanceT*               caller,
         const PluginxxScopeRef*  scope,
@@ -478,70 +534,24 @@ public:
         void*                    ud,
         PluginxxString*          error_out
     ) {
-        std::shared_ptr<CapabilityChain> chain;
-        std::shared_ptr<OpCore>          core;
+        if (!this->ioExecutor()) {
+            detail::setErrorString(error_out, "invoke_capability: missing IO executor");
+            return nullptr;
+        }
+        if (capability.empty()) {
+            detail::setErrorString(error_out, "invoke_capability: missing capability id");
+            return nullptr;
+        }
+        const std::string cap{capability};
+        const std::string args    = argsJson.empty() ? std::string{"{}"} : std::string{argsJson};
+        // 作用域: 调用方给的 scope 参与行过滤 (空 = 不过滤)
+        const std::string scopeId = (scope && pluginxx_scope_ref_ok(scope) && scope->id.data
+                                     && scope->id.size > 0)
+                                        ? std::string{scope->id.data, static_cast<size_t>(scope->id.size)}
+                                        : std::string{};
+        std::shared_ptr<InstanceT> owner;
+        std::shared_ptr<OpCore>    core;
         try {
-            if (!this->ioExecutor()) {
-                throw std::runtime_error(
-                    "invoke_capability: missing IO executor"
-                );
-            }
-            const std::string cap{capability};
-            // 作用域: 调用方给的 scope 参与行过滤 (空 = 不过滤)
-            const std::string scopeId
-                = (scope && pluginxx_scope_ref_ok(scope) && scope->id.data
-                   && scope->id.size > 0)
-                      ? std::string{scope->id.data, static_cast<size_t>(scope->id.size)}
-                      : std::string{};
-            const auto*       slot = capabilities_->slot(cap);
-            if (!slot) {
-                throw std::runtime_error(
-                    "invoke_capability: capability is not declared: " + cap
-                );
-            }
-            std::vector<CapabilityProvider> rows;
-            if (phase == 0) {
-                detail::appendStage(
-                    rows,
-                    *capabilities_,
-                    cap,
-                    CapabilityPhase_e::Before,
-                    false,
-                    scopeId
-                );
-                detail::appendStage(
-                    rows,
-                    *capabilities_,
-                    cap,
-                    CapabilityPhase_e::Impl,
-                    false,
-                    scopeId
-                );
-                detail::appendStage(
-                    rows,
-                    *capabilities_,
-                    cap,
-                    CapabilityPhase_e::After,
-                    true,
-                    scopeId
-                );
-            } else {
-                const auto wanted = static_cast<CapabilityPhase_e>(phase);
-                detail::appendStage(
-                    rows,
-                    *capabilities_,
-                    cap,
-                    wanted,
-                    wanted == CapabilityPhase_e::After,
-                    scopeId
-                );
-            }
-            if (rows.empty() && !slot->decl.declaredBy.empty()) {
-                throw std::runtime_error(
-                    "invoke_capability: capability has no implementation: " + cap
-                );
-            }
-            std::shared_ptr<InstanceT> owner;
             if (caller) {
                 owner = caller->template sharedSelf<InstanceT>();
                 if (!owner) {
@@ -549,83 +559,119 @@ public:
                         "invoke_capability: caller instance is unavailable"
                     );
                 }
+                // 调用方是插件时，这里挂的就是调用方自己的租约，且**允许它处于关闭中**:
+                // 插件在 stop 事务里仍要能调能力 (通知另一个插件撤销自己的资源)。
+                // 被调一方由每一行各自把关，不受此开关影响。
+                core = OpCore::create(
+                    this->runtime(),
+                    owner,
+                    nullptr,
+                    "capability " + cap,
+                    /*lifecycle=*/false,
+                    /*callerMayStop=*/true
+                );
+            } else {
+                // 调用方为空 = 主程序 (应用) 自己发起: 不挂任何实例租约
+                core = OpCore::createDetached(this->runtime(), "capability " + cap);
             }
-            // 调用方为空 = 主程序（应用）自己发起: 不挂任何实例租约
-            //
-            // 调用方是插件时，这里挂的就是调用方自己的租约，且**允许它处于关闭中**:
-            // 插件在 stop 事务里仍要能调能力 (通知另一个插件撤销自己的资源)。
-            // 被调一方由每一行各自把关，不受此开关影响。
-            const auto newOperation = [&](std::string label) {
-                return owner ? OpCore::create(
-                                   this->runtime(),
-                                   owner,
-                                   nullptr,
-                                   std::move(label),
-                                   /*lifecycle=*/false,
-                                   /*callerMayStop=*/true
-                               )
-                             : OpCore::createDetached(
-                                   this->runtime(),
-                                   std::move(label),
-                                   caller ? caller->template sharedSelf<InstanceT>()
-                                          : nullptr
-                               );
-            };
-            if (rows.empty()) {
-                /// 应用实现的能力（声明由应用给出、没有插件实现行）: 派发前把调用
-                /// 交给派生主程序转给应用（应用实现的能力就是这种）。完成与取消都
-                /// 复用同一套 Operation 协议。
-                core = newOperation("capability " + cap);
-                core->setCallback(cb, ud, true);
-                const std::string argsText{argsJson};
-                const int32_t     appTimeoutMs =
-                    timeoutMs >= 0 ? timeoutMs : slot->decl.timeoutMs;
-                OpDrive           appDrive;
-                appDrive.start = [this, caller, cap, argsText, appTimeoutMs](
-                                     const PluginxxOperatorNotify* notify,
-                                     PluginxxString*               errorOut
-                                 ) -> void* {
-                    return this->onAppCapabilityStart(
-                        caller, cap, argsText, appTimeoutMs, notify, errorOut
-                    );
-                };
-                appDrive.cancel = [this, caller, cap](void* handle) {
-                    this->onAppCapabilityCancel(caller, cap, handle);
-                };
-                std::string startError;
-                if (!core->start(std::move(appDrive), startError)) {
-                    detail::setErrorString(error_out, startError);
-                    return nullptr;
-                }
-                return core->handle();
-            }
-            // 外层操作只持有调用方的 lease: 一次调用是调用方的一次操作, 每一行
-            // 在启动时各自持有提供者的 lease (提供者卸载会挡住或跳过它)。
-            core = newOperation("capability " + cap);
-            chain             = std::make_shared<CapabilityChain>();
-            chain->host       = this;
-            chain->core       = core;
-            chain->caller     = owner;
-            chain->capability = cap;
-            chain->merge      = slot->decl.merge;
-            chain->rows       = std::move(rows);
-            chain->args
-                = argsJson.empty() ? std::string{"{}"} : std::string{argsJson};
-            core->setCallback(cb, ud, true);
-            core->accept([weak = std::weak_ptr<CapabilityChain>(chain)] {
-                if (auto self = weak.lock()) {
-                    self->cancelCurrent();
-                }
-            });
-            chain->startNext();
-            return core->handle();
+            core->setCallback(cb, ud, /*mayBeSyncBridge=*/true);
         } catch (const std::exception& e) {
-            if (core && !core->submitted()) {
-                core->reject();
-            }
             detail::setErrorString(error_out, e.what());
             return nullptr;
         }
+        return this->acceptOnIo(
+            core,
+            [this, core, owner, caller, cap, args, scopeId, phase, timeoutMs] {
+                const auto* slot = capabilities_->slot(cap);
+                if (!slot) {
+                    core->pluginFailure("invoke_capability: capability is not declared: " + cap);
+                    return;
+                }
+                std::vector<CapabilityProvider> rows;
+                if (phase == 0) {
+                    detail::appendStage(
+                        rows,
+                        *capabilities_,
+                        cap,
+                        CapabilityPhase_e::Before,
+                        false,
+                        scopeId
+                    );
+                    detail::appendStage(
+                        rows,
+                        *capabilities_,
+                        cap,
+                        CapabilityPhase_e::Impl,
+                        false,
+                        scopeId
+                    );
+                    detail::appendStage(
+                        rows,
+                        *capabilities_,
+                        cap,
+                        CapabilityPhase_e::After,
+                        true,
+                        scopeId
+                    );
+                } else {
+                    const auto wanted = static_cast<CapabilityPhase_e>(phase);
+                    detail::appendStage(
+                        rows,
+                        *capabilities_,
+                        cap,
+                        wanted,
+                        wanted == CapabilityPhase_e::After,
+                        scopeId
+                    );
+                }
+                if (rows.empty() && !slot->decl.declaredBy.empty()) {
+                    core->pluginFailure(
+                        "invoke_capability: capability has no implementation: " + cap
+                    );
+                    return;
+                }
+                if (rows.empty()) {
+                    /// 应用实现的能力（声明由应用给出、没有插件实现行）: 派发前把调用
+                    /// 交给派生主程序转给应用（应用实现的能力就是这种）。完成与取消都
+                    /// 复用同一套 Operation 协议。
+                    const int32_t appTimeoutMs = timeoutMs >= 0 ? timeoutMs : slot->decl.timeoutMs;
+                    OpDrive       appDrive;
+                    appDrive.start = [this, caller, cap, args, appTimeoutMs](
+                                         const PluginxxOperatorNotify* notify,
+                                         PluginxxString*               errorOut
+                                     ) -> void* {
+                        return this->onAppCapabilityStart(
+                            caller, cap, args, appTimeoutMs, notify, errorOut
+                        );
+                    };
+                    appDrive.cancel = [this, caller, cap](void* handle) {
+                        this->onAppCapabilityCancel(caller, cap, handle);
+                    };
+                    std::string startError;
+                    if (!core->startReportingFailure(std::move(appDrive), startError)) {
+                        // 已作为失败完成包上报 (句柄早就在调用线程交出去了)
+                        XX_LOGW("capability `{}` not started: {}", cap, startError);
+                    }
+                    return;
+                }
+                // 外层操作只持有调用方的 lease: 一次调用是调用方的一次操作, 每一行
+                // 在启动时各自持有提供者的 lease (提供者卸载会挡住或跳过它)。
+                auto chain        = std::make_shared<CapabilityChain>();
+                chain->host       = this;
+                chain->core       = core;
+                chain->caller     = owner;
+                chain->capability = cap;
+                chain->merge      = slot->decl.merge;
+                chain->rows       = std::move(rows);
+                chain->args       = args;
+                core->accept([weak = std::weak_ptr<CapabilityChain>(chain)] {
+                    if (auto self = weak.lock()) {
+                        self->cancelCurrent();
+                    }
+                });
+                chain->startNext();
+            }
+        );
     }
 
     /// 自省: 一条能力 (**IO 线程**; 未声明返回 [PLUGINXX_RESULT_ERR_NOT_DECLARED])
@@ -1102,7 +1148,9 @@ public:
     // scheduler 表 (睡眠 / 阻塞工作委托)
     // =====================================================================
 
-    /// 定时器睡眠 (**IO 线程**); 完成/取消/失败都经完成回调恰好一次上报
+    /// 定时器睡眠 (**任意线程**: 受理在调用线程完成, 定时器在 IO 线程建立)
+    /// - 完成/取消/失败都经完成回调恰好一次上报;
+    /// - 取消可能早于定时器建立: 状态里的 `canceled` 先置位, 工作体看到后直接以取消收尾。
     PluginxxOperatorHandle* sleep(
         InstanceT*               inst,
         int64_t                  ms,
@@ -1110,36 +1158,73 @@ public:
         void*                    ud,
         PluginxxString*          error_out
     ) {
-        if (!inst || !cb || !this->isIoThread()) {
-            detail::setErrorString(
-                error_out,
-                "scheduler sleep: invalid instance, callback, or thread"
-            );
+        if (!inst || !cb) {
+            detail::setErrorString(error_out, "scheduler sleep: invalid instance or callback");
             return nullptr;
         }
         if (ms < 0) {
             detail::setErrorString(error_out, "scheduler sleep: negative duration");
             return nullptr;
         }
-
         auto owner = inst->template sharedSelf<InstanceT>();
         if (!owner) {
             detail::setErrorString(error_out, "scheduler sleep: instance is unavailable");
             return nullptr;
         }
 
-        std::shared_ptr<OpCore> core;
+        /// 定时器只在 IO 线程建立与使用; 其它线程只置取消标记, 并把取消动作投回 IO
+        struct SleepState {
+            std::atomic<bool>                 canceled{false};
+            std::weak_ptr<asio::steady_timer> timer;
+        };
+
+        std::shared_ptr<OpCore>     core;
+        std::shared_ptr<SleepState> state;
         try {
-            core         = OpCore::create(this->runtime(), owner, nullptr, "scheduler sleep");
-            auto  timer  = std::make_shared<asio::steady_timer>(this->ioExecutor());
+            state = std::make_shared<SleepState>();
+            core  = OpCore::create(this->runtime(), owner, nullptr, "scheduler sleep");
             auto* handle = core->handle();
             core->setCallback(cb, ud);
             core->setCompletionHandler([owner, handle](int32_t, std::string_view) {
                 owner->sleepTimers.erase(handle);
             });
-            core->accept([timer] {
-                timer->cancel();
+            std::weak_ptr<PluginRuntime> weakRuntime = this->runtime();
+            core->accept([state, weakRuntime] {
+                // 取消可能从任意线程发起 (插件线程/IO 线程): 只置标记, 定时器由 IO 线程动
+                state->canceled.store(true, std::memory_order_release);
+                if (auto runtime = weakRuntime.lock()) {
+                    enqueueRuntimeAction(
+                        runtime,
+                        [state] {
+                            if (auto timer = state->timer.lock()) {
+                                timer->cancel();
+                            }
+                        },
+                        /*retainWhenStopped=*/true
+                    );
+                }
             });
+        } catch (const std::exception& e) {
+            if (core) {
+                core->reject();
+            }
+            detail::setErrorString(error_out, e.what());
+            return nullptr;
+        } catch (...) {
+            if (core) {
+                core->reject();
+            }
+            detail::setErrorString(error_out, "scheduler sleep: failed to create timer");
+            return nullptr;
+        }
+        return this->acceptOnIo(core, [this, core, owner, state, ms] {
+            if (state->canceled.load(std::memory_order_acquire)) {
+                core->pluginFailure("scheduler sleep: canceled");
+                return;
+            }
+            auto timer = std::make_shared<asio::steady_timer>(this->ioExecutor());
+            state->timer    = timer;
+            auto* handle    = core->handle();
             owner->sleepTimers.emplace(handle, handle->shared_from_this());
             timer->expires_after(std::chrono::milliseconds(ms));
             timer->async_wait([core, timer](const utilxx_base::AsioErrorCode& ec) {
@@ -1150,28 +1235,13 @@ public:
                     nullptr
                 );
             });
-            return handle;
-        } catch (const std::exception& e) {
-            if (core) {
-                owner->sleepTimers.erase(core->handle());
-                core->reject();
-            }
-            detail::setErrorString(error_out, e.what());
-            return nullptr;
-        } catch (...) {
-            if (core) {
-                owner->sleepTimers.erase(core->handle());
-                core->reject();
-            }
-            detail::setErrorString(error_out, "scheduler sleep: failed to create timer");
-            return nullptr;
-        }
+        });
     }
 
-    /// 阻塞工作委托到主程序工作线程池 (**IO 线程**)
+    /// 阻塞工作委托到主程序工作线程池 (**任意线程**: 受理在调用线程完成, 起跑在 IO 线程)
     /// - 工作体本身在工作线程执行 (显式例外), 完成通知经 OpCore 回到 IO 线程;
     /// - `work` 收到的取消令牌只在本次工作调用期间有效 (插件不得保存);
-    /// - 主程序无工作线程时立即以失败终结 (不静默丢工作)。
+    /// - 主程序无工作线程时以失败终结 (不静默丢工作, 也不阻塞调用线程)。
     PluginxxOperatorHandle* offload(
         InstanceT* inst,
         void*(PLUGINXX_CALL*
@@ -1181,11 +1251,8 @@ public:
         void*           ud,
         PluginxxString* error_out
     ) {
-        if (!inst || !work || !this->isIoThread()) {
-            detail::setErrorString(
-                error_out,
-                "scheduler offload: invalid instance, work, or thread"
-            );
+        if (!inst || !work) {
+            detail::setErrorString(error_out, "scheduler offload: invalid instance or work");
             return nullptr;
         }
 
@@ -1199,11 +1266,13 @@ public:
             void* value = nullptr;
         };
 
-        std::shared_ptr<OpCore> core;
+        std::shared_ptr<OpCore>     core;
+        std::shared_ptr<WorkResult> result;
+        std::shared_ptr<OffloadCancelState> cancelState;
         try {
             core             = OpCore::create(this->runtime(), owner, nullptr, "scheduler offload");
-            auto result      = std::make_shared<WorkResult>();
-            auto cancelState = std::make_shared<OffloadCancelState>();
+            result           = std::make_shared<WorkResult>();
+            cancelState      = std::make_shared<OffloadCancelState>();
             core->setCompletionHandler([owner, result, done, ud](int32_t status, std::string_view error) {
                 if (!done) {
                     return;
@@ -1226,48 +1295,6 @@ public:
             core->accept([cancelState] {
                 cancelState->requested.store(true, std::memory_order_release);
             });
-
-            const bool queued = [&]() {
-                if (!services_ || !services_->postToWorkerThread([core, result, cancelState, work, ud]() {
-                        PluginxxCancelToken token{&isOffloadCanceled, cancelState.get()};
-                        PluginxxString      workError{};
-                        int32_t             status = PLUGINXX_OPERATOR_OK;
-                        std::string         error;
-                        try {
-                            result->value = work(ud, &token, &workError);
-                            if (workError.data) {
-                                error.assign(workError.data, static_cast<size_t>(workError.size));
-                                status = PLUGINXX_OPERATOR_FAILED;
-                            }
-                            if (cancelState->requested.load(std::memory_order_acquire)) {
-                                status = PLUGINXX_OPERATOR_CANCELED;
-                            }
-                        } catch (const std::exception& e) {
-                            status = PLUGINXX_OPERATOR_FAILED;
-                            try {
-                                error = e.what();
-                            } catch (...) {
-                            }
-                        } catch (...) {
-                            status = PLUGINXX_OPERATOR_FAILED;
-                            error  = "plugin offload worker threw unknown exception";
-                        }
-                        hostMemoryFree(workError.data);
-                        auto notify = core->notify();
-                        auto view   = detail::abiView(error);
-                        notify.done(notify.host_ud, status, &view);
-                    })) {
-                    return false;
-                }
-                return true;
-            }();
-
-            if (!queued) {
-                auto notify = core->notify();
-                auto view   = detail::abiView("plugin offload: no thread pool");
-                notify.done(notify.host_ud, PLUGINXX_OPERATOR_FAILED, &view);
-            }
-            return core->handle();
         } catch (const std::exception& e) {
             if (core) {
                 core->reject();
@@ -1281,13 +1308,46 @@ public:
             detail::setErrorString(error_out, "scheduler offload: failed to create operation");
             return nullptr;
         }
+        return this->acceptOnIo(core, [this, core, result, cancelState, work, done, ud] {
+            if (!services_ || !services_->postToWorkerThread([core, result, cancelState, work, ud]() {
+                    PluginxxCancelToken token{&isOffloadCanceled, cancelState.get()};
+                    PluginxxString      workError{};
+                    int32_t             status = PLUGINXX_OPERATOR_OK;
+                    std::string         error;
+                    try {
+                        result->value = work(ud, &token, &workError);
+                        if (workError.data) {
+                            error.assign(workError.data, static_cast<size_t>(workError.size));
+                            status = PLUGINXX_OPERATOR_FAILED;
+                        }
+                        if (cancelState->requested.load(std::memory_order_acquire)) {
+                            status = PLUGINXX_OPERATOR_CANCELED;
+                        }
+                    } catch (const std::exception& e) {
+                        status = PLUGINXX_OPERATOR_FAILED;
+                        try {
+                            error = e.what();
+                        } catch (...) {
+                        }
+                    } catch (...) {
+                        status = PLUGINXX_OPERATOR_FAILED;
+                        error  = "plugin offload worker threw unknown exception";
+                    }
+                    hostMemoryFree(workError.data);
+                    auto notify = core->notify();
+                    auto view   = detail::abiView(error);
+                    notify.done(notify.host_ud, status, &view);
+                })) {
+                core->pluginFailure("plugin offload: no thread pool");
+            }
+        });
     }
 
     // =====================================================================
     // tasks 表 (后台任务托管)
     // =====================================================================
 
-    /// 托管一个后台任务 (**IO 线程**)
+    /// 托管一个后台任务 (**任意线程**: 受理全在调用线程完成, 不碰 IO 线程状态)
     /// - `cancel_fn`/`cancel_ud`: 卸载取消时主程序回调 (IO 线程, 协作式);
     /// - `notify`: 【出参】插件协程结束 (帧销毁后) 经 `notify.done` 恰好一次上报;
     /// - 返回主程序托管句柄 (失败 NULL + error_out); 句柄仅用于 `cancel_task`,
@@ -1304,9 +1364,8 @@ public:
         }
         std::shared_ptr<OpCore> core;
         try {
-            if (!inst || !notify || !this->isIoThread() || !this->acceptsRegistration(inst)) {
-                throw std::runtime_error("register_task: missing instance/notify or wrong IO thread"
-                );
+            if (!inst || !notify) {
+                throw std::runtime_error("register_task: missing instance or notify");
             }
             core = OpCore::create(
                 this->runtime(),

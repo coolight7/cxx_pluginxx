@@ -11,8 +11,9 @@
 ///   [hostMemorySetString]: C ABI 跨 CRT 堆内存操作与主程序堆字符串构造;
 /// - [getExecutableDirPath]: 跨平台可执行目录 helper (builtin:// 回退探测用)。
 ///
-/// 线程约定: 实例字段 (注册记录/依赖表) 仅 IO 线程读写; `enabled` 为普通布尔
-/// (调用方遵守线程约定), 驱动登记表用独立互斥 (允许任意线程取消)。
+/// 线程约定: 实例字段 (注册记录/依赖表) 仅 IO 线程读写; `enabled` 为原子布尔
+/// (插件线程受理操作时要读它), 操作登记表 ([recordsMutex]) 与驱动登记表
+/// 各用独立互斥 (允许任意线程建/取消)。
 #pragma once
 
 #include "asio/any_io_executor.hpp"
@@ -83,7 +84,11 @@ struct PluginInstanceBase {
     /// 内置插件 (合并编译进主程序二进制) 的 destroy 入口; 动态库插件为 nullptr
     /// (此时 destroy 由 [destroyPlugin] 经 [pluginDestroySymbol] 向动态库查找)
     PluginxxDestroyFn builtinUnload = nullptr;
-    bool              enabled       = true; ///< 是否启用 (禁用: 注册摘除/命令停用)
+    /// 是否启用 (禁用: 注册摘除/命令停用)
+    ///
+    /// 原子: 由 IO 线程写入, 插件线程受理操作 (`sleep`/`offload`/`register_task`/
+    /// 能力调用) 时要读它判"还能不能起新动作"。
+    std::atomic<bool> enabled{true};
     bool              userDisabled = false; ///< 是否被用户显式禁用 (区别于级联禁用)
     bool blockedByDependencies     = false; ///< 是否因必选依赖不可用而级联禁用
     bool unloadRequested           = false; ///< 已请求卸载 (防重复)
@@ -143,6 +148,11 @@ struct PluginInstanceBase {
         return lifecycleStop != nullptr && lifecycleStarted && !lifecycleStopped;
     }
 
+    /// 操作登记表 (句柄保活 / 完成端点 / 活动操作)
+    ///
+    /// 读写分处两条线程: 受理在调用线程 (插件线程), 收尾在 IO 线程, 因此一律在
+    /// [recordsMutex] 下访问。
+    mutable std::mutex                                                  recordsMutex;
     std::vector<std::shared_ptr<::PluginxxOperatorHandle>>              operatorHandles;
     std::vector<std::shared_ptr<::PluginxxOperationCompletionEndpoint>> completionEndpoints;
     std::vector<std::shared_ptr<::PluginxxOperatorHandle>>              outstandingOps;

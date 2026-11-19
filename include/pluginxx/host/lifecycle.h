@@ -695,7 +695,11 @@ public:
 
         /// 只请求取消，不删除活跃记录；终态提交负责唯一一次清理。
         /// 回调可能登记其他操作，因此遍历当前快照，避免 vector 迭代器失效。
-        const auto operations = inst->outstandingOps;
+        std::vector<std::shared_ptr<::PluginxxOperatorHandle>> operations;
+        {
+            std::lock_guard recordsLock(inst->recordsMutex);
+            operations = inst->outstandingOps;
+        }
         for (const auto& op : operations) {
             if (op && !op->completed.load(std::memory_order_acquire) && op->cancelFn) {
                 op->cancelFn();

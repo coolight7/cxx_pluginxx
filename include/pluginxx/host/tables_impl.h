@@ -17,7 +17,10 @@
 /// 解析框架控制块 (取实例/管理器 + admission lease) → 投递到 IO 线程 → 调用
 /// [PluginHostCore] 的同名方法; 业务数据一律由 [DomainServices] 提供。
 ///
-/// 线程约定: 入口可在任意线程调用 (内部投递并同步等待); 表结构体首次查询时构造,
+/// 线程约定: 入口可在任意线程调用。注册/写入类入口投递到 IO 线程并同步等待;
+/// 四个“提交即返回”的入口 (`capabilities.invoke_*` / `scheduler.sleep` /
+/// `scheduler.offload` / `tasks.register_task`) 在**调用线程受理** (句柄立即可用),
+/// 需要 IO 线程状态的工作体随后在 IO 线程执行。表结构体首次查询时构造,
 /// 之后只读, 因此可安全被多个插件线程并发查询。
 #pragma once
 
@@ -949,7 +952,6 @@ struct GenericTableEntries {
                 return static_cast<PluginxxOperatorHandle*>(nullptr);
             }
             // 跨边界视图只在本次调用内有效: 投递前复制为自有字符串
-            auto              keep = call;
             const std::string id   = svToStr(*capability_id);
             const std::string args = args_json ? svToStr(*args_json) : std::string{"{}"};
             PluginxxScopeRef  scopeCopy{};
@@ -957,22 +959,17 @@ struct GenericTableEntries {
             if (hasScope) {
                 scopeCopy = *scope;
             }
-            return ioCallSyncKeep<PluginxxOperatorHandle*>(
-                keep,
-                mgr,
-                [keep, hasScope, scopeCopy, id, args, phase, timeout_ms, cb, ud, error_out]() {
-                    return keep.manager()->invokeCapabilityAsync(
-                        keep.instance(),
-                        hasScope ? &scopeCopy : nullptr,
-                        id,
-                        args,
-                        phase,
-                        timeout_ms,
-                        cb,
-                        ud,
-                        error_out
-                    );
-                }
+            // 受理在调用线程完成 (句柄立即可用), 能力链在 IO 线程推进
+            return mgr->invokeCapabilityAsync(
+                inst,
+                hasScope ? &scopeCopy : nullptr,
+                id,
+                args,
+                phase,
+                timeout_ms,
+                cb,
+                ud,
+                error_out
             );
         });
     }
@@ -1054,15 +1051,8 @@ struct GenericTableEntries {
                 detail::setErrorString(error_out, "scheduler sleep: plugin runtime unavailable");
                 return static_cast<PluginxxOperatorHandle*>(nullptr);
             }
-            // sleep 自身会经 OpCore 获取实例执行 lease, 这里只需投递到 IO 线程
-            auto keep = call;
-            return ioCallSyncKeep<PluginxxOperatorHandle*>(
-                keep,
-                mgr,
-                [keep, ms, cb, ud, error_out]() {
-                    return keep.manager()->sleep(keep.instance(), ms, cb, ud, error_out);
-                }
-            );
+            // sleep 自身会在调用线程受理、在 IO 线程建定时器; 这里不再阻塞等 IO
+            return mgr->sleep(inst, ms, cb, ud, error_out);
         });
     }
 
@@ -1090,14 +1080,8 @@ struct GenericTableEntries {
                 detail::setErrorString(error_out, "scheduler offload: plugin runtime unavailable");
                 return static_cast<PluginxxOperatorHandle*>(nullptr);
             }
-            auto keep = call;
-            return ioCallSyncKeep<PluginxxOperatorHandle*>(
-                keep,
-                mgr,
-                [keep, work, done, ud, error_out]() {
-                    return keep.manager()->offload(keep.instance(), work, done, ud, error_out);
-                }
-            );
+            // offload 在调用线程受理, 工作亲在 IO 线程交给工作池; 这里不再阻塞等 IO
+            return mgr->offload(inst, work, done, ud, error_out);
         });
     }
 
@@ -1199,15 +1183,8 @@ struct GenericTableEntries {
             if (!mgr || !inst || !notify) {
                 return static_cast<PluginxxOperatorHandle*>(nullptr);
             }
-            auto keep = call;
-            return ioCallSyncKeep<PluginxxOperatorHandle*>(
-                keep,
-                mgr,
-                [keep, cancel_fn, cancel_ud, notify, error_out]() {
-                    return keep.manager()
-                        ->registerTask(keep.instance(), cancel_fn, cancel_ud, notify, error_out);
-                }
-            );
+            // 受理全在调用线程完成 (建 Operation + 填 notify), 不碰 IO 线程状态
+            return mgr->registerTask(inst, cancel_fn, cancel_ud, notify, error_out);
         });
     }
 

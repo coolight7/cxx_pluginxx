@@ -162,16 +162,20 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
                 operation->cancel();
             }
         };
-        core->id_ = core->runtime_->nextOperationId++;
+        core->id_ = core->runtime_->nextOperationId.fetch_add(1, std::memory_order_relaxed);
         try {
             std::lock_guard runtimeLock(core->runtime_->operationsMutex);
             core->runtime_->operations.emplace(core->id_, core);
             // ABI 句柄是调用方可持有的裸指针；活动索引移除后仍保留主程序
             // tombstone，迟到 cancel 只会观察 completed，不访问已释放对象。
+            //
+            // 登记表用实例互斥保护: 受理已经前移到调用线程 (插件线程), 收尾仍在 IO 线程。
+            std::lock_guard recordsLock(provider->recordsMutex);
             provider->operatorHandles.push_back(core->handle_);
             provider->outstandingOps.push_back(core->handle_);
             provider->completionEndpoints.push_back(core->completionEndpoint_);
             if (caller && caller != provider) {
+                std::lock_guard callerLock(caller->recordsMutex);
                 caller->operatorHandles.push_back(core->handle_);
                 caller->outstandingOps.push_back(core->handle_);
                 caller->completionEndpoints.push_back(core->completionEndpoint_);
@@ -218,7 +222,7 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
                 operation->cancel();
             }
         };
-        core->id_ = core->runtime_->nextOperationId++;
+        core->id_ = core->runtime_->nextOperationId.fetch_add(1, std::memory_order_relaxed);
         try {
             std::lock_guard runtimeLock(core->runtime_->operationsMutex);
             core->runtime_->operations.emplace(core->id_, core);
@@ -298,6 +302,14 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
     bool start(OpDrive drive, std::string& error) {
         prepareStart(std::move(drive));
         return finishStart(invokePluginStart(), error);
+    }
+
+    /// 与 [start] 相同, 但"没受理"按失败结果上报而不是静默 reject
+    ///
+    /// 用于句柄已经交给插件的入口 (受理前移到调用线程的能力调用等): 拿不回来, 只能当结果。
+    bool startReportingFailure(OpDrive drive, std::string& error) {
+        prepareStart(std::move(drive));
+        return finishStart(invokePluginStart(), error, /*reportWhenNotStarted=*/true);
     }
 
     /// 受理一次操作 (**IO 侧协程**): 插件那一半投递到插件执行器, 状态机仍在本线程
@@ -523,6 +535,18 @@ public:
         return {&OpCore::onEndpointDone, completionEndpoint_.get()};
     }
 
+    /// 以失败完成包终结 (**IO 线程**)
+    ///
+    /// 用于"句柄已经交给插件、但受理不了"的情形 (`sleep` / `offload` / `register_task` /
+    /// 能力调用在调用线程上已经返回了句柄): 这时不能 [reject] —— 那会静默收回句柄,
+    /// 插件的完成回调永远不会到, 等待方 (kit 的 awaiter / JS 的 Promise) 就挂住了。
+    /// 失败当结果上报, 插件侧把它当一次失败的调用处理。
+    void pluginFailure(std::string_view error) noexcept {
+        PluginxxStringView view{error.data(), static_cast<uint64_t>(error.size())};
+        auto               ntf = notify();
+        ntf.done(ntf.host_ud, PLUGINXX_OPERATOR_FAILED, &view);
+    }
+
     static void
         onDoneCore(OpCore* self, int32_t status, const PluginxxStringView* payload) noexcept {
         if (!self) {
@@ -656,7 +680,9 @@ private:
     }
 
     /// IO: 按插件结论推进状态机 (与原同步 start 的后半段逐字一致)
-    bool finishStart(StartOutcome outcome, std::string& error) {
+    ///
+    /// `reportWhenNotStarted`: 没受理时不是 [reject], 而是用 [pluginFailure] 上报失败。
+    bool finishStart(StartOutcome outcome, std::string& error, bool reportWhenNotStarted = false) {
         if (error.empty()) {
             error = std::move(outcome.error);
         }
@@ -669,6 +695,10 @@ private:
         } else if (!error.empty() || !providerHandle_) {
             if (error.empty()) {
                 error = "protocol violation: null operation without done/error";
+            }
+            if (reportWhenNotStarted) {
+                pluginFailure(error);
+                return false;
             }
             reject();
             return false;
@@ -799,6 +829,7 @@ private:
             if (eraseActive) {
                 auto erase = [this](const OpGuardPtr& guard) {
                     if (guard && guard->inst) {
+                        std::lock_guard recordsLock(guard->inst->recordsMutex);
                         std::erase(guard->inst->outstandingOps, handle_);
                     }
                 };

@@ -297,7 +297,9 @@ typedef struct PluginxxCapabilitiesIface {
 
     /// 调用能力 (**异步; 完成回调恰好一次**)
     /// - `args_json` 为空按 `{}` 处理; `phase` 为 0 表示走默认链 (before → impl → after);
-    /// - 真正拒绝 (能力不存在 / 没有可用实现) 返回 NULL 并写 `error_out`, 此时不调用 `cb`
+    /// - 受理在调用线程完成: 返回非 NULL 时句柄立即可用, 后续工作体在 io 线程执行;
+    /// - 只有"受理不了"才返回 NULL 并写 `error_out` (运行时不可用 / 调用方实例已收尾);
+    ///   能力不存在 / 没有实现是**结果失败** (`PLUGINXX_OPERATOR_FAILED` + 原因), 不是拒绝
     PluginxxOperatorHandle*(PLUGINXX_CALL* invoke_capability)(
         const PluginxxHost*       host,
         const PluginxxScopeRef*   scope,
@@ -413,6 +415,8 @@ typedef struct PluginxxSchedulerIface {
     int32_t(PLUGINXX_CALL* is_io_thread)(const PluginxxHost* host);
 
     /// 睡一段时间 (回调式异步: 到点回调, 期间不占线程)
+    ///
+    /// 受理在调用线程完成 (句柄立即可用), 定时器在 io 线程建立, 调用线程不等待。
     PluginxxOperatorHandle*(PLUGINXX_CALL* sleep)(
         const PluginxxHost*      host,
         int64_t                  ms,
@@ -422,6 +426,8 @@ typedef struct PluginxxSchedulerIface {
     );
 
     /// 把一段阻塞工作交给主程序线程池 (回调式异步)
+    ///
+    /// 受理在调用线程完成 (句柄立即可用), 交给工作池在 io 线程发生, 调用线程不等待。
     PluginxxOperatorHandle*(PLUGINXX_CALL* offload)(
         const PluginxxHost* host,
         void*(PLUGINXX_CALL*
@@ -641,10 +647,9 @@ typedef struct PluginxxTasksIface {
         PluginxxOperatorNotify*        notify,
         PluginxxString*                error_out
     );
-    /// 取消任务 (幂等; 仅限 io 线程调用, 或主程序内部经 ioCallSync 投递后调用)
-    /// - 与主程序 detachAll 内部路径一致; 句柄由主程序托管, 跨线程主动取消需经
-    ///   scheduler.request_driver / ioCallSync 回到 io 线程 (与注册类接口线程
-    ///   约束一致), 避免 handle->caller 裸指针跨线程反查实例
+    /// 取消任务 (幂等; 任意线程可调用)
+    /// - 与主程序 detachAll 内部路径一致; 句柄由主程序托管, 取消经 io 线程线性化
+    ///   (入口只投递, 不在此处反查实例), 因此插件线程可直接调用
     void(PLUGINXX_CALL* cancel_task)(PluginxxOperatorHandle* h);
 } PluginxxTasksIface;
 
