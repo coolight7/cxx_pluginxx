@@ -228,12 +228,15 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
         }
         // 没有实例替它保活句柄: 放进运行时的保活表 (已完成项在下一次扩展时清掉)
         auto& keep = core->runtime_->detachedHandles;
-        if (keep.size() >= PluginRuntime::kDetachedHandleKeep) {
-            std::erase_if(keep, [](const std::shared_ptr<PluginxxOperatorHandle>& handle) {
-                return handle && handle->completed.load(std::memory_order_acquire);
-            });
+        {
+            std::lock_guard keepLock(core->runtime_->detachedHandlesMutex);
+            if (keep.size() >= PluginRuntime::kDetachedHandleKeep) {
+                std::erase_if(keep, [](const std::shared_ptr<PluginxxOperatorHandle>& handle) {
+                    return handle && handle->completed.load(std::memory_order_acquire);
+                });
+            }
+            keep.push_back(core->handle_);
         }
-        keep.push_back(core->handle_);
         return core;
     }
 
@@ -272,9 +275,16 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
         return completionSubmitted_ && state() != PluginOperationState::Completed;
     }
 
-    void setCallback(PluginxxOperatorCallback cb, void* ud) noexcept {
-        callback_   = cb;
-        callbackUd_ = ud;
+    /// 登记完成回调
+    ///
+    /// `mayBeSyncBridge`: 回调与 `ud` 来自插件经 ABI 传来的表调用参数时传 true ——
+    /// 那种上下文按契约至少一个指针大小, 主程序可以读它的同步桥标记。主程序自己的
+    /// `sleep` / `offload` / `post` 等入口传 false: 它们的 `ud` 是插件的任意数据
+    /// (可能只有一个 `int` 大), 不能按指针读。
+    void setCallback(PluginxxOperatorCallback cb, void* ud, bool mayBeSyncBridge = false) noexcept {
+        callback_            = cb;
+        callbackUd_          = ud;
+        callbackMayBeBridge_ = mayBeSyncBridge;
     }
 
     /// 主程序已接受的 post/sleep/offload 可复用这个完成处理器。
@@ -427,10 +437,25 @@ private:
         }
         auto target = providerTarget();
         if (target && runtime_ && hasPluginExecutor(runtime_)) {
-            const bool queued = dispatchToPlugin(
+            // 投递到插件线程后才真正执行: 这段等待期间操作可能已经完成, 插件侧的
+            // cancel 句柄 (工具体里的 `Job` 一类) 已经随完成包释放 —— 那时不能再交给
+            // 插件 (否则是插件侧 use-after-free)。所以带上操作自身, 到时先复查终态。
+            //
+            // 复查用 [submitted] 而不是 `Completed`: 插件调 done 时就在它自己的线程上
+            // 置位 `completionSubmitted_` (随后才投递到 IO 提交终态), 而插件侧句柄是
+            // 在 done 之后随完成收尾释放的。这两个动作在插件线程上紧邻执行, 因此只要
+            // 这里看到 "done 已被接受" 就说明句柄不能再用了; 只看 `Completed` 会放过
+            // "done 已接受、IO 还没提交" 这段窗口 (实测 use-after-free)。
+            std::weak_ptr<OpCore> weakSelf = weak_from_this();
+            const bool            queued    = dispatchToPlugin(
                 target,
                 label_ + " cancel",
-                [cancel = std::move(cancel), handle]() mutable {
+                [cancel = std::move(cancel), handle, weakSelf]() mutable {
+                    auto self = weakSelf.lock();
+                    if (!self || self->submitted()
+                        || self->state() == PluginOperationState::Completed) {
+                        return;
+                    }
                     try {
                         cancel(handle);
                     } catch (const std::exception& e) {
@@ -685,6 +710,7 @@ private:
         providerHandle_ = nullptr;
         auto  callback  = std::exchange(callback_, nullptr);
         auto* ud        = std::exchange(callbackUd_, nullptr);
+        const bool mayBeBridge = std::exchange(callbackMayBeBridge_, false);
         /// 插件完成回调是**插件代码**: 配了插件执行器时投回去执行 (lease 在派发时取,
         /// 因此回调执行前不会 dlclose)。搬作体很快 (唤醒协程 / 置一个标志), 但它
         /// 可能就是插件自己的用户代码。
@@ -693,15 +719,25 @@ private:
             auto target = callbackTarget();
             // 同步桥 (kit 的 `tableOpSyncWait`): 调用方线程正阻塞等这次回调, 投回插件
             // 执行器就是自己等自己。就地调用 (完成线程上) 只跑唤醒体, 不跑插件业务。
-            if (target && runtime_ && hasPluginExecutor(runtime_) && !isSyncBridgeCallback(ud)) {
+            // 只有表调用传来的上下文才参与判定 (见 [setCallback])。
+            if (target && runtime_ && hasPluginExecutor(runtime_)
+                && !(mayBeBridge && isSyncBridgeCallback(ud))) {
                 auto callbackCopy = callback;
                 auto* udCopy      = ud;
                 auto  status      = completion_.status;
                 auto  payload     = completion_.payload;
+                // 回调执行期间继续持有本次操作的 lease: 插件代码在回调里可能碰自己的
+                // 状态, 因此不能因为 op 已提交终态就允许 dlclose。就地调用时这两个
+                // lease 本来就活到回调返回, 投递路径也保持同一语义 (闭包释放 = 回调
+                // 结束或投递失败)。
+                auto keepProvider = provider_;
+                auto keepCaller   = caller_;
                 callbackDispatched = dispatchToPlugin(
                     target,
                     label_ + " completion",
-                    [callbackCopy, udCopy, status, payload]() mutable {
+                    [callbackCopy, udCopy, status, payload, keepProvider, keepCaller]() mutable {
+                        (void)keepProvider;
+                        (void)keepCaller;
                         auto sv = PluginxxStringView{
                             payload.data(),
                             static_cast<uint64_t>(payload.size())
@@ -795,6 +831,8 @@ private:
     std::shared_ptr<PluginxxOperationCompletionEndpoint> completionEndpoint_;
     PluginxxOperatorCallback                             callback_   = nullptr;
     void*                                                callbackUd_ = nullptr;
+    /// `callbackUd_` 是表调用传来的上下文 (可按指针读同步桥标记)
+    bool                                                 callbackMayBeBridge_ = false;
     std::function<void(int32_t, std::string_view)>       completionHandler_;
     asio::steady_timer                                   finished_;
 };

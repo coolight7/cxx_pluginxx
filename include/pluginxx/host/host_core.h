@@ -576,7 +576,7 @@ public:
                 /// 交给派生主程序转给应用（应用实现的能力就是这种）。完成与取消都
                 /// 复用同一套 Operation 协议。
                 core = newOperation("capability " + cap);
-                core->setCallback(cb, ud);
+                core->setCallback(cb, ud, true);
                 const std::string argsText{argsJson};
                 const int32_t     appTimeoutMs =
                     timeoutMs >= 0 ? timeoutMs : slot->decl.timeoutMs;
@@ -611,7 +611,7 @@ public:
             chain->rows       = std::move(rows);
             chain->args
                 = argsJson.empty() ? std::string{"{}"} : std::string{argsJson};
-            core->setCallback(cb, ud);
+            core->setCallback(cb, ud, true);
             core->accept([weak = std::weak_ptr<CapabilityChain>(chain)] {
                 if (auto self = weak.lock()) {
                     self->cancelCurrent();
@@ -765,7 +765,7 @@ public:
                 = capabilities_->rowsOf(id, CapabilityPhase_e::Impl, scopeId);
             if (rows.empty()) {
                 core = OpCore::createDetached(this->runtime(), "point " + id);
-                core->setCallback(cb, ud);
+                core->setCallback(cb, ud, true);
                 core->accept();
                 auto             notify = core->notify();
                 std::string_view none{"null"};

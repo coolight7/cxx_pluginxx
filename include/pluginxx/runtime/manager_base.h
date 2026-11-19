@@ -270,6 +270,13 @@ public:
         return pluginxx::isRuntimePluginThread(runtime_);
     }
 
+    /// 插件代码的执行执行器 (未配独立插件线程时退回 io 执行器)
+    ///
+    /// 测试与嵌入方用它把“插件线程上已排队的活”跑完 (往它上面 post 一个哨兵再等)。
+    asio::any_io_executor pluginExecutor() const {
+        return pluginxx::pluginExecutionExecutor(runtime_);
+    }
+
     /// 插件回调耗时统计 (派发次数/平均值/超预算数/dropped)
     const pluginxx::PluginCallbackStats& pluginCallbackStats() const noexcept {
         return runtime_->callbackStats;

@@ -2453,15 +2453,16 @@ inline void finishIfDone(std::coroutine_handle<Promise> h) {
         // 桥接根: 完成/放弃的仲裁与帧销毁都收敛在 [BridgeRoot] 上。
         // - 先认领完成权: 主程序可能在放弃路径 (failAllRoots) 已上报过 FAILED,
         //   此时这里不得重复上报;
-        // - 再销毁帧 (幂等): 排队中的本地任务之后不会再恢复一个已销毁的帧;
-        // - 最后释放 op 句柄等资源 (与 notify 一样恰好一次)。
+        // - 上报终态**先于**销毁帧: 帧销毁会顺手释放 op 侧资源 (插件释放取消句柄),
+        //   而主程序把 done 当作已受理后不会再调取消 (见 OpCore 的取消协议),
+        //   两个动作在插件线程上紧邻执行, 因此 "提交 done" 必须先于 "释放取消句柄";
+        // - 最后销毁帧 (幂等): 排队中的本地任务之后不会再恢复一个已销毁的帧。
         const bool claimed = bridgeRoot->claimFinish();
+        if (claimed) {
+            bridgeRoot->notifyHost(status, payload);
+        }
         // destroyFrame 同时释放 op 侧资源 (幂等); 协程已挂在 final_suspend, 销毁安全。
         bridgeRoot->destroyFrame();
-        if (!claimed) {
-            return; // 主程序已在放弃路径上报过终态, 不重复上报
-        }
-        bridgeRoot->notifyHost(status, payload);
         return;
     }
 
@@ -4488,6 +4489,15 @@ inline detail::TableOpResult tableOpSyncWait(
 
 namespace detail {
 
+/// 阻塞读取"主程序自己实现"的表时的线程策略
+///
+/// 这些表 (`config` / `session` / `runtime` ...) 的工作体在主程序 io 上执行,
+/// 完成回调就是同步桥 (`invokeSyncBridge`)、就地在 io 上调用 —— 因此插件执行线程上
+/// 真等不会自己等自己。禁止的是"工作体会派回同一条插件线程"的调用 (能力/工具互调),
+/// 那些必须写 `co_await`。
+inline constexpr SyncWaitThreadPolicy kMainSideWaitPolicy
+    = SyncWaitThreadPolicy::allowOnPluginThread;
+
 /// [tableOpText] 的定义: 只取结果正文 (失败 = 空串)
 template<typename StartFn>
 std::string tableOpText(
@@ -4501,7 +4511,8 @@ std::string tableOpText(
         cancel,
         scheduler,
         std::forward<StartFn>(start),
-        0
+        0,
+        kMainSideWaitPolicy
     );
     return res.ok() ? std::string(res.text()) : std::string{};
 }
@@ -4519,7 +4530,8 @@ bool tableOpOk(
                cancel,
                scheduler,
                std::forward<StartFn>(start),
-               0
+               0,
+               kMainSideWaitPolicy
     )
         .ok();
 }
