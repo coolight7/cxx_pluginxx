@@ -826,6 +826,13 @@ public:
         }
         decl.cache           = detail::broadcastCacheOf(spec);
         decl.publish         = detail::broadcastPublishOf(spec);
+        /// 插件频道的默认发布者改成"任何人": 几个插件可以共用一条频道写同一个值
+        /// (声明里显式写 `"publish": "owner"` 的仍只有属主能发)。
+        /// 官方 `musicxx.*` 频道不走这里 (它们由应用声明, owner 为空)。
+        if (detail::jsonString(spec, "publish").empty()
+            && detail::isPluginScopedId(decl.id)) {
+            decl.publish = BroadcastPublisher_e::Anyone;
+        }
         decl.pushOnSubscribe = detail::jsonBool(spec, "pushOnSubscribe", false);
         decl.coalesce        = detail::jsonBool(spec, "coalesce", true);
         decl.scope           = detail::broadcastScopeOf(spec);
