@@ -700,10 +700,38 @@ inline bool destroyInstanceNoWait(
     }
 
     /// 完成端点: 插件可能稍后才 `done`, 因此这里只能有一份状态堆内存
+    ///
+    /// 关库必须等 destroy **入口返回**之后: 入口内部通常会 `notify->done(...)`,
+    /// 那一刻栈上还有插件的返回地址, 在 `done` 里 `dlclose` 会让紧接的返回落到
+    /// 已卸载的内存上 (实测 Windows 第二次确认时是 ``<Unloaded_xxx.dll>+偏移``)。
     struct DestroyOnce {
         std::shared_ptr<PluginInstanceBase> inst;
         std::function<void()>               onFinished;
-        std::atomic<bool>                   finished{false};
+        std::mutex                          mutex;
+        bool                                doneCalled    = false; // 插件已交完成
+        bool                                entryReturned = false; // destroy 入口已返回
+        bool                                finished      = false; // 收尾已做过
+
+        /// 两个条件都到齐才收尾 (关库 → 回调 → 自删); 由最后到场的调用方执行
+        void maybeFinish() {
+            bool run = false;
+            {
+                std::lock_guard lock(mutex);
+                if (doneCalled && entryReturned && !finished) {
+                    finished = true;
+                    run      = true;
+                }
+            }
+            if (!run) {
+                return;
+            }
+            inst->finishDestroy();
+            inst->closeLibraryHandle();
+            if (onFinished) {
+                onFinished();
+            }
+            delete this;
+        }
 
         static void PLUGINXX_CALL
             onDone(void* ud, int32_t status, const PluginxxStringView* payload) noexcept {
@@ -711,27 +739,27 @@ inline bool destroyInstanceNoWait(
             if (!self) {
                 return;
             }
-            if (!self->finished.exchange(true, std::memory_order_acq_rel)) {
-                if (status != PLUGINXX_OPERATOR_OK && payload && payload->data) {
-                    XX_LOGW(
-                        "Plugin `{}` destroy finished with failure: {}",
-                        self->inst->name,
-                        std::string(payload->data, static_cast<size_t>(payload->size))
-                    );
-                }
-                self->inst->finishDestroy();
-                self->inst->closeLibraryHandle();
-                if (self->onFinished) {
-                    self->onFinished();
-                }
+            if (status != PLUGINXX_OPERATOR_OK && payload && payload->data) {
+                XX_LOGW(
+                    "Plugin `{}` destroy finished with failure: {}",
+                    self->inst->name,
+                    std::string(payload->data, static_cast<size_t>(payload->size))
+                );
             }
-            delete self;
+            {
+                std::lock_guard lock(self->mutex);
+                if (self->doneCalled) {
+                    return; // 重复 done: 忽略, 不重复收尾
+                }
+                self->doneCalled = true;
+            }
+            self->maybeFinish();
         }
     };
 
-    auto* once = new DestroyOnce{inst, std::move(onFinished), false};
+    auto* once      = new DestroyOnce{inst, std::move(onFinished), {}, false, false, false};
     auto  destroyFn = inst->lifecycleDestroy;
-    auto ctx       = inst->pluginCtx;
+    auto  ctx       = inst->pluginCtx;
     const bool queued = dispatchToPlugin(
         inst,
         "plugin destroy",
@@ -750,6 +778,13 @@ inline bool destroyInstanceNoWait(
                 XX_LOGW("Plugin destroy threw unknown exception");
                 DestroyOnce::onDone(once, PLUGINXX_OPERATOR_FAILED, nullptr);
             }
+            // destroy 入口已返回: 栈上不再有插件代码, 此时才允许关库
+            // (`once` 到这里一定还在: `entryReturned` 只在这里置位, 所以 maybeFinish 还没跑过)
+            {
+                std::lock_guard lock(once->mutex);
+                once->entryReturned = true;
+            }
+            once->maybeFinish();
         },
         PluginDispatchOptions{.allowClosing = true, .retainWhenStopped = true, .measure = false}
     );

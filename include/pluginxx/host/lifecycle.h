@@ -664,14 +664,17 @@ public:
         // 清空实例表，否则最后一个 lease 释放后将失去可重试的关闭入口。
     }
 
-    /// 禁用插件 (级联禁用依赖者; 摘除注册; 投递 stop 撤销插件自管资源)
-    void disable(std::string_view name) {
-        disableImpl(name, /*userInitiated=*/true);
+    /// 禁用插件 (级联禁用依赖者; 摘除注册; 等 stop 事务真的走完)
+    /// - `return`: true = 已处于禁用态且事务完成 (含“本来就没启用”);
+    ///   false = 实例不存在 / 已在关闭 / stop 事务报错
+    asio::awaitable<bool> disable(std::string_view name) {
+        co_return co_await disableImpl(name, /*userInitiated=*/true);
     }
 
-    /// 启用插件 (先启用必选依赖, 再投递 start 让插件重新声明注册)
-    void enable(std::string_view name) {
-        enableImpl(name, /*userInitiated=*/true);
+    /// 启用插件 (先启用必选依赖, 再等 create 事务重新声明注册)
+    /// - `return`: true = 已处于启用态; false = 实例不存在 / 已在关闭 / create 失败
+    asio::awaitable<bool> enable(std::string_view name) {
+        co_return co_await enableImpl(name, /*userInitiated=*/true);
     }
 
     /// 摘除实例在主程序侧的**全部**注册 (通用登记 + 业务注册 + 实例专属资源所有权),
@@ -1284,14 +1287,17 @@ protected:
     /// - `userInitiated=true` 表示用户显式操作，会更新 `userDisabled`；
     /// - 级联（false）只维护 `blockedByDependencies`，不覆盖用户显式禁用标记。
     /// 依赖级联按直接依赖者递归，覆盖三级/菱形依赖。
-    void disableImpl(std::string_view name, bool userInitiated) {
+    asio::awaitable<bool> disableImpl(std::string_view name, bool userInitiated) {
         auto inst = this->find(name);
-        if (!inst || !inst->enabled) {
-            return;
+        if (!inst) {
+            co_return false;
+        }
+        if (!inst->enabled) {
+            co_return true;
         }
         if (inst->lifetime && inst->lifetime->closeRequested()) {
             // 已进入关闭流程: 不再接受启用状态变化，避免与 stop/destroy 交错。
-            return;
+            co_return false;
         }
         if (userInitiated) {
             inst->userDisabled          = true;
@@ -1313,28 +1319,44 @@ protected:
         );
 
         // 级联禁用依赖者: 只收集直接依赖者，再逐层递归，覆盖三级/菱形依赖。
+        bool ok = true;
         for (const auto& child :
              collectReverseRequiredDeps(this->plugins_, inst->name, /*onlyEnabled=*/true)) {
-            disableImpl(child, /*userInitiated=*/false);
+            if (!co_await disableImpl(child, /*userInitiated=*/false)) {
+                ok = false;
+            }
         }
 
-        // start/stop 事务（R5）：导出 stop 的插件必须收到 stop 才能撤销自管资源
-        // （订阅/线程/定时器）；同步入口把事务投递到本管理器 IO executor，
-        // 完成后状态保持 Disabled。
-        requestStopForDisable(inst);
+        // stop 事务：导出 stop 的插件必须收到 stop 才能撤销自管资源
+        // （订阅/线程/定时器）；完成后状态保持 Disabled。
+        co_await stopForDisable(inst);
+        // 主程序补充动作: 拆掉该实例在本程序侧的作用域（如拆挂载）
+        try {
+            co_await onInstanceDisabledAsync(inst);
+        } catch (const std::exception& e) {
+            XX_LOGE("{}Plugin `{}` disable hook threw: {}", logTag(), inst->name, e.what());
+            ok = false;
+        } catch (...) {
+            XX_LOGE("{}Plugin `{}` disable hook threw unknown", logTag(), inst->name);
+            ok = false;
+        }
+        co_return ok && !inst->enabled.load();
     }
 
-    void enableImpl(std::string_view name, bool userInitiated) {
+    asio::awaitable<bool> enableImpl(std::string_view name, bool userInitiated) {
         auto inst = this->find(name);
-        if (!inst || inst->enabled) {
-            return;
+        if (!inst) {
+            co_return false;
+        }
+        if (inst->enabled) {
+            co_return true;
         }
         if (inst->lifetime && inst->lifetime->closeRequested()) {
-            return;
+            co_return false;
         }
         if (!userInitiated && inst->userDisabled) {
-            // 用户显式禁用的插件不被级联恢复。
-            return;
+            // 用户显式禁用的插件不被级联恢复 (不是失败)。
+            co_return true;
         }
         // 先置位再递归: 既让注册复查通过，也让循环依赖不会无限递归。
         inst->enabled = true;
@@ -1346,120 +1368,46 @@ protected:
             inst->lifetime->setState(PluginInstanceState::Ready);
         }
 
-        // 先启用必选依赖: 子插件的 start 需要父插件的能力/工具已经可用。
+        // 先启用必选依赖: 子插件的 create 需要父插件的能力/工具已经可用。
+        bool ok = true;
         for (const auto& dep : inst->depends) {
-            enableImpl(dep, /*userInitiated=*/false);
+            if (!co_await enableImpl(dep, /*userInitiated=*/false)) {
+                ok = false;
+            }
         }
 
-        // 注册由插件 start 事务重新声明: 主程序只负责投递并处理结果 (失败则回到 Disabled)。
-        // 依赖本插件的那些实例在本次 start 完成后才启用 —— 它们的 start 往往
-        // 直接用本插件的能力/工具, 早跑会拿到“能力不存在” (见 [requestStartForEnable])。
-        requestStartForEnable(inst);
-        XX_LOGI(
-            "{}Plugin `{}` enabled ({})",
-            logTag(),
-            inst->name,
-            userInitiated ? "user" : "dependency"
-        );
+        // 注册由插件 create 事务重新声明: 主程序只负责驱动并处理结果 (失败则回到 Disabled)。
+        // 依赖本插件的那些实例在本次 create 完成后才启用 —— 它们的 create 往往
+        // 直接用本插件的能力/工具, 早跑会拿到“能力不存在” (见 [resumeDependents])。
+        try {
+            co_await startForEnable(inst);
+            // 主程序补充动作: 重新挂到作用域上 (作用域级注册都在插件的 mount 里)
+            if (inst->enabled) {
+                co_await onInstanceEnabledAsync(inst);
+            }
+            // create 成功才级联: 失败时本插件的注册已撤净, 子插件跟着启用也只会失败
+            co_await resumeDependents(inst);
+        } catch (const std::exception& e) {
+            XX_LOGE("{}Plugin `{}` enable threw: {}", logTag(), inst->name, e.what());
+            ok = false;
+        } catch (...) {
+            XX_LOGE("{}Plugin `{}` enable threw unknown", logTag(), inst->name);
+            ok = false;
+        }
+        co_return ok && inst->enabled.load();
     }
 
     /// 级联恢复因本插件被禁用而跟着停用的依赖者 (不覆盖用户显式禁用)
-    /// - 必须在被依赖那一方 start 成功之后调: 子插件的 start 通常就要用它的能力
-    void resumeDependents(const InstancePtr& inst) {
+    /// - 必须在被依赖那一方 create 成功之后调: 子插件的 create 通常就要用它的能力
+    asio::awaitable<void> resumeDependents(const InstancePtr& inst) {
         if (!inst || !inst->enabled) {
-            return;
+            co_return;
         }
         for (const auto& child :
              collectReverseRequiredDeps(this->plugins_, inst->name, /*onlyEnabled=*/false)) {
-            enableImpl(child, /*userInitiated=*/false);
+            (void)co_await enableImpl(child, /*userInitiated=*/false);
         }
-    }
-
-    /// 按需投递禁用事务: 拆作用域 (onInstanceDisabledAsync) 与补 stop 各有自己的
-    /// 前置判断, 所以这里不提前跳过 —— 没有 stop 要补的实例也可能挂着作用域需要拆。
-    void requestStopForDisable(const InstancePtr& inst) {
-        if (!inst) {
-            return;
-        }
-        auto self = selfRef();
-        try {
-            asio::co_spawn(
-                this->ioExecutor(),
-                [self, inst]() -> asio::awaitable<void> {
-                    co_await self->stopForDisable(inst);
-                    // 主程序补充动作: 禁用时拆掉该实例在本程序侧的作用域 (如拆挂载)
-                    co_await self->onInstanceDisabledAsync(inst);
-                },
-                [inst, tag = std::string{logTag()}](std::exception_ptr e) {
-                    if (!e) {
-                        return;
-                    }
-                    try {
-                        std::rethrow_exception(e);
-                    } catch (const std::exception& ex) {
-                        XX_LOGE("{}Plugin `{}` disable stop threw: {}", tag, inst->name, ex.what());
-                    } catch (...) {
-                        XX_LOGE("{}Plugin `{}` disable stop threw unknown", tag, inst->name);
-                    }
-                }
-            );
-        } catch (const std::exception& e) {
-            XX_LOGW(
-                "{}Plugin `{}` disable stop could not be scheduled: {}",
-                logTag(),
-                inst->name,
-                e.what()
-            );
-        }
-    }
-
-    /// 按需投递启用事务（导出 start 的插件）。
-    ///
-    /// 依赖本插件的实例在本事务结束后才级联启用: 它们的 start 往往直接使用
-    /// 本插件的能力/工具, 在本插件重新声明之前就跑会拿到“能力不存在”。
-    void requestStartForEnable(const InstancePtr& inst) {
-        if (!inst) {
-            return;
-        }
-        if (!inst->lifecycleCreate) {
-            // 没有 create 可投: 直接级联
-            resumeDependents(inst);
-            return;
-        }
-        auto self = selfRef();
-        try {
-            asio::co_spawn(
-                this->ioExecutor(),
-                [self, inst]() -> asio::awaitable<void> {
-                    co_await self->startForEnable(inst);
-                    // 主程序补充动作: 重新挂到作用域上 (作用域级注册都在插件的 mount 里)
-                    if (inst->enabled) {
-                        co_await self->onInstanceEnabledAsync(inst);
-                    }
-                    // start 成功才级联: 失败时本插件的注册已撤净, 子插件跟着启用也只会失败
-                    self->resumeDependents(inst);
-                },
-                [inst, tag = std::string{logTag()}](std::exception_ptr e) {
-                    if (!e) {
-                        return;
-                    }
-                    try {
-                        std::rethrow_exception(e);
-                    } catch (const std::exception& ex) {
-                        XX_LOGE("{}Plugin `{}` enable start threw: {}", tag, inst->name, ex.what());
-                    } catch (...) {
-                        XX_LOGE("{}Plugin `{}` enable start threw unknown", tag, inst->name);
-                    }
-                }
-            );
-        } catch (const std::exception& e) {
-            XX_LOGW(
-                "{}Plugin `{}` enable start could not be scheduled: {}",
-                logTag(),
-                inst->name,
-                e.what()
-            );
-        }
+        co_return;
     }
 
     asio::awaitable<bool>
