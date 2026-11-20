@@ -3577,77 +3577,6 @@ private:
 
 namespace detail {
 
-struct SleepAwaiter {
-    const PluginxxHost*           host;
-    const PluginxxSchedulerIface* sched;
-    /// 异步操作句柄的取消入口 (`cancel.op_cancel`)
-    const PluginxxCancelIface* cancel = nullptr;
-    /// 协程驱动桥 (主程序支持时为非空): 完成回调经它投递 continuation 并唤醒 driver。
-    PollOneBridge*          bridge = nullptr;
-    int64_t                 ms;
-    void*                   coroAddr  = nullptr;
-    PluginxxOperatorHandle* operation = nullptr;
-    std::string             error;
-
-    bool await_ready() noexcept {
-        if (ms <= 0) {
-            return true;
-        }
-        if (!sched || !sched->sleep) {
-            error = "scheduler sleep is unavailable";
-            return true;
-        }
-        return false;
-    }
-
-    template<typename Promise>
-    bool await_suspend(std::coroutine_handle<Promise> h) {
-        auto& p  = h.promise();
-        coroAddr = h.address();
-        PluginxxString errorOut{};
-        operation = sched->sleep(
-            host,
-            ms,
-            [](void* ud, int32_t status, const PluginxxStringView* payload) {
-                auto* self   = static_cast<SleepAwaiter*>(ud);
-                auto  handle = std::coroutine_handle<Promise>::from_address(self->coroAddr);
-                auto& prom   = handle.promise();
-                prom.clear_outstanding();
-                if (status == PLUGINXX_OPERATOR_CANCELED) {
-                    prom.set_exception(std::make_exception_ptr(CanceledException("sleep canceled")
-                    ));
-                } else if (status == PLUGINXX_OPERATOR_FAILED) {
-                    auto message = PluginStringView::str(payload);
-                    prom.set_exception(std::make_exception_ptr(
-                        std::runtime_error(message.empty() ? "sleep failed" : std::string(message))
-                    ));
-                }
-                // 桥接路径不在主程序回调栈内恢复协程 (见 [resumePluginCoroutine])。
-                resumePluginCoroutine(self->bridge, handle);
-            },
-            this,
-            &errorOut
-        );
-        if (!operation) {
-            error = PluginStringView::str(&errorOut);
-            PluginString::free(host, &errorOut);
-            return false;
-        }
-        p.set_outstanding([cancel = this->cancel, operation = this->operation]() {
-            if (cancel && cancel->op_cancel && operation) {
-                cancel->op_cancel(operation);
-            }
-        });
-        return true;
-    }
-
-    void await_resume() const {
-        if (!error.empty()) {
-            throw std::runtime_error(error);
-        }
-    }
-};
-
 struct YieldAwaiter {
     const PluginxxHost* host;
     /// 协程驱动桥: "让出" = 投递到本地执行器 + 唤醒 driver, 由下一次请求推进,
@@ -3667,106 +3596,466 @@ struct YieldAwaiter {
     void await_resume() const {}
 };
 
-template<typename WorkFn>
-struct OffloadAwaiter {
-    using ResultType = std::decay_t<std::invoke_result_t<WorkFn, const PluginxxCancelToken*>>;
-
-    const PluginxxHost*           host;
-    const PluginxxSchedulerIface* sched;
-    /// 异步操作句柄的取消入口 (`cancel.op_cancel`)
-    const PluginxxCancelIface* cancel = nullptr;
-    WorkFn                     work;
-    /// 协程驱动桥。**注意**: offload 的工作体本身仍运行在主程序工作线程池
-    /// (显式声明的例外), 只有"完成后的恢复"经桥回到 driver 序列。
-    PollOneBridge*     bridge = nullptr;
-    std::exception_ptr exPtr  = nullptr;
-    std::conditional_t<std::is_void_v<ResultType>, std::monostate, std::optional<ResultType>>
-                            result;
-    PluginxxOperatorHandle* operation = nullptr;
-    int32_t                 status    = PLUGINXX_OPERATOR_OK;
-    std::string             error;
-
-    bool await_ready() noexcept {
-        if (!sched || !sched->offload) {
-            error = "scheduler offload is unavailable";
-            return true;
-        }
-        return false;
-    }
-
-    template<typename Promise>
-    bool await_suspend(std::coroutine_handle<Promise> h) {
-        auto& p   = h.promise();
-        coroAddr_ = h.address();
-        PluginxxString errorOut{};
-        operation = sched->offload(
-            host,
-            [](void* ud, const PluginxxCancelToken* token, PluginxxString* error_out) -> void* {
-                auto* self = static_cast<OffloadAwaiter*>(ud);
-                try {
-                    if constexpr (std::is_void_v<ResultType>) {
-                        self->work(token);
-                    } else {
-                        self->result = self->work(token);
-                    }
-                } catch (const CanceledException&) {
-                    self->exPtr = std::current_exception();
-                } catch (...) {
-                    self->exPtr = std::current_exception();
-                }
-                (void)error_out;
-                return nullptr;
-            },
-            [](void* ud, int32_t status, void*, const PluginxxStringView* err) {
-                auto* self   = static_cast<OffloadAwaiter*>(ud);
-                self->status = status;
-                self->error  = PluginStringView::str(err);
-                auto  handle = std::coroutine_handle<Promise>::from_address(self->coroAddr_);
-                auto& prom   = handle.promise();
-                prom.clear_outstanding();
-                // 桥接路径: 恢复走 driver 序列 (不在主程序完成回调栈内重入插件协程)。
-                resumePluginCoroutine(self->bridge, handle);
-            },
-            this,
-            &errorOut
-        );
-        if (!operation) {
-            error = PluginStringView::str(&errorOut);
-            PluginString::free(host, &errorOut);
-            return false;
-        }
-        p.set_outstanding([cancel = this->cancel, operation = this->operation]() {
-            if (cancel && cancel->op_cancel && operation) {
-                cancel->op_cancel(operation);
-            }
-        });
-        return true;
-    }
-
-    ResultType await_resume() {
-        if (!error.empty() && status == PLUGINXX_OPERATOR_FAILED) {
-            throw std::runtime_error(error);
-        }
-        if (exPtr) {
-            std::rethrow_exception(exPtr);
-        }
-        if (status == PLUGINXX_OPERATOR_CANCELED) {
-            throw CanceledException("offload canceled");
-        }
-        if constexpr (!std::is_void_v<ResultType>) {
-            return std::move(*result);
-        }
-    }
-
-    void* coroAddr_ = nullptr;
-};
-
 enum class AwaiterState : uint32_t {
     INIT      = 0,
     CALLING   = 1,
     SUSPENDED = 2,
     COMPLETED = 3
 };
+
+/// 取一个主程序堆字符串出参并把内存还回去 (空出参得到空串)
+inline std::string takeHostError(const PluginxxHost* host, PluginxxString& s) {
+    std::string out;
+    if (s.data) {
+        out.assign(s.data, static_cast<size_t>(s.size));
+        PluginString::free(host, &s);
+    }
+    return out;
+}
+
+/// 一次 `sleep` 的提交状态 (**构造即提交**, 与 [TableOpState] 同一套唤醒协议)
+struct SleepState {
+    const PluginxxHost*        host   = nullptr;
+    const PluginxxCancelIface* cancel = nullptr;
+    /// 协程驱动桥 (完成回调经它恢复挂起的帧)
+    PollOneBridge*             bridge = nullptr;
+    std::atomic<AwaiterState>  state{AwaiterState::INIT};
+    /// 终态 (`PLUGINXX_OPERATOR_*`)
+    int32_t                 status = PLUGINXX_OPERATOR_OK;
+    /// 失败/取消原因 (终态非 OK 时有意义)
+    std::string             error;
+    /// 未受理原因 (非空 = 压根没开始计时)
+    std::string             startError;
+    PluginxxOperatorHandle* opHandle = nullptr;
+    void*                   coroAddr = nullptr;
+    void (*resumeEntry)(SleepState*) = nullptr;
+};
+
+/// `sleep` 的凭据 (**调用即提交**)
+///
+/// - `co_await sleep(ctx, 200)` 与以前写法一样;
+/// - 也可以先拿凭据、先干别的, 需要结果时再 `co_await`;
+/// - 多条并行用 [whenAll]; 完成后结果不会再重跑;
+/// - `cancel()` 是显式动作 (await 时抛 `CanceledException`)。
+class [[nodiscard]] SleepTicket {
+public:
+    /// 泛化入口 (`whenAll` 等) 需要的结果类型: sleep 没有返回值
+    using result_type = std::monostate;
+
+    SleepTicket() = default;
+
+    explicit SleepTicket(std::shared_ptr<SleepState> st) noexcept : st_(std::move(st)) {}
+
+    /// 主程序受理了这次计时 (false = 压根没开始, 原因在 `await_resume` 抛的文本里)
+    bool accepted() const noexcept {
+        return st_ && st_->startError.empty();
+    }
+
+    /// 已有结果 (为真时 `co_await` 不挂起)
+    bool done() const noexcept {
+        return !st_ || st_->state.load(std::memory_order_acquire) == AwaiterState::COMPLETED;
+    }
+
+    /// 请求取消 (协作式, 不等待; 终态仍通过 `co_await` 取)
+    void cancel() const noexcept {
+        if (st_ && st_->cancel && st_->cancel->op_cancel && st_->opHandle) {
+            st_->cancel->op_cancel(st_->opHandle);
+        }
+    }
+
+    /// 提交完不管 (计时照常结束, 没人看结果)
+    void forget() const noexcept {}
+
+    bool await_ready() const noexcept {
+        return done();
+    }
+
+    template<typename Promise>
+    bool await_suspend(std::coroutine_handle<Promise> h) {
+        auto st = st_;
+        if (!st) {
+            return false;
+        }
+        st->coroAddr    = h.address();
+        st->resumeEntry = +[](SleepState* s) {
+            auto handle = std::coroutine_handle<Promise>::from_address(s->coroAddr);
+            handle.promise().clear_outstanding();
+            resumePluginCoroutine(s->bridge, handle);
+        };
+
+        auto expected = AwaiterState::INIT;
+        if (!st->state.compare_exchange_strong(
+                expected,
+                AwaiterState::CALLING,
+                std::memory_order_acq_rel
+            )) {
+            // 已经有结果 (或已被别的协程接管): 不挂起, 当场取结果
+            return false;
+        }
+        auto installing = AwaiterState::CALLING;
+        if (!st->state.compare_exchange_strong(
+                installing,
+                AwaiterState::SUSPENDED,
+                std::memory_order_acq_rel
+            )) {
+            // 完成回调在安装期间到达: 结果已记下, 这里不挂起
+            return false;
+        }
+        h.promise().set_outstanding([st] {
+            if (st->cancel && st->cancel->op_cancel && st->opHandle) {
+                st->cancel->op_cancel(st->opHandle);
+            }
+        });
+        return true;
+    }
+
+    void await_resume() const;
+
+private:
+    std::shared_ptr<SleepState> st_;
+};
+
+/// 提交一次计时 (**立即开始**, 不等)
+inline SleepTicket submitSleep(
+    const PluginxxHost*           host,
+    const PluginxxSchedulerIface* sched,
+    const PluginxxCancelIface*    cancel,
+    PollOneBridge*                bridge,
+    int64_t                       ms
+) {
+    auto st    = std::make_shared<SleepState>();
+    st->host   = host;
+    st->cancel = cancel;
+    st->bridge = bridge;
+    if (ms <= 0) {
+        st->state.store(AwaiterState::COMPLETED, std::memory_order_release);
+        return SleepTicket{std::move(st)};
+    }
+    if (!sched || !sched->sleep) {
+        st->status     = PLUGINXX_OPERATOR_FAILED;
+        st->startError = "scheduler sleep is unavailable";
+        st->state.store(AwaiterState::COMPLETED, std::memory_order_release);
+        return SleepTicket{std::move(st)};
+    }
+
+    auto*          holder = new std::shared_ptr<SleepState>(st);
+    PluginxxString err{nullptr, 0};
+    st->opHandle = sched->sleep(
+        host,
+        ms,
+        [](void* ud, int32_t status, const PluginxxStringView* payload) {
+            auto* hp = static_cast<std::shared_ptr<SleepState>*>(ud);
+            auto  s  = *hp;
+            delete hp;
+
+            s->status = status;
+            if (payload && payload->data && payload->size > 0) {
+                s->error.assign(payload->data, static_cast<size_t>(payload->size));
+            }
+            // 状态规则与 [TableOpState] 一致: 只有"已经挂起"才恢复协程
+            auto expected = AwaiterState::INIT;
+            if (s->state.compare_exchange_strong(
+                    expected,
+                    AwaiterState::COMPLETED,
+                    std::memory_order_acq_rel
+                )) {
+                return;
+            }
+            auto installing = AwaiterState::CALLING;
+            if (s->state.compare_exchange_strong(
+                    installing,
+                    AwaiterState::COMPLETED,
+                    std::memory_order_acq_rel
+                )) {
+                return;
+            }
+            s->state.store(AwaiterState::COMPLETED, std::memory_order_release);
+            if (s->resumeEntry) {
+                s->resumeEntry(s.get());
+            }
+        },
+        holder,
+        &err
+    );
+    if (!st->opHandle) {
+        delete holder;
+        st->status     = PLUGINXX_OPERATOR_FAILED;
+        st->startError = takeHostError(host, err);
+        if (st->startError.empty()) {
+            st->startError = "plugin sleep was not accepted";
+        }
+        st->state.store(AwaiterState::COMPLETED, std::memory_order_release);
+    }
+    return SleepTicket{std::move(st)};
+}
+
+inline void SleepTicket::await_resume() const {
+    if (!st_) {
+        return;
+    }
+    if (!st_->startError.empty()) {
+        throw std::runtime_error(st_->startError);
+    }
+    if (st_->status == PLUGINXX_OPERATOR_CANCELED) {
+        throw CanceledException(st_->error.empty() ? "sleep canceled" : st_->error);
+    }
+    if (st_->status == PLUGINXX_OPERATOR_FAILED) {
+        throw std::runtime_error(st_->error.empty() ? "sleep failed" : st_->error);
+    }
+}
+
+/// `offload` 工作体的类型擦除基类 (工作体可能是只可移动的 lambda, 不能用 std::function)
+template<typename ResultT>
+struct OffloadWorkBase {
+    virtual ~OffloadWorkBase()                    = default;
+    virtual void run(const PluginxxCancelToken*) = 0;
+};
+
+/// 一次 `offload` 的提交状态
+///
+/// 工作体在**主程序工作池**线程上跑 (显式例外), 完成回调里再唤醒插件协程;
+/// 工作体与结果都由本结构拥有, 直到完成回调把它交还为止。
+template<typename ResultT>
+struct OffloadState {
+    using result_type = ResultT;
+
+    const PluginxxHost*        host   = nullptr;
+    const PluginxxCancelIface* cancel = nullptr;
+    PollOneBridge*             bridge = nullptr;
+    std::atomic<AwaiterState>  state{AwaiterState::INIT};
+    /// 工作体返回值 (void 时用 monostate 占位)
+    std::conditional_t<std::is_void_v<ResultT>, std::monostate, std::optional<ResultT>> result;
+    /// 工作体抛出的异常 (原样重抛)
+    std::exception_ptr      workError;
+    std::unique_ptr<OffloadWorkBase<ResultT>> work;
+    int32_t                 status = PLUGINXX_OPERATOR_OK;
+    std::string             error;
+    std::string             startError;
+    PluginxxOperatorHandle* opHandle = nullptr;
+    void*                   coroAddr = nullptr;
+    void (*resumeEntry)(OffloadState*) = nullptr;
+};
+
+template<typename ResultT, typename Fn>
+struct OffloadWork : OffloadWorkBase<ResultT> {
+    Fn                      fn;
+    OffloadState<ResultT>*  st = nullptr;
+
+    OffloadWork(Fn&& inFn, OffloadState<ResultT>* inState) :
+        fn(std::move(inFn)),
+        st(inState) {}
+
+    void run(const PluginxxCancelToken* token) override {
+        if constexpr (std::is_void_v<ResultT>) {
+            fn(token);
+        } else {
+            st->result = fn(token);
+        }
+    }
+};
+
+/// `offload` 的凭据 (**调用即提交**)
+///
+/// - `co_await offload(ctx, [&]{ ... })` 与以前写法一样;
+/// - 也可以先提交几条, 用 [whenAll] 一次等齐 (总耗时 = 最慢那条);
+/// - 工作体在主程序工作池线程上跑, 所以回调/工具体里可以放阻塞工作;
+/// - `cancel()` 是显式动作 (await 时抛 `CanceledException`)。
+template<typename ResultT>
+class [[nodiscard]] OffloadTicket {
+public:
+    /// 泛化入口 (`whenAll` 等) 需要的结果类型 (void 结果用 `monostate` 占位)
+    using result_type = std::conditional_t<std::is_void_v<ResultT>, std::monostate, ResultT>;
+
+    OffloadTicket() = default;
+
+    explicit OffloadTicket(std::shared_ptr<OffloadState<ResultT>> st) noexcept : st_(std::move(st)) {}
+
+    /// 主程序受理了这次提交 (false = 压根没开始, 原因在 `await_resume` 抛的文本里)
+    bool accepted() const noexcept {
+        return st_ && st_->startError.empty();
+    }
+
+    /// 已有结果 (为真时 `co_await` 不挂起)
+    bool done() const noexcept {
+        return !st_ || st_->state.load(std::memory_order_acquire) == AwaiterState::COMPLETED;
+    }
+
+    /// 请求取消 (协作式, 不等待; 终态仍通过 `co_await` 取)
+    void cancel() const noexcept {
+        if (st_ && st_->cancel && st_->cancel->op_cancel && st_->opHandle) {
+            st_->cancel->op_cancel(st_->opHandle);
+        }
+    }
+
+    /// 提交完不管 (工作照常跑, 没人看结果)
+    void forget() const noexcept {}
+
+    bool await_ready() const noexcept {
+        return done();
+    }
+
+    template<typename Promise>
+    bool await_suspend(std::coroutine_handle<Promise> h) {
+        auto st = st_;
+        if (!st) {
+            return false;
+        }
+        st->coroAddr    = h.address();
+        st->resumeEntry = +[](OffloadState<ResultT>* s) {
+            auto handle = std::coroutine_handle<Promise>::from_address(s->coroAddr);
+            handle.promise().clear_outstanding();
+            resumePluginCoroutine(s->bridge, handle);
+        };
+
+        auto expected = AwaiterState::INIT;
+        if (!st->state.compare_exchange_strong(
+                expected,
+                AwaiterState::CALLING,
+                std::memory_order_acq_rel
+            )) {
+            return false;
+        }
+        auto installing = AwaiterState::CALLING;
+        if (!st->state.compare_exchange_strong(
+                installing,
+                AwaiterState::SUSPENDED,
+                std::memory_order_acq_rel
+            )) {
+            return false;
+        }
+        h.promise().set_outstanding([st] {
+            if (st->cancel && st->cancel->op_cancel && st->opHandle) {
+                st->cancel->op_cancel(st->opHandle);
+            }
+        });
+        return true;
+    }
+
+    ResultT await_resume() {
+        if (st_) {
+            if (!st_->startError.empty()) {
+                throw std::runtime_error(st_->startError);
+            }
+            if (st_->workError) {
+                std::rethrow_exception(st_->workError);
+            }
+            if (st_->status == PLUGINXX_OPERATOR_CANCELED) {
+                throw CanceledException(st_->error.empty() ? "offload canceled" : st_->error);
+            }
+            if (st_->status == PLUGINXX_OPERATOR_FAILED) {
+                throw std::runtime_error(st_->error.empty() ? "offload failed" : st_->error);
+            }
+        }
+        if constexpr (std::is_void_v<ResultT>) {
+            return;
+        } else {
+            if (!st_ || !st_->result) {
+                return ResultT{};
+            }
+            return std::move(*st_->result);
+        }
+    }
+
+private:
+    std::shared_ptr<OffloadState<ResultT>> st_;
+};
+
+/// 提交一次阻塞工作 (**立即开始**; 工作体在主程序工作池线程上跑)
+template<typename WorkFn>
+inline auto submitOffload(
+    const PluginxxHost*           host,
+    const PluginxxSchedulerIface* sched,
+    const PluginxxCancelIface*    cancel,
+    PollOneBridge*                bridge,
+    WorkFn&&                      work
+) -> OffloadTicket<std::decay_t<std::invoke_result_t<WorkFn, const PluginxxCancelToken*>>> {
+    using ResultType = std::decay_t<std::invoke_result_t<WorkFn, const PluginxxCancelToken*>>;
+    using State      = OffloadState<ResultType>;
+
+    auto st    = std::make_shared<State>();
+    st->host   = host;
+    st->cancel = cancel;
+    st->bridge = bridge;
+
+    if (!sched || !sched->offload) {
+        st->status     = PLUGINXX_OPERATOR_FAILED;
+        st->startError = "scheduler offload is unavailable";
+        st->state.store(AwaiterState::COMPLETED, std::memory_order_release);
+        return OffloadTicket<ResultType>{std::move(st)};
+    }
+
+    st->work = std::make_unique<OffloadWork<ResultType, std::decay_t<WorkFn>>>(
+        std::forward<WorkFn>(work),
+        st.get()
+    );
+
+    // 主程序给 work 与 done 的是**同一个** user_data, 且 done 总在 work 之后:
+    // 堆上只留一份持有者, 由 done 回调释放 (work 只借用)。
+    auto* holder = new std::shared_ptr<State>(st);
+    PluginxxString err{nullptr, 0};
+    st->opHandle = sched->offload(
+        host,
+        [](void* ud, const PluginxxCancelToken* token, PluginxxString* error_out) -> void* {
+            auto* hp = static_cast<std::shared_ptr<State>*>(ud);
+            auto  s  = *hp;
+            try {
+                if (s->work) {
+                    s->work->run(token);
+                }
+            } catch (...) {
+                s->workError = std::current_exception();
+            }
+            // 工作体已返回才释放它 (工作体自身可能就在它里面)
+            s->work.reset();
+            if (error_out) {
+                *error_out = PluginxxString{nullptr, 0};
+            }
+            return nullptr;
+        },
+        [](void* ud, int32_t status, void*, const PluginxxStringView* errView) {
+            auto* hp = static_cast<std::shared_ptr<State>*>(ud);
+            auto  s  = *hp;
+            delete hp;
+
+            s->status = status;
+            s->error  = PluginStringView::str(errView);
+            // 状态规则与 [TableOpState] 一致: 只有"已经挂起"才恢复协程
+            auto expected = AwaiterState::INIT;
+            if (s->state.compare_exchange_strong(
+                    expected,
+                    AwaiterState::COMPLETED,
+                    std::memory_order_acq_rel
+                )) {
+                return;
+            }
+            auto installing = AwaiterState::CALLING;
+            if (s->state.compare_exchange_strong(
+                    installing,
+                    AwaiterState::COMPLETED,
+                    std::memory_order_acq_rel
+                )) {
+                return;
+            }
+            s->state.store(AwaiterState::COMPLETED, std::memory_order_release);
+            if (s->resumeEntry) {
+                s->resumeEntry(s.get());
+            }
+        },
+        holder,
+        &err
+    );
+    if (!st->opHandle) {
+        delete holder;
+        st->work       = nullptr;
+        st->status     = PLUGINXX_OPERATOR_FAILED;
+        st->startError = takeHostError(host, err);
+        if (st->startError.empty()) {
+            st->startError = "plugin offload was not accepted";
+        }
+        st->state.store(AwaiterState::COMPLETED, std::memory_order_release);
+    }
+    return OffloadTicket<ResultType>{std::move(st)};
+}
 
 struct InvokeCapState {
     const PluginxxHost*              host = nullptr;
@@ -3975,16 +4264,6 @@ private:
     }
 };
 
-/// 取一个主程序堆字符串出参并把内存还回去 (空出参得到空串)
-inline std::string takeHostError(const PluginxxHost* host, PluginxxString& s) {
-    std::string out;
-    if (s.data) {
-        out.assign(s.data, static_cast<size_t>(s.size));
-        PluginString::free(host, &s);
-    }
-    return out;
-}
-
 /// 表调用在等待期间共享的状态 (堆上持有: 完成回调与 ticket 各持一份)
 ///
 /// 调用在构造 ticket 时就提交了, 因此协程可能在**任何时刻**装进来等结果; 这里用
@@ -4033,6 +4312,9 @@ struct TableOpState {
 ///   能取到正文。
 class [[nodiscard]] TableOpTicket {
 public:
+    /// 泛化入口 (`whenAll` 等) 需要的结果类型
+    using result_type = detail::TableOpResult;
+
     TableOpTicket() = default;
 
     /// 由 [tableOp] 构造 (业务代码写 `tableOp(ctx, ...)` 即可)
@@ -4197,18 +4479,20 @@ inline TableOpTicket submitTableOp(
 
 } // namespace detail
 
-/// 主程序计时器适配 (非轮询): 计时器到期时主程序回调 adapter, adapter 把 continuation
-/// 投递到本地执行器并 [detail::PollOneBridge::wake]; continuation 由下一次 driver
-/// 推进, 因此既不需要额外线程, 也不占用主程序 IO 线程执行插件工作。
+/// 主程序计时器适配 (**提交即开始计时**): 到期时主程序回调适配器, 适配器把
+/// continuation 投递到本地执行器并 [detail::PollOneBridge::wake], 由下一次 driver 推进。
+///
+/// - 返回值是凭据 (`SleepTicket`), 可直接 `co_await`, 也可以先提交几条再用 [whenAll] 等齐;
+/// - `ms <= 0` 当场完成 (`co_await` 不挂起)。
 template<typename Ctx>
-inline detail::SleepAwaiter sleep(const Ctx& ctx, int64_t ms) noexcept {
-    return detail::SleepAwaiter{
+inline detail::SleepTicket sleep(const Ctx& ctx, int64_t ms) noexcept {
+    return detail::submitSleep(
         ctx.host,
         ctx.iface.scheduler,
         ctx.iface.cancel,
         &ctx.bridge(),
         ms
-    };
+    );
 }
 
 /// 让出一轮 (等价于"下一位"): 投递 continuation + 唤醒 driver,
@@ -4218,17 +4502,21 @@ inline detail::YieldAwaiter yield(const Ctx& ctx) noexcept {
     return detail::YieldAwaiter{ctx.host, &ctx.bridge()};
 }
 
-/// 阻塞工作委托 (主程序工作线程池): **显式例外**, 工作体本身不在 driver 序列里运行;
-/// 完成后的恢复仍回到 driver 序列 (见 [detail::OffloadAwaiter])。
+/// 阻塞工作委托 (**提交即开始**; 主程序工作线程池): **显式例外**, 工作体本身不在
+/// driver 序列里运行; 完成后的恢复仍回到 driver 序列 (见 [detail::OffloadTicket])。
+///
+/// - 返回值是凭据 (`OffloadTicket<R>`), 可直接 `co_await`, 也可以先提交几条再用
+///   [whenAll] 等齐 (总耗时 = 最慢那条);
+/// - 工作体抛出的异常原样重抛给 `co_await` 处。
 template<typename Ctx, typename WorkFn>
 inline auto offload(const Ctx& ctx, WorkFn&& work) {
-    return detail::OffloadAwaiter<std::decay_t<WorkFn>>{
+    return detail::submitOffload(
         ctx.host,
         ctx.iface.scheduler,
         ctx.iface.cancel,
-        std::forward<WorkFn>(work),
-        &ctx.bridge()
-    };
+        &ctx.bridge(),
+        std::forward<WorkFn>(work)
+    );
 }
 
 template<typename Ctx>
@@ -4300,11 +4588,40 @@ inline detail::TableOpTicket tableOp(const Ctx& ctx, StartFn&& start) {
     );
 }
 
-/// 等一批**已提交**的表调用全部完成 (总耗时 = 最慢的那条)
+namespace detail {
+
+/// 收一条已提交 ticket 的结果; 抛异常只记下第一条, 不打断其余条目
 ///
-/// - 参数是已经提交的 ticket (`tableOp(...)` 一调用就开始了), 这里只按顺序收结果,
-///   不会把它们串起来执行;
-/// - 返回的结果与传入顺序一一对应; 某条未受理 / 失败 / 取消不影响其余条目;
+/// `result_type` 与 `await_resume()` 的差异 (void 结果用 `monostate` 占位) 在这里抹平。
+template<typename TicketT>
+inline Task<typename TicketT::result_type>
+    takeTicket(TicketT ticket, std::exception_ptr& firstError) {
+    using ResultT = typename TicketT::result_type;
+    try {
+        if constexpr (std::is_void_v<decltype(std::declval<TicketT&>().await_resume())>) {
+            co_await std::move(ticket);
+            co_return ResultT{};
+        } else {
+            co_return co_await std::move(ticket);
+        }
+    } catch (...) {
+        if (!firstError) {
+            firstError = std::current_exception();
+        }
+        if constexpr (!std::is_void_v<decltype(std::declval<TicketT&>().await_resume())>) {
+            co_return ResultT{};
+        }
+    }
+}
+
+} // namespace detail
+
+/// 等一批**已提交**的表调用 / `offload` / `sleep` 全部完成 (总耗时 = 最慢的那条)
+///
+/// - 参数是已经提交的 ticket (`tableOp(...)` / `offload(...)` / `sleep(...)` 一调用
+///   就开始了), 这里只按顺序收结果, 不会把它们串起来执行;
+/// - 返回的结果与传入顺序一一对应;
+/// - 某条抛异常 (失败/取消) 不影响其余条目把工作做完, 全部条目结束后重抛第一个异常;
 /// - 用法:
 /// ```cpp
 /// std::vector<TableOpTicket> tickets;
@@ -4314,11 +4631,59 @@ inline detail::TableOpTicket tableOp(const Ctx& ctx, StartFn&& start) {
 /// ```
 /// - 返回 `pluginxx::Task<...>` (本包的协程类型, 不是 asio 的 awaitable —— 插件协程帧
 ///   没有 asio executor), 只能在插件协程里 `co_await`。
-inline Task<std::vector<TableOpResult>> whenAll(std::vector<TableOpTicket> tickets) {
-    std::vector<TableOpResult> results;
+template<typename TicketT>
+inline Task<std::vector<typename TicketT::result_type>> whenAll(std::vector<TicketT> tickets) {
+    std::vector<typename TicketT::result_type> results;
     results.reserve(tickets.size());
+    std::exception_ptr firstError;
     for (auto& ticket : tickets) {
-        results.push_back(co_await ticket);
+        results.push_back(co_await detail::takeTicket(std::move(ticket), firstError));
+    }
+    if (firstError) {
+        std::rethrow_exception(firstError);
+    }
+    co_return results;
+}
+
+namespace detail {
+
+/// 按 index 序列逐条取结果 (**从左到右**保证: 花括号初始化列表的求值顺序是确定的)
+template<typename ResultTuple, typename... Tickets, size_t... Is>
+inline Task<ResultTuple> takeAllInto(
+    std::index_sequence<Is...>,
+    std::exception_ptr&        firstError,
+    Tickets&&... tickets
+) {
+    ResultTuple out{};
+    (void)std::initializer_list<int>{
+        (std::get<Is>(out) = co_await takeTicket(std::forward<Tickets>(tickets), firstError), 0)...
+    };
+    co_return out;
+}
+
+} // namespace detail
+
+/// 等几条**不同类**的已提交 ticket (变参: 表调用 / `offload` / `sleep` 可混用)
+///
+/// - 返回 `Task<std::tuple<...>>`, 与传入顺序一一对应;
+/// - 同样的"先全部提交再一起等"语义: 总耗时 = 最慢那条;
+/// - 某条抛异常时, 其余条目仍会被等到 (它们已在跑), 之后重抛第一个异常。
+template<typename First, typename... Rest>
+    requires(sizeof...(Rest) >= 1)
+inline Task<std::tuple<typename std::decay_t<First>::result_type,
+                       typename std::decay_t<Rest>::result_type...>>
+    whenAll(First&& first, Rest&&... rest) {
+    using ResultTuple = std::tuple<typename std::decay_t<First>::result_type,
+                                   typename std::decay_t<Rest>::result_type...>;
+    std::exception_ptr firstError;
+    auto               results = co_await detail::takeAllInto<ResultTuple>(
+        std::index_sequence_for<First, Rest...>{},
+        firstError,
+        std::forward<First>(first),
+        std::forward<Rest>(rest)...
+    );
+    if (firstError) {
+        std::rethrow_exception(firstError);
     }
     co_return results;
 }
