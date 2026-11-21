@@ -1182,7 +1182,16 @@ public:
         std::shared_ptr<SleepState> state;
         try {
             state = std::make_shared<SleepState>();
-            core  = OpCore::create(this->runtime(), owner, nullptr, "scheduler sleep");
+            // callerMayStop: 插件在自己的 stop 事务里仍可能要延时重试 / 退避,
+            // 这类操作也算清理的一部分 (lease 计入 inflight, 卸载会等它结束)
+            core = OpCore::create(
+                this->runtime(),
+                owner,
+                nullptr,
+                "scheduler sleep",
+                /*lifecycle=*/false,
+                /*callerMayStop=*/true
+            );
             auto* handle = core->handle();
             core->setCallback(cb, ud);
             core->setCompletionHandler([owner, handle](int32_t, std::string_view) {
@@ -1270,7 +1279,16 @@ public:
         std::shared_ptr<WorkResult> result;
         std::shared_ptr<OffloadCancelState> cancelState;
         try {
-            core             = OpCore::create(this->runtime(), owner, nullptr, "scheduler offload");
+            // callerMayStop: 关闭期的清理常常就是一段阻塞工作 (关文件 / 杀子进程 /
+            // 同步存储), 这类操作也算清理的一部分 (lease 计入 inflight, 卸载会等它结束)
+            core = OpCore::create(
+                this->runtime(),
+                owner,
+                nullptr,
+                "scheduler offload",
+                /*lifecycle=*/false,
+                /*callerMayStop=*/true
+            );
             result           = std::make_shared<WorkResult>();
             cancelState      = std::make_shared<OffloadCancelState>();
             core->setCompletionHandler([owner, result, done, ud](int32_t status, std::string_view error) {
@@ -1367,11 +1385,16 @@ public:
             if (!inst || !notify) {
                 throw std::runtime_error("register_task: missing instance or notify");
             }
+            // callerMayStop: 关闭期的清理协程最常用的就是"入口返回、任务继续跑"
+            // (`ctx.spawn` + `finishLater`)。这类任务也拿到 lease, 卸载的 inflight
+            // 等待因此必然覆盖到它; 实例进入 Closed 后仍拒。
             core = OpCore::create(
                 this->runtime(),
                 inst->template sharedSelf<InstanceT>(),
                 nullptr,
-                "background task"
+                "background task",
+                /*lifecycle=*/false,
+                /*callerMayStop=*/true
             );
             core->accept([cancel_fn, cancel_ud] {
                 if (cancel_fn) {

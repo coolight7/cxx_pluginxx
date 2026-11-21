@@ -1044,7 +1044,9 @@ struct GenericTableEntries {
         PluginxxString*          error_out
     ) {
         return guardVtableCall<PluginxxOperatorHandle*>(nullptr, [&]() {
-            auto call = enterHost(host);
+            // 关闭中仍受理: stop 事务里的清理协程常用“入口立刻返回、后台继续收尾”,
+            // 那条协程要能 sleep。租约按 lifecycle 放宽到 Closing, Closed 仍拒绝。
+            auto call = enterHost(host, /*allowClosing=*/true);
             auto mgr  = call.manager();
             auto inst = call.instance();
             if (!mgr || !inst || !cb) {
@@ -1073,7 +1075,8 @@ struct GenericTableEntries {
         PluginxxString* error_out
     ) {
         return guardVtableCall<PluginxxOperatorHandle*>(nullptr, [&]() {
-            auto call = enterHost(host);
+            // 关闭中仍受理: 关闭期的清理常常要等一次阻塞工作 (join 自有线程前先收尾)。
+            auto call = enterHost(host, /*allowClosing=*/true);
             auto mgr  = call.manager();
             auto inst = call.instance();
             if (!mgr || !inst || !work) {
@@ -1177,7 +1180,10 @@ struct GenericTableEntries {
         PluginxxString*                error_out
     ) {
         return guardVtableCall<PluginxxOperatorHandle*>(nullptr, [&]() {
-            auto call = enterHost(host);
+            // 关闭中仍受理: `finishLater(notify)` + `ctx.spawn(...)` 是 stop/destroy
+            // 入口的标准写法 (入口立刻返回, 清理协程继续跑)。这类任务的 lease 计入
+            // inflight, 卸载的“等 inflight 归零”因此会等它跑完; Closed 仍拒绝。
+            auto call = enterHost(host, /*allowClosing=*/true);
             auto mgr  = call.manager();
             auto inst = call.instance();
             if (!mgr || !inst || !notify) {
