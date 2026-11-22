@@ -3335,15 +3335,16 @@ public:
         }
     }
 
-    void init(const PluginxxHost* h) {
+    /// 绑定主程序句柄与接口表 (同步; 只做字段赋值)
+    ///
+    /// 与业务初始化分开的原因: create 事务要 `co_await` 业务初始化 (例如订阅广播),
+    /// 而 `spawn` 本身就依赖 `host` / `iface`, 所以绑定必须先同步完成。
+    void attachHost(const PluginxxHost* h) {
         host         = h;
         iface        = IfacesT::query(h);
         log.host     = h;
         log.logIface = iface.log;
         log.logFn    = (iface.log && iface.log->log) ? iface.log->log : nullptr;
-
-        // 业务挂钩: 由主程序侧派生基类补齐 (如在此订阅域内的轮次开始事件)
-        onHostReady();
     }
 
     /// 主程序配置 JSON (失败给 `{}`)
@@ -3559,11 +3560,14 @@ public:
         detail::spawnTaskImpl(self, std::forward<Fn>(fn));
     }
 
-protected:
-
-    /// 业务挂钩: [init] 末尾调用, 由主程序侧派生基类补齐业务初始化
-    /// (主程序可在此订阅域内的轮次开始事件, 用于重置按作用域键的取消登记)
-    virtual void onHostReady() {}
+    /// 业务初始化 (**协程**: create 事务在 [attachHost] 之后 await 它)
+    ///
+    /// 需要调表的初始化 (订阅广播、读配置…) 写在这里: 插件执行线程上不能同步等表,
+    /// 协程形态是唯一可用写法。派生类覆写时必须保持"不抛异常"的约定 (抛了由
+    /// create 事务转成失败通知)。
+    ///
+    /// **对外可见是为了让 create 事务能调它** (不是给插件业务代码调的)。
+    virtual pluginxx::Task<void> onHostReady() { co_return; }
 
 private:
 
@@ -5241,12 +5245,29 @@ inline void callLifecycleEntryVoid(
     }
 }
 
-/// 实例创建入口的公共实现: 构造上下文 (**可重入**) + 注册事务
+/// 实例上下文是否具备 kit 基类形态 (`PluginBaseT` 派生): 能 `attachHost`, 且业务
+/// 初始化是伸程 (`onHostReady`)
+///
+/// 不是 kit 上下文的自定义上下文 (如 `example_js_execute_command` 的 `ShellCtx`)
+/// 自己提供 `init(host)`, 由 create 事务保持旧的同步路径。
+template<typename C>
+concept KitInstanceCtx = requires(C& c, const PluginxxHost* h) {
+    c.attachHost(h);
+    c.onHostReady();
+};
+
+/// 实例创建入口的公共实现: 构造上下文 (**可重入**) + 业务初始化 + 注册事务
 ///
 /// - `*plugin_ctx` 非空 = 同一实例的第二次 `create` (禁用后再启用): 不重建上下文,
-///   只跑注册事务;
-/// - 构造失败、注册抛异常都按失败收尾 (`done(FAILED, 原因)`), 调用方 (主程序) 负责回滚;
-/// - `createFn` 为空 = 只构造 (插件没有注册事务)。
+///   不重跑业务初始化, 只跑注册事务;
+/// - 首次构造: 同步阶段只做“绑定 host/iface” (`attachHost`, `spawn` 依赖它) 与写出
+///   `*plugin_ctx`; 需要调表的业务初始化 (`onHostReady`) 与注册事务进后台任务,
+///   完成后经 `notify` 恰好一次交回 —— 插件执行线程上不能同步等表;
+/// - 构造失败、初始化/注册抛异常都按失败收尾 (`done(FAILED, 原因)`), 调用方 (主程序)
+///   负责回滚;
+/// - `createFn` 为空 = 只构造 (插件没有注册事务);
+/// - 主机没有 `pluginxx.tasks` 表时 `spawn` 不可用, 退回“只绑定 + 注册事务” (跳过
+///   `onHostReady`) 并记一条警告 —— 这种主机连 `finishLater` 也用不了;
 /// - `name` 只用于诊断 (构造失败时写进错误串) —— 不能在这里打日志:
 ///   本头不依赖主程序的日志设施 (框架的通用 `log` 表要等实例构造完成才能用)。
 template<typename CtxType>
@@ -5262,12 +5283,22 @@ inline void createInstanceEntry(
         notifyLifecycleFailure(host, notify, err, "plugin create: null plugin context");
         return;
     }
-    auto* ctx = static_cast<CtxType*>(*plugin_ctx);
-    if (!ctx) {
+    if (!notify || !notify->done) {
+        pluginxx::PluginString::set(host, err, "plugin create: null completion notify");
+        return;
+    }
+    auto*      ctx   = static_cast<CtxType*>(*plugin_ctx);
+    const bool fresh = (ctx == nullptr);
+    if (fresh) {
         try {
-            auto fresh = std::make_unique<CtxType>();
-            fresh->init(host);
-            ctx         = fresh.release();
+            auto instance = std::make_unique<CtxType>();
+            if constexpr (KitInstanceCtx<CtxType>) {
+                instance->attachHost(host);
+            } else {
+                // 自定义上下文: 自己绑定 host / 接口表 (旧形态)
+                instance->init(host);
+            }
+            ctx         = instance.release();
             *plugin_ctx = ctx;
         } catch (const std::exception& e) {
             notifyLifecycleFailure(
@@ -5280,6 +5311,39 @@ inline void createInstanceEntry(
         } catch (...) {
             notifyLifecycleFailure(host, notify, err, "plugin create: unknown exception");
             return;
+        }
+    }
+    // 首次构造: 业务初始化是协程 (要调表), 与注册事务一起进后台任务。
+    if constexpr (KitInstanceCtx<CtxType>) {
+        if (fresh && ctx->iface.tasks && ctx->iface.tasks->register_task) {
+            const PluginxxOperatorNotify done = *notify; // 借用指针: 按值持有到任务结束
+            ctx->spawn([host, done, createFn](CtxType& instance, OpCtl&) -> Task<void> {
+                try {
+                    co_await instance.onHostReady();
+                    if (createFn) {
+                        // 注册事务可能在入口内部分发起异步工作 (finishLater), 自己完成通知;
+                        // 这里只负责把同步写出的错误串释放掉
+                        PluginxxString localError{nullptr, 0};
+                        createFn(instance, &done, &localError);
+                        if (localError.data) {
+                            pluginxx::PluginString::free(host, &localError);
+                        }
+                    } else {
+                        done.done(done.host_ud, PLUGINXX_OPERATOR_OK, nullptr);
+                    }
+                } catch (const std::exception& e) {
+                    notifyLifecycleFailure(host, &done, nullptr, e.what());
+                } catch (...) {
+                    notifyLifecycleFailure(host, &done, nullptr, "plugin create: unknown exception");
+                }
+                co_return;
+            });
+            return;
+        }
+        if (fresh) {
+            ctx->log.warn(
+                "plugin create: host has no pluginxx.tasks; business init (onHostReady) skipped"
+            );
         }
     }
     callLifecycleEntryVoid(host, ctx, notify, err, "plugin create", [&]() {
