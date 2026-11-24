@@ -2527,7 +2527,7 @@ inline void spawnAwaitableImpl(Ctx& ctx, Fn&& fn) {
                     r->cancelFlag->store(true, std::memory_order_release);
                 }
                 if (r && r->cancelSignal) {
-                    r->cancelSignal->emit(asio::cancellation_type::terminal);
+                    r->cancelSignal->emit(asio::cancellation_type::total);
                 }
             },
             rec.get(),
@@ -2622,9 +2622,16 @@ struct ProviderRoot : CancelableProvider {
     PollOneBridge*             bridge = nullptr;
 
     /// 请求取消: 只发信号, 不强断协程
+    ///
+    /// 用 `total` 而不是 `terminal`: `terminal` 会让 asio **立刻销毁协程帧**,
+    /// 而业务协程可能正等着一次表调用 (定时器 / 网络); 那次调用稍后完成时还会
+    /// 去恢复已经销毁的帧 (实测崩溃在 resumed frame 里).
+    /// `total` 只把取消传给正在等的那次操作: 它的取消槽会先 `op_cancel` 掉,
+    /// 主程序随后以 CANCELED 完成, 协程在"下一次恢复"时抛 `operation_aborted`
+    /// 并正常展开, 帧的生命周期因此是安全的。
     void requestCancel() noexcept override {
         if (cancelSignal) {
-            cancelSignal->emit(asio::cancellation_type::terminal);
+            cancelSignal->emit(asio::cancellation_type::total);
         }
     }
 
@@ -2959,7 +2966,7 @@ public:
                 continue;
             }
             if (rec->cancelSignal) {
-                rec->cancelSignal->emit(asio::cancellation_type::terminal);
+                rec->cancelSignal->emit(asio::cancellation_type::total);
             }
         }
         spawns_.clear();
@@ -3243,11 +3250,23 @@ struct AsyncTableOpState {
     std::atomic<bool> fired{false};
     /// 本次表调用在主程序侧的操作句柄 (槽里取消时用它调 `op_cancel`)
     std::atomic<PluginxxOperatorHandle*> opHandle{nullptr};
+    /// 实例存活标记 (**弱引用**): 实例已析构时不再投递/恢复协程
+    ///
+    /// 为什么要它: 完成回调可能比实例活得久 (主程序计时器 / 网络 / 卸载竞态)。
+    /// 实例析构后执行器 (`io_context`) 和协程帧都已释放, 再投递就是向已释放的
+    /// 执行器上排队, 恢复的是一个已释放的帧 (实测直接崩溃在协程恢复函数里)。
+    std::weak_ptr<std::atomic<bool>> life;
 
     AsyncTableOpState(Handler inHandler, Executor inEx) :
         handler(std::move(inHandler)),
         ex(std::move(inEx)) {}
 };
+
+/// 实例是否还活着 (没有存活标记时按"活"处理: 调用方没给上下文)
+inline bool tableOpOwnerAlive(const std::weak_ptr<std::atomic<bool>>& life) noexcept {
+    const auto token = life.lock();
+    return !token || token->load(std::memory_order_acquire);
+}
 
 /// 把结果投到执行器并调用完成处理器 (恰好一次)
 ///
@@ -3261,9 +3280,17 @@ inline void finishAsyncTableOp(
     if (st->fired.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
+    // 实例已经没了: 不投递 (执行器与协程帧都已释放; 帧由 asio 自己回收)
+    if (!tableOpOwnerAlive(st->life)) {
+        return;
+    }
     asio::post(
         st->ex,
         [st, result = std::move(result)]() mutable {
+            // 排队期间实例可能被析构: 投递到本地后才检查, 仍是安全点
+            if (!tableOpOwnerAlive(st->life)) {
+                return;
+            }
             auto handler = std::move(st->handler);
             handler(std::move(result));
         }
@@ -3279,12 +3306,15 @@ struct AsyncTableOpInitiation {
     StartFn                    start;
     /// 调用方协程的取消槽 (未连接 = 不接取消)
     asio::cancellation_slot slot;
+    /// 实例存活标记 (见 [AsyncTableOpState::life])
+    std::weak_ptr<std::atomic<bool>> life;
 
     template<typename Handler>
     void operator()(Handler&& handler) {
         using H     = std::decay_t<Handler>;
         using State = AsyncTableOpState<H, Executor>;
         auto st     = std::make_shared<State>(H(std::forward<Handler>(handler)), ex);
+        st->life    = life;
         auto* holder = new std::shared_ptr<State>(st);
         PluginxxString err{nullptr, 0};
         // 完成回调: 主程序受理后至少调用一次 (未受理则不会调用, 由下面的
@@ -3351,13 +3381,15 @@ public:
         const PluginxxCancelIface* inCancel,
         Executor                   inEx,
         StartFn                    inStart,
-        asio::cancellation_slot    inSlot = {}
+        asio::cancellation_slot    inSlot = {},
+        std::weak_ptr<std::atomic<bool>> inLife = {}
     ) :
         host_(inHost),
         cancelIface_(inCancel),
         ex_(std::move(inEx)),
         start_(std::move(inStart)),
-        slot_(inSlot) {}
+        slot_(inSlot),
+        life_(std::move(inLife)) {}
 
     template<typename Token>
         requires(
@@ -3377,7 +3409,8 @@ public:
                 cancelIface_,
                 ex_,
                 start_,
-                slot_
+                slot_,
+                life_
             };
             initiation(std::forward<Token>(token));
         }
@@ -3390,6 +3423,8 @@ private:
     Executor                   ex_;
     StartFn                    start_;
     asio::cancellation_slot    slot_;
+    /// 实例存活标记 (见 [AsyncTableOpState::life])
+    std::weak_ptr<std::atomic<bool>> life_;
 };
 
 } // namespace detail
@@ -3476,7 +3511,9 @@ inline auto asyncTableOp(const Ctx& ctx, Executor ex, StartFn&& start) {
         ctx.host,
         ctx.iface.cancel,
         std::move(ex),
-        std::forward<StartFn>(start)
+        std::forward<StartFn>(start),
+        {},
+        ctx.lifeToken()
     };
 }
 
@@ -3493,7 +3530,8 @@ inline auto
         ctx.iface.cancel,
         std::move(ex),
         std::forward<StartFn>(start),
-        slot
+        slot,
+        ctx.lifeToken()
     };
 }
 

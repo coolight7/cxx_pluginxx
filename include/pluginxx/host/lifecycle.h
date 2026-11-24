@@ -751,15 +751,27 @@ public:
             co_return;
         }
         std::string error;
-        if (!co_await awaitPluginLifecycleVoid(
-                this->runtime(),
-                inst,
-                [&](const PluginxxOperatorNotify* notify, PluginxxString* errorOut) {
-                    inst->lifecycleStop(inst->pluginCtx, notify, errorOut);
-                },
-                "plugin stop",
-                error
-            )) {
+        // stop 事务常写成协程 (`ctx.spawn` + `co_await` 表调用), 而协程驱动请求在
+        // Disabled 状态下会被拒绝 —— 事务永远跑不完, 禁用就卡到超时。这一段临时进
+        // "关闭中" (驱动放行的是 lifecycle lease), 结束后再回到 Disabled。
+        const bool restoreDisabled
+            = inst->lifetime && inst->lifetime->state() == PluginInstanceState::Disabled;
+        if (restoreDisabled) {
+            inst->lifetime->setState(PluginInstanceState::Closing);
+        }
+        const bool stopped = co_await awaitPluginLifecycleVoid(
+            this->runtime(),
+            inst,
+            [&](const PluginxxOperatorNotify* notify, PluginxxString* errorOut) {
+                inst->lifecycleStop(inst->pluginCtx, notify, errorOut);
+            },
+            "plugin stop",
+            error
+        );
+        if (restoreDisabled) {
+            inst->lifetime->setState(PluginInstanceState::Disabled);
+        }
+        if (!stopped) {
             XX_LOGE("{}Plugin `{}` stop failed while disabling: {}", logTag(), inst->name, error);
             co_return;
         }

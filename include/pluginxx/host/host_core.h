@@ -318,9 +318,13 @@ public:
         const PluginxxCapabilitySpec& spec,
         std::string*                  error
     ) {
+        // 失败原因以结果分类名开头 (`not_declared` / `invalid_argument` …), 后面
+        // 跟一句人话解释: 插件只能拿到文本, 前缀是它可以判定的稳定部分。
         auto fail = [error](int32_t code, std::string message) {
             if (error) {
-                *error = std::move(message);
+                const char* name = pluginxx::result::nameOf(code);
+                *error = name ? std::string{name} + ": " + message
+                              : std::move(message);
             }
             return code;
         };
@@ -375,8 +379,7 @@ public:
             if (appOwned) {
                 return fail(
                     PLUGINXX_RESULT_ERR_NOT_DECLARED,
-                    "register_capability: `" + fullId
-                        + "` is not declared by the application"
+                    "`" + fullId + "` is not declared by the application"
                 );
             }
             CapabilityDecl decl;
@@ -584,7 +587,7 @@ public:
             [this, core, owner, caller, cap, args, scopeId, phase, timeoutMs] {
                 const auto* slot = capabilities_->slot(cap);
                 if (!slot) {
-                    core->pluginFailure("invoke_capability: capability is not declared: " + cap);
+                    core->pluginFailure("not_declared: capability is not declared: " + cap);
                     return;
                 }
                 std::vector<CapabilityProvider> rows;
