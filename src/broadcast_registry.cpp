@@ -371,19 +371,16 @@ bool BroadcastRegistry::end(
             return false;
         }
         BroadcastChannel& channel = it->second;
-        // 属主或应用才能结束; 插件不能结束别人的频道 (含应用频道)
-        if (!writer.empty() && channel.decl.owner != writer) {
+        // 应用频道 (owner 为空) 只有应用能结束; 插件频道谁都能结束
+        // (多插件共用一条频道时, 任何一个都能收尾)
+        if (!writer.empty() && channel.decl.owner.empty()) {
             if (error) {
-                *error = "broadcast `" + std::string{id} + "` is owned by `"
-                         + (channel.decl.owner.empty() ? std::string{"app"}
-                                                       : channel.decl.owner)
-                         + "`";
+                *error = "broadcast `" + std::string{id} + "` is owned by `app`";
             }
             XX_LOGW(
-                "BroadcastRegistry: `{}` cannot end broadcast `{}` owned by `{}`",
+                "BroadcastRegistry: `{}` cannot end broadcast `{}` owned by `app`",
                 writer,
-                id,
-                channel.decl.owner.empty() ? "app" : channel.decl.owner
+                id
             );
             return false;
         }
