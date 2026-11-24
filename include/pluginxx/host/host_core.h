@@ -574,7 +574,7 @@ public:
                 // 调用方为空 = 主程序 (应用) 自己发起: 不挂任何实例租约
                 core = OpCore::createDetached(this->runtime(), "capability " + cap);
             }
-            core->setCallback(cb, ud, /*mayBeSyncBridge=*/true);
+            core->setCallback(cb, ud);
         } catch (const std::exception& e) {
             detail::setErrorString(error_out, e.what());
             return nullptr;
@@ -811,7 +811,7 @@ public:
                 = capabilities_->rowsOf(id, CapabilityPhase_e::Impl, scopeId);
             if (rows.empty()) {
                 core = OpCore::createDetached(this->runtime(), "point " + id);
-                core->setCallback(cb, ud, true);
+                core->setCallback(cb, ud);
                 core->accept();
                 auto             notify = core->notify();
                 std::string_view none{"null"};

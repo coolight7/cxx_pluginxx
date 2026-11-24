@@ -103,7 +103,7 @@ PluginxxOperatorHandle* startTableOp(
         inlineIo = mgr->isIoThread();
         core     = OpCore::createDetached(runtime, label, std::move(callbackOwner));
         if (!inlineIo) {
-            core->setCallback(cb, ud, true);
+            core->setCallback(cb, ud);
         }
         core->accept();
     } catch (const std::exception& e) {

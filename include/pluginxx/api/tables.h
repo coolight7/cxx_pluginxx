@@ -409,8 +409,8 @@ typedef struct PluginxxSchedulerIface {
     /// 与 io 同线程)。
     ///
     /// 保留同步的理由: 只是比一下线程 id, 不发任务、不跨执行体、不产生任何等待。
-    /// 用途: 判断"这次能不能阻塞等结果" (kit 的 `tableOpSyncWait` /
-    /// `netCallBlocking` / `invoke_capability_blocking` 用它做安全闸)。
+    /// 用途: 判断"当前线程会不会被阻塞调用卡住" (kit 的同步等待形态已全部删除,
+    /// 需要自己阻塞等结果的插件/嵌入方据此决定要不要换线程)。
     /// **不允许**据此内联执行 driver 回调。
     int32_t(PLUGINXX_CALL* is_io_thread)(const PluginxxHost* host);
 

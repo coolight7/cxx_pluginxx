@@ -265,7 +265,7 @@ public:
     /// 当前线程是不是插件代码的执行线程
     ///
     /// 语义是“在这里阻塞会不会把插件卡住”: 配了插件线程时是那条线程, 没配时等于
-    /// [isIoThread]。`scheduler.is_io_thread` 入口与 kit 的同步桥用它判。
+    /// [isIoThread]。`scheduler.is_io_thread` 入口用它判。
     bool isPluginThread() const {
         return pluginxx::isRuntimePluginThread(runtime_);
     }

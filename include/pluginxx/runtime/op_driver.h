@@ -24,7 +24,6 @@
 #include "asio/use_awaitable.hpp"
 #include "fmt/format.h"
 #include "pluginxx/api/abi.h"
-#include "pluginxx/api/sync_bridge.h"
 #include "pluginxx/runtime/instance_base.h"
 #include "pluginxx/runtime/runtime.h"
 #include "utilxx/cancel.h"
@@ -280,15 +279,9 @@ struct OpCore : std::enable_shared_from_this<OpCore> {
     }
 
     /// 登记完成回调
-    ///
-    /// `mayBeSyncBridge`: 回调与 `ud` 来自插件经 ABI 传来的表调用参数时传 true ——
-    /// 那种上下文按契约至少一个指针大小, 主程序可以读它的同步桥标记。主程序自己的
-    /// `sleep` / `offload` / `post` 等入口传 false: 它们的 `ud` 是插件的任意数据
-    /// (可能只有一个 `int` 大), 不能按指针读。
-    void setCallback(PluginxxOperatorCallback cb, void* ud, bool mayBeSyncBridge = false) noexcept {
-        callback_            = cb;
-        callbackUd_          = ud;
-        callbackMayBeBridge_ = mayBeSyncBridge;
+    void setCallback(PluginxxOperatorCallback cb, void* ud) noexcept {
+        callback_   = cb;
+        callbackUd_ = ud;
     }
 
     /// 主程序已接受的 post/sleep/offload 可复用这个完成处理器。
@@ -740,18 +733,13 @@ private:
         providerHandle_ = nullptr;
         auto  callback  = std::exchange(callback_, nullptr);
         auto* ud        = std::exchange(callbackUd_, nullptr);
-        const bool mayBeBridge = std::exchange(callbackMayBeBridge_, false);
         /// 插件完成回调是**插件代码**: 配了插件执行器时投回去执行 (lease 在派发时取,
         /// 因此回调执行前不会 dlclose)。搬作体很快 (唤醒协程 / 置一个标志), 但它
         /// 可能就是插件自己的用户代码。
         bool callbackDispatched = false;
         if (callback) {
             auto target = callbackTarget();
-            // 同步桥 (kit 的 `tableOpSyncWait`): 调用方线程正阻塞等这次回调, 投回插件
-            // 执行器就是自己等自己。就地调用 (完成线程上) 只跑唤醒体, 不跑插件业务。
-            // 只有表调用传来的上下文才参与判定 (见 [setCallback])。
-            if (target && runtime_ && hasPluginExecutor(runtime_)
-                && !(mayBeBridge && isSyncBridgeCallback(ud))) {
+            if (target && runtime_ && hasPluginExecutor(runtime_)) {
                 auto callbackCopy = callback;
                 auto* udCopy      = ud;
                 auto  status      = completion_.status;
@@ -862,8 +850,7 @@ private:
     std::shared_ptr<PluginxxOperationCompletionEndpoint> completionEndpoint_;
     PluginxxOperatorCallback                             callback_   = nullptr;
     void*                                                callbackUd_ = nullptr;
-    /// `callbackUd_` 是表调用传来的上下文 (可按指针读同步桥标记)
-    bool                                                 callbackMayBeBridge_ = false;
+    /// `callbackUd_` 是表调用传来的上下文 (一块至少 8 字节的真实内存, 可按指针读)
     std::function<void(int32_t, std::string_view)>       completionHandler_;
     asio::steady_timer                                   finished_;
 };

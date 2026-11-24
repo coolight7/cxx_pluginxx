@@ -509,7 +509,7 @@ inline asio::any_io_executor pluginExecutionExecutor(const std::shared_ptr<Plugi
 ///
 /// 语义: "在这里阻塞会不会把插件代码卡住"。有独立插件执行器时比对插件线程;
 /// 没有时插件代码就跑在 io 线程上, 退回 [isRuntimeIoThread] 的结论。
-/// kit 的同步桥 (`tableOpSyncWait`) 与 `scheduler.is_io_thread` 用这个判定。
+/// `scheduler.is_io_thread` 用这个判定。
 inline bool isRuntimePluginThread(const std::shared_ptr<PluginRuntime>& runtime) noexcept {
     if (!runtime) {
         return false;
@@ -541,7 +541,7 @@ inline void bindPluginExecutor(
     runtime->pluginThreadId.store(std::thread::id{}, std::memory_order_release);
     if (runtime->pluginExecutor && !runtimeExecutorStopped(runtime->pluginExecutor)) {
         // 先投一个空动作把插件线程 id 记下来: 那条线程只有在动作真的执行时才知道
-        // (绑定发生在调用方线程上), 而 `is_io_thread` / 同步桥守卫从第一次业务调用
+        // (绑定发生在调用方线程上), 而 `is_io_thread` 从第一次业务调用
         // 起就要能回答 —— 不能等到"第一次真派发"。
         enqueuePluginAction(runtime, [] {}, /*retainWhenStopped=*/false);
         replayPluginActions(runtime);

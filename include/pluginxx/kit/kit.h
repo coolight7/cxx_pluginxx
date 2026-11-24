@@ -7,8 +7,8 @@
 /// - [Logger] / [pluginLog] / [pluginStrdup] / [ctxGuardLogger] / [jsonEscape]: 实例级
 ///   日志与 JSON 工具
 /// - [CancelRegistry] / [OpCtl]: 框架级取消登记与操作控制对象
-/// - [Task] 锚定协程与完成协议; 锚定原语 [sleep] / [yield] / [offload] / [invoke_cap];
-///   后台协作任务 [spawn]; 能力注册 [capability]
+/// - 插件协程一律是 `asio::awaitable`; 驱动桥 [detail::PollOneBridge] 按主机请求推进;
+///   后台协作任务 [spawn]; 能力注册 [capabilityAsync]
 /// - [ArgReader]: 强类型参数提取器
 /// - [PluginBaseT]: 插件实例上下文基类 (业务表由主程序侧派生基类补齐)
 /// - 导出宏 PLUGINXX_EXPORT_PLUGIN / PLUGINXX_EXPORT_PLUGIN_LIFECYCLE
@@ -18,7 +18,10 @@
 /// 自己的头文件里包含本头, 并用 `using` 把通用名引入本程序命名空间 —— 插件源码只包含
 /// 主程序那份头即可, 无需关心本节分层。
 #pragma once
+#include "asio/async_result.hpp"
 #include "asio/awaitable.hpp"
+#include "asio/bind_cancellation_slot.hpp"
+#include "asio/cancellation_signal.hpp"
 #include "asio/co_spawn.hpp"
 #include "asio/detached.hpp"
 #include "asio/executor_work_guard.hpp"
@@ -28,7 +31,6 @@
 #include "fmt/ranges.h"
 #include "pluginxx/api/abi.h"
 #include "pluginxx/api/iface_meta.h"
-#include "pluginxx/api/sync_bridge.h"
 #include "pluginxx/api/tables.h"
 #include "utilxx_base/container_util.h"
 #include "utilxx_base/json.h"
@@ -682,167 +684,13 @@ inline std::string
  */
 namespace detail {
 
-/// 单实例协程驱动桥 (定义在下方; 这里前置声明供 [BridgeRoot] 引用)。
+/// 单实例协程驱动桥 (定义在下方)。
 class PollOneBridge;
-
-/// 根协程帧的销毁函数 (类型擦除到具体 promise)。
-template<typename Promise>
-inline void destroyBridgeFrame(void* frame) noexcept {
-    if (!frame) {
-        return;
-    }
-    auto handle = std::coroutine_handle<Promise>::from_address(frame);
-    if (handle) {
-        handle.destroy();
-    }
-}
-
-/// 根操作在桥接中的仲裁对象: 完成/放弃的 exactly-once 与协程帧的销毁责任。
-///
-/// 为什么不直接用 promise 里的 notify:
-/// - 根协程的推进由 host driver 触发, 因此"根仍在本地排队"与"主程序拒绝提供驱动"
-///   可能并发出现; 本对象用原子 CAS 保证 `notify.done` 至多一次, 并保证 op 句柄
-///   等资源只释放一次;
-/// - 主程序拒绝再提供驱动 (实例关闭 / 无 IO executor) 时, 根必须被终结为失败, 否则
-///   主程序持有的 Operation 永远不完成、卸载等待必然超时;
-/// - 协程帧的销毁责任跟着本对象的生命周期: 排队中的本地任务 (或桥析构释放队列)
-///   持有它的强引用, 最后一个引用释放时销毁仍挂起的帧。放弃路径只置标志, 因此
-///   **不会有跨线程销毁一个仍可能被恢复的协程帧**。
-class BridgeRoot : public std::enable_shared_from_this<BridgeRoot> {
-public:
-
-    using DestroyFrameFn = void (*)(void* frame) noexcept;
-    /// "帧已结束时收尾一次"的类型擦除入口 (对应 [finishIfDone])
-    using FinishFrameFn = void (*)(void* frame);
-
-    BridgeRoot(const PluginxxOperatorNotify& notify, void* frame, DestroyFrameFn destroyFrame) :
-        notify_(notify),
-        frame_(frame),
-        destroyFrame_(destroyFrame) {}
-
-    /// 绑定所属桥 (由 [startBridgedRoot] 设置): 放弃的根需要由桥保活协程帧。
-    void setOwner(PollOneBridge* owner) noexcept {
-        owner_ = owner;
-    }
-
-    BridgeRoot(const BridgeRoot&)            = delete;
-    BridgeRoot& operator=(const BridgeRoot&) = delete;
-
-    ~BridgeRoot() {
-        // 最后一个引用 (排队中的本地任务 / 桥登记 / 桥析构) 释放: 销毁仍挂起的帧。
-        // 已正常完成的帧在 [finishIfDone] 中已销毁 (frame_ 置空), 这里是幂等空操作。
-        destroyFrame();
-    }
-
-    /// 认领"根已终结"的所有权 (CAS); 只有第一个调用者能走完成/放弃流程。
-    bool claimFinish() noexcept {
-        bool expected = false;
-        return claimed_.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
-    }
-
-    /// 向主程序上报终态 (仅在 [claimFinish] 成功后调用, 保证 exactly-once)。
-    void notifyHost(int32_t status, std::string_view payload) noexcept {
-        if (!notify_.done) {
-            return;
-        }
-        auto sv = PluginStringView::from(payload.data(), payload.size());
-        try {
-            notify_.done(notify_.host_ud, status, &sv);
-        } catch (...) {
-            // 主程序回调不得抛异常; 即便抛了也已经认领过完成权, 不重复派发。
-        }
-    }
-
-    /// 主程序不再提供驱动: 终结为失败 (幂等)。
-    ///
-    /// 帧的处置: 不能在这里销毁 —— 该根可能有仍在外部的主程序回调 (例如已排队或正在
-    /// 执行的 sleep/offload 完成), 它们随后会尝试恢复本帧; 因此把根交给桥托管
-    /// (`owner_`), 由桥在**销毁时** (此时插件上下文已无任何未完成主程序操作) 统一销毁,
-    /// 期间迟到的回调会因 `shouldAdvance()==false` 而安全跳过。
-    /// (定义在 [PollOneBridge] 之后: 需要完整的桥类型来登记托管。)
-    void abandon(std::string_view reason) noexcept;
-
-    /// 释放 op 侧资源 (幂等)。
-    void runCleanup() noexcept {
-        if (cleanup_) {
-            auto cleanup = std::move(cleanup_);
-            cleanup_     = nullptr;
-            try {
-                cleanup();
-            } catch (...) {
-            }
-        }
-    }
-
-    /// 本地任务实际推进前检查: 被放弃的根不再推进 (帧由引用释放路径销毁)。
-    bool shouldAdvance() const noexcept {
-        return !abandoned_.load(std::memory_order_acquire) && hasFrame();
-    }
-
-    bool hasFrame() const noexcept {
-        return frame_.load(std::memory_order_acquire) != nullptr;
-    }
-
-    bool finished() const noexcept {
-        return claimed_.load(std::memory_order_acquire);
-    }
-
-    bool abandoned() const noexcept {
-        return abandoned_.load(std::memory_order_acquire);
-    }
-
-    /// 完成权被认领时释放 op 侧资源 (op 句柄对象等)。
-    void setCleanup(std::function<void()> cleanup) {
-        cleanup_ = std::move(cleanup);
-    }
-
-    /// 绑定"根帧已结束就收尾"的入口 (由 [startBridgedRoot] 设置)。
-    void setFinishFrame(FinishFrameFn fn) noexcept {
-        finishFrame_ = fn;
-    }
-
-    /// 根帧已经结束 (挂在 final_suspend) 就收尾一次; 未结束是空操作。
-    ///
-    /// 用于"恢复了某条子 Task 帧"的路径: 子帧结束后把控制权交回父协程, 父链最上面的
-    /// 根可能因此在**这次 resume 里**结束, 而那条路径上没有根帧的句柄。`finishIfDone`
-    /// 自身幂等 (完成权 CAS + 帧指针置空), 重复调用无副作用。
-    void finishFrameIfDone() noexcept {
-        if (finishFrame_ && hasFrame()) {
-            finishFrame_(frame_.load(std::memory_order_acquire));
-        }
-    }
-
-    /// 销毁仍然挂起的协程帧 (幂等) 并释放 op 侧资源。
-    ///
-    /// 调用点都满足"协程已终止或不可能再被恢复":
-    /// - [finishIfDone] 的桥接分支 (协程刚结束, 挂在 final_suspend);
-    /// - 桥销毁 / 最后一个引用释放 (此后不存在主程序回调访问该帧)。
-    /// op 资源在这里释放, 而不是在 [abandon]: 被放弃的根可能正在 host driver 内
-    /// 执行, 其输入 (Request/OpCtl) 仍被协程以引用使用。
-    void destroyFrame() noexcept {
-        void* frame = frame_.exchange(nullptr, std::memory_order_acq_rel);
-        if (frame && destroyFrame_) {
-            destroyFrame_(frame);
-        }
-        runCleanup();
-    }
-
-private:
-
-    PluginxxOperatorNotify notify_{nullptr, nullptr};
-    std::atomic<void*>     frame_{nullptr};
-    DestroyFrameFn         destroyFrame_ = nullptr;
-    FinishFrameFn          finishFrame_  = nullptr;
-    PollOneBridge*         owner_        = nullptr;
-    std::function<void()>  cleanup_;
-    std::atomic<bool>      claimed_{false};
-    std::atomic<bool>      abandoned_{false};
-};
 
 /// 受控轮询根 (asio 协程) 的仲裁对象。
 ///
-/// 与 [BridgeRoot] 的区别: `asio::awaitable` 的协程帧由 asio 自己的 completion
-/// handler 持有 (本地 reactor 销毁时统一释放), 因此本对象**不负责销毁帧**, 只负责:
+/// `asio::awaitable` 的协程帧由 asio 自己的 completion handler 持有 (本地 reactor
+/// 销毁时统一释放), 因此本对象**不负责销毁帧**, 只负责:
 /// - 终态上报与资源释放的 **exactly-once** 仲裁 (正常完成 vs 桥停止时放弃);
 /// - 被放弃时执行一次类型擦除的清理 (回收 Job 等主程序可见资源)。
 ///
@@ -912,19 +760,15 @@ private:
 /// 单实例协程驱动桥 (每个插件实例独立一份; 无任何进程级可变状态)。
 ///
 /// kit 内部用法:
-/// - 根操作启动: `postToLocal(首步)` + `wake()`, 并用 [addRoot] 登记 [BridgeRoot],
-///   以便主程序拒绝驱动时终结它;
-/// - 主程序回调完成: `postToLocal(continuation)` + `wake()`;
-/// - stop/destroy: [stop] (拒绝新 wake、取消排队请求、停止本地 reactor、终结活跃根)。
+/// - 协程首步 / 主程序回调完成: `postToLocal(...)` + `wake()`;
+/// - stop/destroy: [stop] (拒绝新 wake、取消排队请求、停止本地 reactor、终结未结束的
+///   受控轮询根)。
 ///
-/// 两类根:
-/// - **事件驱动根** ([BridgeRoot]): 等的都是"主程序可见唤醒源" (主程序回调/主程序计时器),
-///   空闲时不自旋;
-/// - **受控轮询根** ([PolledRoot], 声明式 `polled_tool`): 等的是插件本地 reactor 上
-///   的内核就绪事件 (socket/管道/文件/本地 timer)。`poll_one` 只能"执行已就绪
-///   handler", 不会让等待对象到期, 因此这类根需要"有操作进行中时轮询":
-///   有进展立即续票、无进展退避 `kPollIntervalMs`, 空闲 (无未结束的 polled 操作) 时
-///   不申请请求、不建定时器, 与事件驱动路径共享同一次请求/同一次 `poll_one`。
+/// 根只有一类: **受控轮询根** ([PolledRoot], 声明式受控轮询的工具 / 后台任务)。
+/// 它等的是插件本地 reactor 上的内核就绪事件 (socket/管道/文件/本地 timer)。
+/// `poll_one` 只能"执行已就绪 handler", 不会让等待对象到期, 因此这类根需要"有操作
+/// 进行中时轮询": 有进展立即续票、无进展退避 `kPollIntervalMs`, 空闲 (无未结束的
+/// polled 操作) 时不申请请求、不建定时器。
 class PollOneBridge {
 public:
 
@@ -935,7 +779,7 @@ public:
     /// 又不至于让真正的私有 reactor 等待被静默掩盖。
     static constexpr int kNoProgressWarnStreak = 8;
 
-    /// ---- 受控轮询 (pump) 参数: 只作用于声明式 `polled_tool` 的根 ----
+    /// ---- 受控轮询 (pump) 参数: 只作用于受控轮询根 (工具/能力/图节点/后台任务的协程体) ----
     /// 无进展时的退避时间片 (ms): 等待插件框架就绪期间约 100 次/秒驱动,
     /// 每次 ≈1 个主程序 post + 1 次 `epoll_wait(0)`, 空闲时不产生任何驱动。
     static constexpr int64_t kPollIntervalMs = 10;
@@ -961,15 +805,6 @@ public:
 
     ~PollOneBridge() {
         stop();
-        // 桥销毁 = 插件上下文销毁的最后边界: 此时不会再有主程序回调访问插件帧
-        // (实例 lease 已归零), 可以安全销毁被放弃仍挂起的根。
-        std::vector<std::shared_ptr<BridgeRoot>> abandoned;
-        {
-            std::lock_guard lock(rootsMutex_);
-            abandoned = std::move(abandonedRoots_);
-            abandonedRoots_.clear();
-        }
-        abandoned.clear();
         // 被放弃的受控轮询根: 协程帧由 asio 随本地 reactor 释放 (见 [stop]),
         // 这里回收它们的 Job (清理回调幂等, 正常完成时已执行过)。
         std::vector<std::function<void()>> cleanups;
@@ -1034,12 +869,6 @@ public:
         return driverSteps_.load(std::memory_order_acquire);
     }
 
-    /// 活跃 (未终结) 根数量 (诊断)。
-    size_t activeRootCount() const {
-        std::lock_guard lock(rootsMutex_);
-        return roots_.size();
-    }
-
     /// 未结束的受控轮询操作数 (诊断: 0 表示"不轮询、不建定时器")。
     uint64_t polledRootCount() const noexcept {
         return polledRoots_.load(std::memory_order_acquire);
@@ -1092,29 +921,7 @@ public:
         });
     }
 
-    /// 登记一个根 (**桥持有强引用**; 主程序拒绝驱动时统一终结)。
-    ///
-    /// 为什么必须持有强引用: 挂起中的根除了"下一次恢复任务"之外没有任何持有者 ——
-    /// 排队任务一旦执行完就会释放它, 若桥不持有, 帧会被立刻销毁, 之后到达的主程序
-    /// 回调就会访问已释放的协程帧。根对象因此由桥保活到 [removeRoot] (正常完成)
-    /// 或桥销毁 (放弃路径)。
-    void addRoot(const std::shared_ptr<BridgeRoot>& root) {
-        if (!root) {
-            return;
-        }
-        std::lock_guard lock(rootsMutex_);
-        roots_.push_back(root);
-    }
-
-    /// 注销一个根 (正常完成时调用; 释放桥对它的强引用)。
-    void removeRoot(const std::shared_ptr<BridgeRoot>& root) {
-        std::lock_guard lock(rootsMutex_);
-        std::erase_if(roots_, [&root](const std::shared_ptr<BridgeRoot>& alive) {
-            return !alive || alive == root;
-        });
-    }
-
-    /// 登记一个受控轮询根 (声明式 `polled_tool` 的根)。
+    /// 登记一个受控轮询根 (工具/能力/图节点/后台任务的协程体)。
     ///
     /// 必须在把该协程排进本地执行器之前调用: 登记之后 `polledRoots_ > 0`,
     /// 桥才知道"等待期间需要按受控轮询策略继续申请请求"。
@@ -1211,7 +1018,7 @@ public:
     /// - 取消**尚未开始**的请求 (正在执行的回调不打断, 由插件自己的 root 收束协议收尾);
     /// - 停止本地 reactor 并释放 work guard: 之后即便有迟到请求也不会再执行插件代码;
     /// - 活跃根统一终结为失败 (主程序不会再有驱动来推进它们); 本地排队的 continuation
-    ///   随桥析构释放, 其持有的帧由 [BridgeRoot] 的引用释放路径销毁。
+    ///   随桥析构释放 (asio 协程帧由本地 reactor 释放)。
     void stop() noexcept {
         PluginxxDriver*         toCancel = nullptr;
         PluginxxOperatorHandle* waitOp   = nullptr;
@@ -1237,34 +1044,7 @@ public:
         cancelSchedulerOp(waitOp);
         work_.reset();
         localIo_.stop();
-        failAllRoots("plugin coroutine bridge stopped");
         failAllPolledRoots("plugin coroutine bridge stopped");
-    }
-
-    /// 托管一个被放弃的根: 帧必须活到桥销毁 (之后不会再有主程序回调访问它)。
-    /// 由 [BridgeRoot::abandon] 调用 (任意线程)。
-    void retainAbandonedRoot(const std::shared_ptr<BridgeRoot>& root) {
-        if (!root) {
-            return;
-        }
-        std::lock_guard lock(rootsMutex_);
-        abandonedRoots_.push_back(root);
-    }
-
-    /// 主程序拒绝再提供驱动 (实例关闭/无 executor) 时, 终结全部活跃根。
-    ///
-    /// 顺序很关键: 先从 `roots_` 摘下 (桥不再持有), 再逐个 [BridgeRoot::abandon] ——
-    /// abandon 会把根登记进 `abandonedRoots_`, 帧因此活到桥销毁为止。
-    void failAllRoots(std::string_view reason) noexcept {
-        std::vector<std::shared_ptr<BridgeRoot>> roots;
-        {
-            std::lock_guard lock(rootsMutex_);
-            roots = std::move(roots_);
-            roots_.clear();
-        }
-        for (const auto& root : roots) {
-            root->abandon(reason);
-        }
     }
 
     void logWarn(std::string_view message) const noexcept {
@@ -1352,7 +1132,7 @@ private:
                 }
             }
             logError(fmt::format("coroutine driver request failed: {}", message));
-            failAllRoots(message);
+            failAllPolledRoots(message);
             return;
         }
         bool cancelImmediately = false;
@@ -1420,17 +1200,16 @@ private:
         }
 
         // 受控轮询期间"本轮无进展"是常态 (等待插件框架就绪 / 退避), 不算异常; 因此
-        // 警告只在"既没有 polled 操作在轮询、又持续空转且仍有活跃根"时出现 ——
-        // 那正是"插件依赖私有 reactor 却没有声明 polled"的误用信号。
+        // 警告只在"没有 polled 操作在轮询、却持续空转"时出现 —— 那正是"插件依赖私有
+        // reactor 却没有声明 polled"的误用信号。
         const bool pumping = polledRoots_.load(std::memory_order_acquire) > 0;
-        if (progressed == 0 && !pumping && activeRootCount() > 0) {
+        if (progressed == 0 && !pumping) {
             if (++noProgressStreak_ >= kNoProgressWarnStreak) {
                 noProgressStreak_ = 0;
                 logWarn(
-                    "coroutine driver made no progress while roots are active: the awaited work "
-                    "has no host-visible wake source (private reactor waits are not driven by "
-                    "this bridge); use host callbacks, the host timer adapter, or declare the "
-                    "root as a polled tool"
+                    "coroutine driver made no progress: the awaited work has no host-visible "
+                    "wake source (private reactor waits are not driven by this bridge); use host "
+                    "callbacks, the host timer adapter, or declare the tool as polled"
                 );
             }
         } else {
@@ -1642,29 +1421,11 @@ private:
     /// 根登记表用的锁。**锁序**: 允许 `rootsMutex_` → `mutex_` (见
     /// [removePolledRoot]), 反向嵌套不存在, 因此不会死锁。
     mutable std::mutex rootsMutex_;
-    /// 活跃根 (桥持有强引用; 见 [addRoot] 说明)。
-    std::vector<std::shared_ptr<BridgeRoot>> roots_;
-    /// 被放弃 (主程序拒绝驱动/桥停止) 的根: 保活到桥销毁, 期间迟到回调只会安全跳过。
-    std::vector<std::shared_ptr<BridgeRoot>> abandonedRoots_;
     /// 未结束的受控轮询根 (与 `polledRoots_` 计数一致)。
     std::vector<std::shared_ptr<PolledRoot>> polledRootList_;
     /// 被放弃的受控轮询根留下的清理回调 (回收 Job); 桥销毁时执行。
     std::vector<std::function<void()>> abandonedCleanups_;
 };
-
-inline void BridgeRoot::abandon(std::string_view reason) noexcept {
-    if (!claimFinish()) {
-        return;
-    }
-    abandoned_.store(true, std::memory_order_release);
-    notifyHost(PLUGINXX_OPERATOR_FAILED, reason);
-    // op 资源释放延后到 [destroyFrame]: 此刻该根可能正由 host driver 执行, 其输入
-    // (Request/OpCtl) 仍被协程以引用使用, 现在释放就是 use-after-free。
-    if (owner_) {
-        // 帧交给桥保活到桥销毁 (见函数声明处的说明)。
-        owner_->retainAbandonedRoot(shared_from_this());
-    }
-}
 
 } // namespace detail
 
@@ -2387,201 +2148,11 @@ private:
     bool                     hasParseError_ = false;
     std::vector<std::string> errors_;
 };
-/* ==================== Task<T> 锚定协程与完成协议 ==================== */
-
-template<typename T = void>
-struct Task;
+/* ==================== 根操作 Request / 完成与生命周期协议 ==================== */
 
 namespace detail {
 
-template<typename Promise>
-inline void finishIfDone(std::coroutine_handle<Promise> h) {
-    if (!h.done()) {
-        return;
-    }
-    auto& p = h.promise();
-    // 子 Task 在 final_suspend 已通过 continuation 恢复父协程；父协程的
-    // await_resume 负责读取结果并销毁子帧。这里不能走 root notify/destroy。
-    if (p.continuation_) {
-        return;
-    }
-
-    int32_t     status = PLUGINXX_OPERATOR_OK;
-    std::string errPayload;
-    std::string resPayload;
-    if (p.has_exception()) {
-        status = PLUGINXX_OPERATOR_FAILED;
-        try {
-            std::rethrow_exception(p.exception());
-        } catch (const CanceledException& e) {
-            status     = PLUGINXX_OPERATOR_CANCELED;
-            errPayload = e.what();
-        } catch (const std::exception& e) {
-            errPayload = e.what();
-        } catch (...) {
-            errPayload = "unknown exception in coroutine";
-        }
-    } else if (p.cancelFlag_ && p.cancelFlag_->load(std::memory_order_acquire)) {
-        status = PLUGINXX_OPERATOR_CANCELED;
-    } else {
-        if constexpr (!std::is_void_v<typename Promise::value_type>) {
-            if constexpr (std::is_same_v<typename Promise::value_type, std::string>) {
-                resPayload = p.result();
-            } else if constexpr (fmt::is_formattable<typename Promise::value_type>::value) {
-                resPayload = fmt::format("{}", p.result());
-            } else {
-                // 结果类型既不是字符串也不能格式化 (例如 `whenAll` 返回的结果数组):
-                // 这种 Task 只作为子协程使用, 根完成正文留空即可。
-            }
-        }
-    }
-
-    PluginxxOperatorNotify notify  = p.notify_;
-    auto                   cleanup = std::move(p.opCleanup_);
-    p.opCleanup_                   = nullptr;
-    auto root                      = std::move(p.bridgeRoot_);
-
-    // 终态 payload: OK=结果, FAILED=错误信息, Canceled=空 (与既有契约一致)
-    std::string_view payload;
-    if (status == PLUGINXX_OPERATOR_FAILED) {
-        payload = errPayload;
-    } else if (status == PLUGINXX_OPERATOR_OK) {
-        payload = resPayload;
-    }
-
-    if (auto bridgeRoot = root.lock()) {
-        // 桥接根: 完成/放弃的仲裁与帧销毁都收敛在 [BridgeRoot] 上。
-        // - 先认领完成权: 主程序可能在放弃路径 (failAllRoots) 已上报过 FAILED,
-        //   此时这里不得重复上报;
-        // - 上报终态**先于**销毁帧: 帧销毁会顺手释放 op 侧资源 (插件释放取消句柄),
-        //   而主程序把 done 当作已受理后不会再调取消 (见 OpCore 的取消协议),
-        //   两个动作在插件线程上紧邻执行, 因此 "提交 done" 必须先于 "释放取消句柄";
-        // - 最后销毁帧 (幂等): 排队中的本地任务之后不会再恢复一个已销毁的帧。
-        const bool claimed = bridgeRoot->claimFinish();
-        if (claimed) {
-            bridgeRoot->notifyHost(status, payload);
-        }
-        // destroyFrame 同时释放 op 侧资源 (幂等); 协程已挂在 final_suspend, 销毁安全。
-        bridgeRoot->destroyFrame();
-        return;
-    }
-
-    h.destroy();
-
-    if (notify.done) {
-        auto sv = PluginStringView::from(payload.data(), payload.size());
-        notify.done(notify.host_ud, status, &sv);
-    }
-
-    if (cleanup) {
-        cleanup();
-    }
-}
-
 /* ==================== 桥接 (host driver) 路径的公共辅助 ==================== */
-
-/// 桥接根推进一次: 恢复协程帧并收束终态 (仅在 host driver 的 `poll_one` 内调用)。
-template<typename Promise>
-inline void advanceRootOnce(std::coroutine_handle<Promise> h) noexcept {
-    if (!h) {
-        return;
-    }
-    if (!h.done()) {
-        try {
-            h.resume();
-        } catch (...) {
-            h.promise().set_exception(std::current_exception());
-        }
-    }
-    finishIfDone(h);
-}
-
-/// 恢复插件协程的统一入口: 先 `postToLocal` 再 `wake`, continuation 由**下一次
-/// host driver** 的 `poll_one` 执行 —— 因此绝不会从主程序回调栈内重入插件协程,
-/// 也不会占用主程序 IO 线程做插件工作 (只投递一个小闭包)。
-///
-/// 被放弃的根 (主程序拒绝驱动) 不再恢复: 直接返回, 帧由引用释放路径销毁。
-template<typename Promise>
-inline void resumePluginCoroutine(
-    detail::PollOneBridge*         bridge,
-    std::coroutine_handle<Promise> handle
-) noexcept {
-    std::weak_ptr<detail::BridgeRoot> weakRoot = handle.promise().bridgeRoot_;
-    // 子 Task 帧 (有 continuation) 结束后由父协程的 `await_resume` 收结果并销毁,
-    // 因此恢复之后不能再碰它 —— 父协程可能在这次 resume 里就把它销毁了。
-    // 只有根帧 (没有 continuation) 才在这里按帧收尾; 子帧这条路径改为让根收尾
-    // (根可能因为这条子帧结束而在同一次 resume 里结束)。
-    const bool isRootFrame = !handle.promise().continuation_;
-    bridge->postToLocal([handle, weakRoot, isRootFrame] {
-        auto root = weakRoot.lock();
-        if (root && !root->shouldAdvance()) {
-            return; // 已放弃: 不恢复, 帧由引用释放路径销毁
-        }
-        try {
-            handle.resume();
-        } catch (...) {
-            handle.promise().set_exception(std::current_exception());
-        }
-        if (isRootFrame) {
-            finishIfDone(handle);
-        } else if (root) {
-            root->finishFrameIfDone();
-        }
-    });
-    bridge->wake();
-}
-
-/// 启动一个桥接根协程 (plugin.md 6.2):
-/// - 首步经本地执行器排队, 由**下一次 host driver** 执行; `execute_start` 因此不会
-///   在主程序 IO 线程上同步跑插件业务代码 (也不会有 completion 重入);
-/// - 帧的销毁责任交给 [BridgeRoot]: 排队中的本地任务持强引用, 最后一个引用释放
-///   时销毁仍挂起的帧;
-/// - `cleanup` 在"根终结恰好一次"时执行 (释放 op 句柄 / 注销根登记)。
-///
-/// `return`: 该根的仲裁对象 (调用方通常不再需要, 资源释放已由 cleanup 覆盖)。
-template<typename Promise>
-inline std::shared_ptr<detail::BridgeRoot> startBridgedRoot(
-    detail::PollOneBridge&         bridge,
-    const PluginxxOperatorNotify&  notify,
-    std::coroutine_handle<Promise> h,
-    std::function<void()>          cleanup
-) {
-    auto root
-        = std::make_shared<detail::BridgeRoot>(notify, h.address(), &destroyBridgeFrame<Promise>);
-    root->setOwner(&bridge);
-    // 子 Task 帧被恢复时没有根帧句柄, 但它结束时父链最上面的根可能一起结束;
-    // 这条类型擦除入口让那条路径也能给根收尾 (幂等)。
-    root->setFinishFrame(+[](void* frame) {
-        if (frame) {
-            finishIfDone(std::coroutine_handle<Promise>::from_address(frame));
-        }
-    });
-    {
-        auto  userCleanup = std::move(cleanup);
-        auto* bridgePtr   = &bridge;
-        // 注销登记用 weak 引用: cleanup 本身保存在 root 内部, 若捕获 shared_ptr 就会
-        // 形成自引用环 (被放弃的根将永不析构, 帧与 op 句柄一起泄漏)。
-        std::weak_ptr<detail::BridgeRoot> weakRoot = root;
-        root->setCleanup([bridgePtr, weakRoot, userCleanup] {
-            if (auto alive = weakRoot.lock()) {
-                bridgePtr->removeRoot(alive);
-            }
-            if (userCleanup) {
-                userCleanup();
-            }
-        });
-    }
-    h.promise().bridgeRoot_ = root;
-    bridge.addRoot(root);
-    bridge.postToLocal([h, root] {
-        if (!root->shouldAdvance()) {
-            return; // 已放弃: 帧由引用释放路径销毁
-        }
-        advanceRootOnce(h);
-    });
-    bridge.wake();
-    return root;
-}
 
 /* ==================== 根操作 Request 与完成守卫 ====================
  *
@@ -2678,8 +2249,8 @@ struct RootRequest {
 ///   "已接受但永远不 done"的操作；
 /// - 重复完成只记录，不重复回调主程序。
 ///
-/// 异步路径（Task）由 `PromiseBase` 的 notify_/cancelFlag_ 在同一处收束，
-/// 语义与这里的同步路径一致。
+/// 异步路径（asio 协程）在各自的收尾处做同一件事:
+/// 先 claim 一次终态, 再回调主程序 (见 [detail::PolledRoot] / [detail::ProviderRoot])。
 class CompletionGuard {
 public:
 
@@ -2764,9 +2335,10 @@ private:
 /// void* start(void* ud, const PluginxxOperatorNotify* notify, PluginxxString*) {
 ///     auto& ctx = *static_cast<MyCtx*>(ud);
 ///     auto  later = pluginxx::finishLater(notify);
-///     ctx.spawn([later](MyCtx& c) -> pluginxx::Task<void> {
+///     ctx.spawn([later](MyCtx& c) -> asio::awaitable<void> {
 ///         co_await c.registerTool(...);      // 表调用, 不阻塞 IO 线程
 ///         later.ok();
+///         co_return;
 ///     });
 ///     return nullptr;                        // 已受理, 完成时再通知
 /// }
@@ -2803,7 +2375,7 @@ struct LifecycleJob {
 ///     auto& ctx = *static_cast<MyCtx*>(ud);
 ///     auto  later = pluginxx::finishLater(notify);
 ///     if (!later.active()) { return nullptr; }          // 主程序没要求通知
-///     ctx.spawn([later](MyCtx& c, OpCtl&) -> pluginxx::Task<void> {
+///     ctx.spawn([later](MyCtx& c, OpCtl&) -> asio::awaitable<void> {
 ///         co_await c.registerTool(...);                  // 表调用, 不阻塞 IO 线程
 ///         later.ok();
 ///         co_return;
@@ -2873,82 +2445,6 @@ inline LifecycleFinisher finishLater(const PluginxxOperatorNotify* notify) {
     return LifecycleFinisher{notify};
 }
 
-template<typename T>
-struct PromiseBase {
-    using value_type = T;
-
-    PluginxxOperatorNotify             notify_{nullptr, nullptr};
-    const PluginxxHost*                host_{nullptr};
-    std::shared_ptr<std::atomic<bool>> cancelFlag_{nullptr};
-    std::function<void()>              outstandingCancel_{nullptr};
-    std::exception_ptr                 exception_{nullptr};
-    std::function<void()>              opCleanup_{nullptr};
-    std::coroutine_handle<>            continuation_{};
-    /// 桥接根仲裁对象 (仅"根操作"帧持有; 子 Task 帧为空)。
-    /// - 弱引用: 强引用由排队中的本地任务持有, 最后一个引用释放时销毁仍挂起的帧,
-    ///   因此不会和帧本身形成引用环;
-    /// - [finishIfDone] 经它做 exactly-once 上报, awaiter 的恢复任务经它判断
-    ///   "根是否已被放弃"。
-    std::weak_ptr<detail::BridgeRoot> bridgeRoot_{};
-
-    std::suspend_always initial_suspend() noexcept {
-        return {};
-    }
-
-    struct FinalAwaiter {
-        bool await_ready() const noexcept {
-            return false;
-        }
-
-        template<typename Promise>
-        std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) const noexcept {
-            auto continuation = h.promise().continuation_;
-            return continuation ? continuation : std::noop_coroutine();
-        }
-
-        void await_resume() const noexcept {}
-    };
-
-    FinalAwaiter final_suspend() noexcept {
-        return {};
-    }
-
-    void unhandled_exception() noexcept {
-        exception_ = std::current_exception();
-    }
-
-    bool has_exception() const noexcept {
-        return exception_ != nullptr;
-    }
-
-    std::exception_ptr exception() const noexcept {
-        return exception_;
-    }
-
-    void set_exception(std::exception_ptr ep) noexcept {
-        exception_ = ep;
-    }
-
-    void set_outstanding(std::function<void()> c) {
-        outstandingCancel_ = std::move(c);
-    }
-
-    void clear_outstanding() noexcept {
-        outstandingCancel_ = nullptr;
-    }
-
-    void cancel_outstanding() {
-        if (outstandingCancel_) {
-            auto fn            = std::move(outstandingCancel_);
-            outstandingCancel_ = nullptr;
-            try {
-                fn();
-            } catch (...) {
-            }
-        }
-    }
-};
-
 } // namespace detail
 
 /// 根操作拥有型输入的公开别名：插件业务签名可直接写 `const RootRequest&`
@@ -2959,181 +2455,59 @@ using RootRequest = detail::RootRequest;
 using LifecycleFinisher = detail::LifecycleFinisher;
 using detail::finishLater;
 
-template<typename T>
-struct Task {
-    struct promise_type : detail::PromiseBase<T> {
-        std::optional<T> res_;
-
-        Task get_return_object() {
-            return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-
-        template<typename U>
-        void return_value(U&& v) {
-            res_.emplace(std::forward<U>(v));
-        }
-
-        T& result() {
-            return *res_;
-        }
-    };
-
-    std::coroutine_handle<promise_type> handle_;
-
-    explicit Task(std::coroutine_handle<promise_type> h) :
-        handle_(h) {}
-
-    Task(Task&& o) noexcept :
-        handle_(std::exchange(o.handle_, {})) {}
-
-    Task& operator=(Task&& o) noexcept {
-        if (this != &o) {
-            if (handle_) {
-                handle_.destroy();
-            }
-            handle_ = std::exchange(o.handle_, {});
-        }
-        return *this;
-    }
-
-    ~Task() {
-        if (handle_) {
-            handle_.destroy();
-        }
-    }
-
-    Task(const Task&)            = delete;
-    Task& operator=(const Task&) = delete;
-
-    struct Awaiter {
-        std::coroutine_handle<promise_type> handle;
-
-        bool await_ready() const noexcept {
-            return !handle || handle.done();
-        }
-
-        /// 挂起子帧并把控制权交给它
-        ///
-        /// 父协程是插件协程帧时顺手把"所属根"传下去: 子帧可能由外部完成回调恢复,
-        /// 那条路径上没有根帧句柄, 靠这个引用让子帧结束后能给根收尾
-        /// (见 [detail::resumePluginCoroutine])。
-        template<typename ParentPromise>
-        std::coroutine_handle<> await_suspend(std::coroutine_handle<ParentPromise> parent) {
-            if constexpr (!std::is_void_v<ParentPromise>) {
-                if constexpr (requires { parent.promise().bridgeRoot_; }) {
-                    handle.promise().bridgeRoot_ = parent.promise().bridgeRoot_;
-                }
-            }
-            handle.promise().continuation_ = parent;
-            return handle;
-        }
-
-        T await_resume() {
-            auto h = std::exchange(handle, {});
-            if (!h) {
-                return T{};
-            }
-            if (h.promise().has_exception()) {
-                auto exception = h.promise().exception();
-                h.destroy();
-                std::rethrow_exception(exception);
-            }
-            T result = std::move(h.promise().result());
-            h.destroy();
-            return result;
-        }
-    };
-
-    Awaiter operator co_await() && noexcept {
-        return Awaiter{std::exchange(handle_, {})};
-    }
-};
-
-template<>
-struct Task<void> {
-    struct promise_type : detail::PromiseBase<void> {
-        Task get_return_object() {
-            return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-
-        void return_void() noexcept {}
-    };
-
-    std::coroutine_handle<promise_type> handle_;
-
-    explicit Task(std::coroutine_handle<promise_type> h) :
-        handle_(h) {}
-
-    Task(Task&& o) noexcept :
-        handle_(std::exchange(o.handle_, {})) {}
-
-    Task& operator=(Task&& o) noexcept {
-        if (this != &o) {
-            if (handle_) {
-                handle_.destroy();
-            }
-            handle_ = std::exchange(o.handle_, {});
-        }
-        return *this;
-    }
-
-    ~Task() {
-        if (handle_) {
-            handle_.destroy();
-        }
-    }
-
-    Task(const Task&)            = delete;
-    Task& operator=(const Task&) = delete;
-
-    struct Awaiter {
-        std::coroutine_handle<promise_type> handle;
-
-        bool await_ready() const noexcept {
-            return !handle || handle.done();
-        }
-
-        /// 挂起子帧并把控制权交给它
-        ///
-        /// 父协程是插件协程帧时顺手把"所属根"传下去: 子帧可能由外部完成回调恢复,
-        /// 那条路径上没有根帧句柄, 靠这个引用让子帧结束后能给根收尾
-        /// (见 [detail::resumePluginCoroutine])。
-        template<typename ParentPromise>
-        std::coroutine_handle<> await_suspend(std::coroutine_handle<ParentPromise> parent) {
-            if constexpr (!std::is_void_v<ParentPromise>) {
-                if constexpr (requires { parent.promise().bridgeRoot_; }) {
-                    handle.promise().bridgeRoot_ = parent.promise().bridgeRoot_;
-                }
-            }
-            handle.promise().continuation_ = parent;
-            return handle;
-        }
-
-        void await_resume() {
-            auto h = std::exchange(handle, {});
-            if (h && h.promise().has_exception()) {
-                auto exception = h.promise().exception();
-                h.destroy();
-                std::rethrow_exception(exception);
-            }
-            if (h) {
-                h.destroy();
-            }
-        }
-    };
-
-    Awaiter operator co_await() && noexcept {
-        return Awaiter{std::exchange(handle_, {})};
-    }
-};
-
 /* ==================== 后台协作任务 spawn 实现 ==================== */
 
 namespace detail {
 
+/// 判断一个类型是不是 `asio::awaitable`
+template<typename T>
+struct IsPluginAwaitable : std::false_type {};
+
+template<typename T, typename Executor>
+struct IsPluginAwaitable<asio::awaitable<T, Executor>> : std::true_type {};
+
+/// 把 `fn(ctx, ctl)` 的 `asio::awaitable<T>` 结果统一收成 `asio::awaitable<void>`
 template<typename Ctx, typename Fn>
-inline void spawnTaskImpl(Ctx& ctx, Fn&& fn) {
-    // SpawnRecord 定义在实例上下文基类内 (与派生类共享同一记录类型)
+inline asio::awaitable<void> invokeSpawnAwaitable(Ctx& ctx, OpCtl& ctl, Fn& fn) {
+    using Ret = std::decay_t<std::invoke_result_t<Fn&, Ctx&, OpCtl&>>;
+    if constexpr (std::is_same_v<Ret, asio::awaitable<void>>) {
+        co_await fn(ctx, ctl);
+    } else {
+        (void)co_await fn(ctx, ctl);
+    }
+}
+
+/// 把 `fn(ctx, ctl)` 的 `asio::awaitable<T>` 结果统一收成 `asio::awaitable<void>`
+///
+/// 闭包与 `OpCtl` **按值进协程帧**: 记录 ([SpawnRecord]) 在 stop/清理时会被提前
+/// 释放, 帧里只存引用就是 use-after-free (ASan 实测)。
+template<typename Ctx, typename Fn>
+inline asio::awaitable<void> invokeSpawnAwaitableOwned(
+    Ctx&                                      ctx,
+    OpCtl                                     ctl,
+    Fn                                        fn,
+    std::shared_ptr<asio::cancellation_signal> signal
+) {
+    // `signal` 只为了在帧里持一份: 协程的取消槽指向该信号内部, 帧比记录活得久时
+    // 记录已释放 → 槽会变成悬垂指针 (ASan 实测在 `cancellation_slot::clear` 报)。
+    (void)signal;
+    using Ret = std::decay_t<std::invoke_result_t<Fn&, Ctx&, OpCtl&>>;
+    if constexpr (std::is_same_v<Ret, asio::awaitable<void>>) {
+        co_await fn(ctx, ctl);
+    } else {
+        (void)co_await fn(ctx, ctl);
+    }
+}
+
+/// `spawn` 的实现: 任务体是 `asio::awaitable<T>`
+///
+/// - 协程帧由 asio 管理 (`asio::co_spawn`), 完成处理器上报一次通知;
+/// - 取消: 置取消标记 (`OpCtl::isCanceled()`) + 发取消信号, 业务体里正在等的表调用
+///   会被 `op_cancel` 撤掉;
+/// - 首步同样不在调用方栈里跑: `co_spawn` 会把帧投递到桥的本地执行器, 等主程序下一次
+///   driver 推进。
+template<typename Ctx, typename Fn>
+inline void spawnAwaitableImpl(Ctx& ctx, Fn&& fn) {
     using SpawnRecord                  = typename std::remove_reference_t<Ctx>::SpawnRecord;
     auto cancelFlag                    = std::make_shared<std::atomic<bool>>(false);
     auto rec                           = std::make_shared<SpawnRecord>();
@@ -3149,14 +2523,11 @@ inline void spawnTaskImpl(Ctx& ctx, Fn&& fn) {
             ctx.host,
             [](void* ud, void*) {
                 auto* r = static_cast<SpawnRecord*>(ud);
-                if (!r || !r->cancelFlag) {
-                    return;
+                if (r && r->cancelFlag) {
+                    r->cancelFlag->store(true, std::memory_order_release);
                 }
-                r->cancelFlag->store(true, std::memory_order_release);
-                if (r->coroAddr) {
-                    auto handle
-                        = std::coroutine_handle<PromiseBase<void>>::from_address(r->coroAddr);
-                    handle.promise().cancel_outstanding();
+                if (r && r->cancelSignal) {
+                    r->cancelSignal->emit(asio::cancellation_type::terminal);
                 }
             },
             rec.get(),
@@ -3184,98 +2555,162 @@ inline void spawnTaskImpl(Ctx& ctx, Fn&& fn) {
         return;
     }
 
-    // 闭包由记录与根 cleanup 一起保活: 协程帧只保存闭包指针, 任务挂起期间
-    // 闭包必须一直有效 (否则访问捕获变量就是 use-after-free)。
     auto closure = std::make_shared<std::decay_t<Fn>>(std::forward<Fn>(fn));
-    rec->closureKeepAlive = closure;
-    auto starter = [&ctx, closure, cancelFlag, recWeak, hostNotify]() {
-        auto rec = recWeak.lock();
-        if (!rec) {
+    if (!rec->ctl) {
+        rec->ctl = std::make_shared<OpCtl>(OpCtl{cancelFlag, nullptr, std::string{}, {}});
+    }
+    auto ctl         = rec->ctl;
+    auto cancelSignal = std::make_shared<asio::cancellation_signal>();
+    rec->cancelSignal = cancelSignal;
+    ctx.spawns_.push_back(rec);
+
+    // asio 协程的每一步都由 `asio::post` 回到桥的本地执行器, 而本地执行器只在主程序
+    // 驱动时被 poll: 用一条"受控轮询根"让桥在任务存活期间持续申请驱动 (≤10 ms 一次),
+    // 否则第一个协程步就没人推进 (实测会挂住 mount)。根自带的通知器留空 ——
+    // 完成上报由下面的完成处理器做。
+    auto pumpRoot = std::make_shared<detail::PolledRoot>(PluginxxOperatorNotify{nullptr, nullptr});
+    ctx.bridge().addPolledRoot(pumpRoot);
+    // 首个驱动请求得自己提: 登记轮询根只让桥“继续”申请请求, 不会自己发起
+    ctx.bridge().wake();
+
+    asio::co_spawn(
+        ctx.bridge().local_executor(),
+        detail::invokeSpawnAwaitableOwned(ctx, *ctl, std::move(*closure), cancelSignal),
+        // 取消信号接到协程的取消槽: 主程序取消后正在等的表调用会被 op_cancel 掉
+        asio::bind_cancellation_slot(
+            cancelSignal->slot(),
+            [recWeak, ctl, hostNotify, pumpRoot, &bridge = ctx.bridge()](std::exception_ptr ep) {
+                bridge.removePolledRoot(pumpRoot);
+                if (hostNotify.done) {
+                    hostNotify.done(
+                        hostNotify.host_ud,
+                        ep ? PLUGINXX_OPERATOR_FAILED : PLUGINXX_OPERATOR_OK,
+                        nullptr
+                    );
+                }
+            }
+        )
+    );
+}
+
+/// “可取消的业务根”公共接口
+///
+/// 主程序只持有一个 `void*` 句柄, 取消时回传给接口表的 `cancel`; 两种形态的根
+/// (asio provider 根 [ProviderRoot] / kit 协程 Job) 都从这里派生, 取消入口不需要
+/// 知道具体是哪种。
+struct CancelableProvider {
+    virtual void requestCancel() noexcept = 0;
+    virtual ~CancelableProvider()           = default;
+};
+
+/// 业务协程 provider 根的公共状态
+///
+/// 用到它的入口: 能力行 ([capability])、图节点 ([graph_node])、主程序侧的功能埋点
+/// 实现行 (`providePoint`) —— 它们都是“插件业务协程算出一个值, 交回主程序”。
+///
+/// 收尾与受控轮询工具一致: 上报权由 [PolledRoot::claimFinish] 认领, 桥停止/关闭
+/// 路径可能先一步接管。
+struct ProviderRoot : CancelableProvider {
+    PluginxxOperatorNotify notify{nullptr, nullptr};
+    /// 业务入参等需要活到协程结束的对象的保活位 (插件侧放进去, 根回收时一起释放)
+    std::shared_ptr<void> keepAlive;
+    /// asio 取消信号: 主程序取消时发一次 (业务协程自己决定是否响应)
+    std::shared_ptr<asio::cancellation_signal> cancelSignal
+        = std::make_shared<asio::cancellation_signal>();
+    /// 受控轮询根 (认领上报权; 存活期间让桥持续申请驱动)
+    std::shared_ptr<PolledRoot> root;
+    PollOneBridge*             bridge = nullptr;
+
+    /// 请求取消: 只发信号, 不强断协程
+    void requestCancel() noexcept override {
+        if (cancelSignal) {
+            cancelSignal->emit(asio::cancellation_type::terminal);
+        }
+    }
+
+    /// 上报终态 (恰好一次; 停止路径可能已认领)
+    void finish(int32_t status, std::string_view body) noexcept {
+        if (!root || !root->claimFinish()) {
             return;
         }
-        // 任务协程以引用接收 ctl：必须由 SpawnRecord 持有到任务结束（不能放在
-        // starter 的栈上，否则任务一挂起就悬垂）。
-        if (!rec->ctl) {
-            rec->ctl = std::make_shared<OpCtl>(OpCtl{cancelFlag, nullptr, std::string{}, {}});
+        if (bridge) {
+            bridge->removePolledRoot(root);
         }
-        auto task = (*closure)(ctx, *rec->ctl);
-        if (task.handle_) {
-            auto h        = task.handle_;
-            task.handle_  = nullptr;
-            auto& p       = h.promise();
-            p.host_       = ctx.host;
-            p.cancelFlag_ = cancelFlag;
-            p.notify_     = hostNotify;
-            if (!h.done()) {
-                rec->coroAddr = h.address();
-            }
-
-            // 任务首步由 host driver 推进, 因此 spawn 不会在调用方栈里同步跑任务体
-            // (调用方可能正处在主程序 start/注册事务中)。桥停止时会经 [BridgeRoot]
-            // 把任务上报为失败, 帧也随之销毁。
-            detail::startBridgedRoot(ctx.bridge(), hostNotify, h, [recWeak, closure] {
-                if (auto recSp = recWeak.lock()) {
-                    recSp->coroAddr = nullptr;
-                }
-            });
-        }
-    };
-    rec->starter = starter;
-    ctx.spawns_.push_back(rec);
-    // 任务体仍然不在当前调用栈里跑: [startBridgedRoot] 会把首步投递到本地执行器,
-    // 由主程序下一次 driver 推进。所以这里直接调 starter 只是"建帧 + 排队",
-    // 不需要再借 scheduler 做一次阻塞往返 (早期的 post_to_io 已删除)。
-    if (rec->starter) {
-        auto starterFn = std::move(rec->starter);
-        rec->starter   = nullptr;
-        starterFn();
+        root->notifyHost(status, body);
     }
+};
+
+/// 跑一条业务协程, 完成时把值/异常转成 (终态, 正文) 并上报
+///
+/// `onValue` / `onError` 的返回值都是 `std::pair<int32_t, std::string>`。
+template<typename AwaitableT, typename OnValue, typename OnError>
+inline asio::awaitable<void> runProviderRoot(
+    std::shared_ptr<ProviderRoot> pr,
+    AwaitableT                    aw,
+    OnValue                       onValue,
+    OnError                       onError
+) {
+    int32_t     status = PLUGINXX_OPERATOR_OK;
+    std::string body;
+    try {
+        auto value = co_await std::move(aw);
+        auto pair  = onValue(std::move(value));
+        status     = pair.first;
+        body       = std::move(pair.second);
+    } catch (...) {
+        auto pair = onError(std::current_exception());
+        status    = pair.first;
+        body      = std::move(pair.second);
+    }
+    pr->finish(status, body);
 }
 
+/// 把业务协程排进桥的本地执行器当 provider 根推进
+///
+/// - `makeAwaitable(pr)` 在根建好之后调用 (业务入参可以指向根拥有的数据);
+/// - 首步自己 `wake()`: 本地执行器只在主程序驱动时被 poll;
+/// - 返回的根指针就是主程序侧的可取消句柄 ([ProviderRoot::requestCancel])。
+template<typename MakeAw, typename OnValue, typename OnError>
+inline std::shared_ptr<ProviderRoot> startProviderRoot(
+    PollOneBridge&                bridge,
+    const PluginxxOperatorNotify& notify,
+    MakeAw&&                      makeAw,
+    OnValue&&                     onValue,
+    OnError&&                     onError
+) {
+    auto pr    = std::make_shared<ProviderRoot>();
+    pr->notify = notify;
+    pr->bridge = &bridge;
+    pr->root   = std::make_shared<PolledRoot>(notify);
+    bridge.addPolledRoot(pr->root);
+    // 建协程帧并排进本地执行器 (首步恒异步), 然后自己提一次驱动请求
+    auto aw = makeAw(pr);
+    bridge.wake();
+    asio::co_spawn(
+        bridge.local_executor(),
+        detail::runProviderRoot<decltype(aw), std::decay_t<OnValue>, std::decay_t<OnError>>(
+            pr,
+            std::move(aw),
+            std::forward<OnValue>(onValue),
+            std::forward<OnError>(onError)
+        ),
+        // 业务协程的取消槽接到根的取消信号上: [ProviderRoot::requestCancel] 因此能
+        // 撤销协程里正在等的表调用 (例如计时器 / 模型请求)。
+        asio::bind_cancellation_slot(pr->cancelSignal->slot(), asio::detached)
+    );
+    return pr;
+}
 } // namespace detail
 
+/// 起一条后台协作任务 (任务体写成 `asio::awaitable<void>`)
+///
+/// asio 管帧 (`co_spawn` 到桥的本地执行器), 完成时上报一次。
+///
+/// 入参形如 (Ctx&, OpCtl&) (也可以只收 Ctx&), 闭包按值搬进协程帧。
 template<typename Ctx, typename Fn>
 inline void spawn(Ctx& ctx, Fn&& fn) {
-    detail::spawnTaskImpl(ctx, std::forward<Fn>(fn));
+    detail::spawnAwaitableImpl(ctx, std::forward<Fn>(fn));
 }
-
-namespace detail {
-
-/// 结果类型 (定义在本文件后半; 声明模板时只需不完整类型)
-struct TableOpResult;
-
-/// 通用表的阻塞调用形态: 只取结果正文 (失败 = 空串)
-template<typename StartFn>
-std::string tableOpText(
-    const PluginxxHost*           host,
-    const PluginxxCancelIface*    cancel,
-    const PluginxxSchedulerIface* scheduler,
-    StartFn&&                     start
-);
-
-/// 通用表的阻塞调用形态: 只看成败
-template<typename StartFn>
-bool tableOpOk(
-    const PluginxxHost*           host,
-    const PluginxxCancelIface*    cancel,
-    const PluginxxSchedulerIface* scheduler,
-    StartFn&&                     start
-);
-
-} // namespace detail
-
-/// 通用表的阻塞调用形态 (定义在本文件后半)
-///
-/// 实例上下文基类在定义之前, 所以先在这里声明 (结果类型在定义处才完整)。
-template<typename StartFn>
-detail::TableOpResult tableOpSyncWait(
-    const PluginxxHost*           host,
-    const PluginxxCancelIface*    cancel,
-    const PluginxxSchedulerIface* scheduler,
-    StartFn&&                     start,
-    int64_t                       timeoutMs,
-    SyncWaitThreadPolicy          pluginThreadPolicy
-);
 
 /* ==================== 插件实例上下文基类 (通用部分) ==================== */
 
@@ -3347,84 +2782,72 @@ public:
         log.logFn    = (iface.log && iface.log->log) ? iface.log->log : nullptr;
     }
 
-    /// 主程序配置 JSON (失败给 `{}`)
-    ///
-    /// 表成员是异步操作契约, 这里用阻塞形态: 调用方本来就在主程序 IO 线程时内联完成。
-    std::string config() const {
+    /// 主程序配置 JSON (**协程形态**; 失败给 `{}`)
+    asio::awaitable<std::string> configAsync() const {
         if (!host || !iface.config || !iface.config->get_config) {
-            return "{}";
+            co_return std::string{"{}"};
         }
-        auto text = detail::tableOpText(
-            host,
-            iface.cancel,
-            iface.scheduler,
-            [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
-                return iface.config->get_config(host, cb, ud, err);
-            }
-        );
-        return text.empty() ? std::string{"{}"} : text;
+        auto r = co_await asyncTableOp(*this, co_await asio::this_coro::executor, [this](PluginxxOperatorCallback cb,
+                                                                 void*           ud,
+                                                                 PluginxxString* err) {
+            return iface.config->get_config(host, cb, ud, err);
+        });
+        co_return (r.ok() && !r.text().empty()) ? std::string{r.text()} : std::string{"{}"};
     }
 
-    /// 本插件配置参数 JSON (失败给 `{}`)
-    std::string argsJson() const {
+    /// 本插件配置参数 JSON (**协程形态**; 失败给 `{}`)
+    asio::awaitable<std::string> argsJsonAsync() const {
         if (!host || !iface.config || !iface.config->get_plugin_args) {
-            return "{}";
+            co_return std::string{"{}"};
         }
-        return detail::tableOpText(
-            host,
-            iface.cancel,
-            iface.scheduler,
-            [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
-                return iface.config->get_plugin_args(host, cb, ud, err);
-            }
-        );
+        auto r = co_await asyncTableOp(*this, co_await asio::this_coro::executor, [this](PluginxxOperatorCallback cb,
+                                                                 void*           ud,
+                                                                 PluginxxString* err) {
+            return iface.config->get_plugin_args(host, cb, ud, err);
+        });
+        co_return r.ok() ? std::string{r.text()} : std::string{"{}"};
     }
 
-    /// 本插件配置文件路径 (未配置给空串)
-    std::string configPath() const {
+    /// 本插件配置文件路径 (**协程形态**; 未配置给空串)
+    asio::awaitable<std::string> configPathAsync() const {
         if (!host || !iface.config || !iface.config->get_plugin_config_path) {
-            return "";
+            co_return std::string{};
         }
-        return detail::tableOpText(
-            host,
-            iface.cancel,
-            iface.scheduler,
-            [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
-                return iface.config->get_plugin_config_path(host, cb, ud, err);
-            }
-        );
+        auto r = co_await asyncTableOp(*this, co_await asio::this_coro::executor, [this](PluginxxOperatorCallback cb,
+                                                                 void*           ud,
+                                                                 PluginxxString* err) {
+            return iface.config->get_plugin_config_path(host, cb, ud, err);
+        });
+        co_return r.ok() ? std::string{r.text()} : std::string{};
     }
 
-    /// 当前语言 (取不到给 `en`; 高频值建议在 `start` / `mount` 里缓存)
-    std::string language() const {
+    /// 当前语言 (**协程形态**; 取不到给 `en`; 高频值建议缓存到实例上)
+    asio::awaitable<std::string> languageAsync() const {
         if (!host || !iface.config || !iface.config->get_language) {
-            return "en";
+            co_return std::string{"en"};
         }
-        auto text = detail::tableOpText(
-            host,
-            iface.cancel,
-            iface.scheduler,
-            [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
-                return iface.config->get_language(host, cb, ud, err);
-            }
-        );
-        return text.empty() ? std::string{"en"} : text;
+        auto r = co_await asyncTableOp(*this, co_await asio::this_coro::executor, [this](PluginxxOperatorCallback cb,
+                                                                 void*           ud,
+                                                                 PluginxxString* err) {
+            return iface.config->get_language(host, cb, ud, err);
+        });
+        co_return (r.ok() && !r.text().empty()) ? std::string{r.text()} : std::string{"en"};
     }
 
-    /// 切换语言 (返回是否受理且成功)
-    bool setLanguage(std::string_view lang) const {
+    /// 切换语言 (**协程形态**; 返回是否受理且成功)
+    asio::awaitable<bool> setLanguageAsync(std::string lang) const {
         if (!host || !iface.config || !iface.config->set_language) {
-            return false;
+            co_return false;
         }
-        auto langSv = PluginStringView::from(lang.data(), lang.size());
-        return detail::tableOpOk(
-            host,
-            iface.cancel,
-            iface.scheduler,
-            [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
+        auto langSv = PluginStringView::from(lang);
+        auto r      = co_await asyncTableOp(
+            *this,
+            co_await asio::this_coro::executor,
+            [this, &langSv](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
                 return iface.config->set_language(host, &langSv, cb, ud, err);
             }
         );
+        co_return r.ok();
     }
 
     char* strdup(PluginxxStringView sv) const {
@@ -3521,16 +2944,11 @@ public:
     }
 
     struct SpawnRecord {
-        std::function<void()>              starter;
         std::shared_ptr<std::atomic<bool>> cancelFlag;
-        void*                              coroAddr = nullptr;
         /// 后台任务的 OpCtl 由记录持有：任务协程以引用接收它，必须在挂起后仍然
-        /// 有效（放在 starter 栈上会悬垂）。
+        /// 有效（放在协程栈上会悬垂）。
         std::shared_ptr<OpCtl> ctl;
-        /// 任务体的闭包保活 (类型擦除): 协程帧只保存闭包指针, 而闭包本身是
-        /// `spawn(...)` 的实参临时量 —— 记录不持有它, 任务一挂起就悬垂
-        /// (ASan 实测 heap-use-after-free)。
-        std::shared_ptr<void> closureKeepAlive;
+        std::shared_ptr<asio::cancellation_signal> cancelSignal;
     };
 
     std::vector<std::shared_ptr<SpawnRecord>> spawns_;
@@ -3540,24 +2958,19 @@ public:
             if (!rec) {
                 continue;
             }
-            rec->starter = nullptr;
-            if (rec->cancelFlag) {
-                rec->cancelFlag->store(true, std::memory_order_release);
-            }
-            if (rec->coroAddr) {
-                auto handle
-                    = std::coroutine_handle<detail::PromiseBase<void>>::from_address(rec->coroAddr);
-                handle.promise().cancel_outstanding();
+            if (rec->cancelSignal) {
+                rec->cancelSignal->emit(asio::cancellation_type::terminal);
             }
         }
         spawns_.clear();
     }
 
-    /// 启动后台协作任务 (完成协议见 [detail::spawnTaskImpl])
+    /// 启动后台协作任务 (完成协议见 [detail::spawnAwaitableImpl])
+    /// - 任务体写成 `asio::awaitable<void>`: asio 管帧, `co_spawn` 到桥的本地执行器
     /// - 任务协程以本实例引用接收 OpCtl; 主程序取消/实例析构时由 [stopSpawns] 收束
     template<typename Self, typename Fn>
     void spawn(this Self& self, Fn&& fn) {
-        detail::spawnTaskImpl(self, std::forward<Fn>(fn));
+        detail::spawnAwaitableImpl(self, std::forward<Fn>(fn));
     }
 
     /// 业务初始化 (**协程**: create 事务在 [attachHost] 之后 await 它)
@@ -3567,7 +2980,7 @@ public:
     /// create 事务转成失败通知)。
     ///
     /// **对外可见是为了让 create 事务能调它** (不是给插件业务代码调的)。
-    virtual pluginxx::Task<void> onHostReady() { co_return; }
+    virtual asio::awaitable<void> onHostReady() { co_return; }
 
 private:
 
@@ -3580,25 +2993,6 @@ private:
 /* ==================== 锚定原语 awaiter 族 ==================== */
 
 namespace detail {
-
-struct YieldAwaiter {
-    const PluginxxHost* host;
-    /// 协程驱动桥: "让出" = 投递到本地执行器 + 唤醒 driver, 由下一次请求推进,
-    /// 因此主程序与插件任务按轮次交替。
-    PollOneBridge* bridge = nullptr;
-
-    bool await_ready() noexcept {
-        return false;
-    }
-
-    template<typename Promise>
-    bool await_suspend(std::coroutine_handle<Promise> h) {
-        resumePluginCoroutine(bridge, h);
-        return true;
-    }
-
-    void await_resume() const {}
-};
 
 enum class AwaiterState : uint32_t {
     INIT      = 0,
@@ -3617,598 +3011,166 @@ inline std::string takeHostError(const PluginxxHost* host, PluginxxString& s) {
     return out;
 }
 
-/// 一次 `sleep` 的提交状态 (**构造即提交**, 与 [TableOpState] 同一套唤醒协议)
-struct SleepState {
-    const PluginxxHost*        host   = nullptr;
-    const PluginxxCancelIface* cancel = nullptr;
-    /// 协程驱动桥 (完成回调经它恢复挂起的帧)
-    PollOneBridge*             bridge = nullptr;
-    std::atomic<AwaiterState>  state{AwaiterState::INIT};
-    /// 终态 (`PLUGINXX_OPERATOR_*`)
-    int32_t                 status = PLUGINXX_OPERATOR_OK;
-    /// 失败/取消原因 (终态非 OK 时有意义)
-    std::string             error;
-    /// 未受理原因 (非空 = 压根没开始计时)
-    std::string             startError;
-    PluginxxOperatorHandle* opHandle = nullptr;
-    void*                   coroAddr = nullptr;
-    void (*resumeEntry)(SleepState*) = nullptr;
-};
+/* ---- asio 形态的 offload (给插件自有 io_context 上的 `asio::awaitable` 用) ---- */
 
-/// `sleep` 的凭据 (**调用即提交**)
+/// asio 形态 offload 的结果
 ///
-/// - `co_await sleep(ctx, 200)` 与以前写法一样;
-/// - 也可以先拿凭据、先干别的, 需要结果时再 `co_await`;
-/// - 多条并行用 [whenAll]; 完成后结果不会再重跑;
-/// - `cancel()` 是显式动作 (await 时抛 `CanceledException`)。
-class [[nodiscard]] SleepTicket {
-public:
-    /// 泛化入口 (`whenAll` 等) 需要的结果类型: sleep 没有返回值
-    using result_type = std::monostate;
-
-    SleepTicket() = default;
-
-    explicit SleepTicket(std::shared_ptr<SleepState> st) noexcept : st_(std::move(st)) {}
-
-    /// 主程序受理了这次计时 (false = 压根没开始, 原因在 `await_resume` 抛的文本里)
-    bool accepted() const noexcept {
-        return st_ && st_->startError.empty();
-    }
-
-    /// 已有结果 (为真时 `co_await` 不挂起)
-    bool done() const noexcept {
-        return !st_ || st_->state.load(std::memory_order_acquire) == AwaiterState::COMPLETED;
-    }
-
-    /// 请求取消 (协作式, 不等待; 终态仍通过 `co_await` 取)
-    void cancel() const noexcept {
-        if (st_ && st_->cancel && st_->cancel->op_cancel && st_->opHandle) {
-            st_->cancel->op_cancel(st_->opHandle);
-        }
-    }
-
-    /// 提交完不管 (计时照常结束, 没人看结果)
-    void forget() const noexcept {}
-
-    bool await_ready() const noexcept {
-        return done();
-    }
-
-    template<typename Promise>
-    bool await_suspend(std::coroutine_handle<Promise> h) {
-        auto st = st_;
-        if (!st) {
-            return false;
-        }
-        st->coroAddr    = h.address();
-        st->resumeEntry = +[](SleepState* s) {
-            auto handle = std::coroutine_handle<Promise>::from_address(s->coroAddr);
-            handle.promise().clear_outstanding();
-            resumePluginCoroutine(s->bridge, handle);
-        };
-
-        auto expected = AwaiterState::INIT;
-        if (!st->state.compare_exchange_strong(
-                expected,
-                AwaiterState::CALLING,
-                std::memory_order_acq_rel
-            )) {
-            // 已经有结果 (或已被别的协程接管): 不挂起, 当场取结果
-            return false;
-        }
-        auto installing = AwaiterState::CALLING;
-        if (!st->state.compare_exchange_strong(
-                installing,
-                AwaiterState::SUSPENDED,
-                std::memory_order_acq_rel
-            )) {
-            // 完成回调在安装期间到达: 结果已记下, 这里不挂起
-            return false;
-        }
-        h.promise().set_outstanding([st] {
-            if (st->cancel && st->cancel->op_cancel && st->opHandle) {
-                st->cancel->op_cancel(st->opHandle);
-            }
-        });
-        return true;
-    }
-
-    void await_resume() const;
-
-private:
-    std::shared_ptr<SleepState> st_;
+/// 状态、原因与工作体返回值都放在这个结构里, 完成处理器里**不抛异常** (它可能在
+/// 任意线程上跑); 取值/抛异常的规则与 [asyncOffload] 一致, 由调用方那一侧判断。
+template<typename ResultT>
+struct OffloadOutcome {
+    /// `PLUGINXX_OPERATOR_*`
+    int32_t status = PLUGINXX_OPERATOR_OK;
+    /// 主程序给的失败/取消原因
+    std::string error;
+    /// 未受理的原因 (非空表示压根没开始)
+    std::string startError;
+    /// 工作体抛出的异常
+    std::exception_ptr workError;
+    /// 工作体返回值 (void 时用 monostate 占位)
+    std::conditional_t<std::is_void_v<ResultT>, std::monostate, std::optional<ResultT>> value;
 };
 
-/// 提交一次计时 (**立即开始**, 不等)
-inline SleepTicket submitSleep(
-    const PluginxxHost*           host,
-    const PluginxxSchedulerIface* sched,
-    const PluginxxCancelIface*    cancel,
-    PollOneBridge*                bridge,
-    int64_t                       ms
-) {
-    auto st    = std::make_shared<SleepState>();
-    st->host   = host;
-    st->cancel = cancel;
-    st->bridge = bridge;
-    if (ms <= 0) {
-        st->state.store(AwaiterState::COMPLETED, std::memory_order_release);
-        return SleepTicket{std::move(st)};
-    }
-    if (!sched || !sched->sleep) {
-        st->status     = PLUGINXX_OPERATOR_FAILED;
-        st->startError = "scheduler sleep is unavailable";
-        st->state.store(AwaiterState::COMPLETED, std::memory_order_release);
-        return SleepTicket{std::move(st)};
-    }
+/// asio 异步操作形态的 offload 状态 (恢复经 `asio::post`, 不经协程驱动桥)
+template<typename Handler, typename Executor, typename ResultT, typename WorkFn>
+struct AsyncOffloadState {
+    Handler                 handler;
+    Executor                ex;
+    WorkFn                  work;
+    OffloadOutcome<ResultT> outcome;
+    std::atomic<bool>       fired{false};
 
-    auto*          holder = new std::shared_ptr<SleepState>(st);
-    PluginxxString err{nullptr, 0};
-    st->opHandle = sched->sleep(
-        host,
-        ms,
-        [](void* ud, int32_t status, const PluginxxStringView* payload) {
-            auto* hp = static_cast<std::shared_ptr<SleepState>*>(ud);
-            auto  s  = *hp;
-            delete hp;
+    AsyncOffloadState(Handler inHandler, Executor inEx, WorkFn inWork) :
+        handler(std::move(inHandler)),
+        ex(std::move(inEx)),
+        work(std::move(inWork)) {}
+};
 
-            s->status = status;
-            if (payload && payload->data && payload->size > 0) {
-                s->error.assign(payload->data, static_cast<size_t>(payload->size));
-            }
-            // 状态规则与 [TableOpState] 一致: 只有"已经挂起"才恢复协程
-            auto expected = AwaiterState::INIT;
-            if (s->state.compare_exchange_strong(
-                    expected,
-                    AwaiterState::COMPLETED,
-                    std::memory_order_acq_rel
-                )) {
-                return;
-            }
-            auto installing = AwaiterState::CALLING;
-            if (s->state.compare_exchange_strong(
-                    installing,
-                    AwaiterState::COMPLETED,
-                    std::memory_order_acq_rel
-                )) {
-                return;
-            }
-            s->state.store(AwaiterState::COMPLETED, std::memory_order_release);
-            if (s->resumeEntry) {
-                s->resumeEntry(s.get());
-            }
-        },
-        holder,
-        &err
-    );
-    if (!st->opHandle) {
-        delete holder;
-        st->status     = PLUGINXX_OPERATOR_FAILED;
-        st->startError = takeHostError(host, err);
-        if (st->startError.empty()) {
-            st->startError = "plugin sleep was not accepted";
-        }
-        st->state.store(AwaiterState::COMPLETED, std::memory_order_release);
-    }
-    return SleepTicket{std::move(st)};
-}
-
-inline void SleepTicket::await_resume() const {
-    if (!st_) {
+/// 把结果投到执行器并调用完成处理器 (恰好一次)
+template<typename State>
+inline void finishAsyncOffload(const std::shared_ptr<State>& st) {
+    if (st->fired.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
-    if (!st_->startError.empty()) {
-        throw std::runtime_error(st_->startError);
-    }
-    if (st_->status == PLUGINXX_OPERATOR_CANCELED) {
-        throw CanceledException(st_->error.empty() ? "sleep canceled" : st_->error);
-    }
-    if (st_->status == PLUGINXX_OPERATOR_FAILED) {
-        throw std::runtime_error(st_->error.empty() ? "sleep failed" : st_->error);
-    }
+    asio::post(
+        st->ex,
+        [st]() mutable {
+            auto handler = std::move(st->handler);
+            handler(std::move(st->outcome));
+        }
+    );
 }
 
-/// `offload` 工作体的类型擦除基类 (工作体可能是只可移动的 lambda, 不能用 std::function)
-template<typename ResultT>
-struct OffloadWorkBase {
-    virtual ~OffloadWorkBase()                    = default;
-    virtual void run(const PluginxxCancelToken*) = 0;
-};
+/// asio 异步操作形态的 offload 发起器: 调用处即提交, 结果经 `asio::post` 回到执行器
+template<typename Executor, typename ResultT, typename WorkFn>
+struct AsyncOffloadInitiation {
+    const PluginxxHost*           host  = nullptr;
+    const PluginxxSchedulerIface* sched = nullptr;
+    Executor                      ex;
+    WorkFn                        work;
 
-/// 一次 `offload` 的提交状态
-///
-/// 工作体在**主程序工作池**线程上跑 (显式例外), 完成回调里再唤醒插件协程;
-/// 工作体与结果都由本结构拥有, 直到完成回调把它交还为止。
-template<typename ResultT>
-struct OffloadState {
-    using result_type = ResultT;
-
-    const PluginxxHost*        host   = nullptr;
-    const PluginxxCancelIface* cancel = nullptr;
-    PollOneBridge*             bridge = nullptr;
-    std::atomic<AwaiterState>  state{AwaiterState::INIT};
-    /// 工作体返回值 (void 时用 monostate 占位)
-    std::conditional_t<std::is_void_v<ResultT>, std::monostate, std::optional<ResultT>> result;
-    /// 工作体抛出的异常 (原样重抛)
-    std::exception_ptr      workError;
-    std::unique_ptr<OffloadWorkBase<ResultT>> work;
-    int32_t                 status = PLUGINXX_OPERATOR_OK;
-    std::string             error;
-    std::string             startError;
-    PluginxxOperatorHandle* opHandle = nullptr;
-    void*                   coroAddr = nullptr;
-    void (*resumeEntry)(OffloadState*) = nullptr;
-};
-
-template<typename ResultT, typename Fn>
-struct OffloadWork : OffloadWorkBase<ResultT> {
-    Fn                      fn;
-    OffloadState<ResultT>*  st = nullptr;
-
-    OffloadWork(Fn&& inFn, OffloadState<ResultT>* inState) :
-        fn(std::move(inFn)),
-        st(inState) {}
-
-    void run(const PluginxxCancelToken* token) override {
-        if constexpr (std::is_void_v<ResultT>) {
-            fn(token);
-        } else {
-            st->result = fn(token);
-        }
-    }
-};
-
-/// `offload` 的凭据 (**调用即提交**)
-///
-/// - `co_await offload(ctx, [&]{ ... })` 与以前写法一样;
-/// - 也可以先提交几条, 用 [whenAll] 一次等齐 (总耗时 = 最慢那条);
-/// - 工作体在主程序工作池线程上跑, 所以回调/工具体里可以放阻塞工作;
-/// - `cancel()` 是显式动作 (await 时抛 `CanceledException`)。
-template<typename ResultT>
-class [[nodiscard]] OffloadTicket {
-public:
-    /// 泛化入口 (`whenAll` 等) 需要的结果类型 (void 结果用 `monostate` 占位)
-    using result_type = std::conditional_t<std::is_void_v<ResultT>, std::monostate, ResultT>;
-
-    OffloadTicket() = default;
-
-    explicit OffloadTicket(std::shared_ptr<OffloadState<ResultT>> st) noexcept : st_(std::move(st)) {}
-
-    /// 主程序受理了这次提交 (false = 压根没开始, 原因在 `await_resume` 抛的文本里)
-    bool accepted() const noexcept {
-        return st_ && st_->startError.empty();
-    }
-
-    /// 已有结果 (为真时 `co_await` 不挂起)
-    bool done() const noexcept {
-        return !st_ || st_->state.load(std::memory_order_acquire) == AwaiterState::COMPLETED;
-    }
-
-    /// 请求取消 (协作式, 不等待; 终态仍通过 `co_await` 取)
-    void cancel() const noexcept {
-        if (st_ && st_->cancel && st_->cancel->op_cancel && st_->opHandle) {
-            st_->cancel->op_cancel(st_->opHandle);
-        }
-    }
-
-    /// 提交完不管 (工作照常跑, 没人看结果)
-    void forget() const noexcept {}
-
-    bool await_ready() const noexcept {
-        return done();
-    }
-
-    template<typename Promise>
-    bool await_suspend(std::coroutine_handle<Promise> h) {
-        auto st = st_;
-        if (!st) {
-            return false;
-        }
-        st->coroAddr    = h.address();
-        st->resumeEntry = +[](OffloadState<ResultT>* s) {
-            auto handle = std::coroutine_handle<Promise>::from_address(s->coroAddr);
-            handle.promise().clear_outstanding();
-            resumePluginCoroutine(s->bridge, handle);
-        };
-
-        auto expected = AwaiterState::INIT;
-        if (!st->state.compare_exchange_strong(
-                expected,
-                AwaiterState::CALLING,
-                std::memory_order_acq_rel
-            )) {
-            return false;
-        }
-        auto installing = AwaiterState::CALLING;
-        if (!st->state.compare_exchange_strong(
-                installing,
-                AwaiterState::SUSPENDED,
-                std::memory_order_acq_rel
-            )) {
-            return false;
-        }
-        h.promise().set_outstanding([st] {
-            if (st->cancel && st->cancel->op_cancel && st->opHandle) {
-                st->cancel->op_cancel(st->opHandle);
-            }
-        });
-        return true;
-    }
-
-    ResultT await_resume() {
-        if (st_) {
-            if (!st_->startError.empty()) {
-                throw std::runtime_error(st_->startError);
-            }
-            if (st_->workError) {
-                std::rethrow_exception(st_->workError);
-            }
-            if (st_->status == PLUGINXX_OPERATOR_CANCELED) {
-                throw CanceledException(st_->error.empty() ? "offload canceled" : st_->error);
-            }
-            if (st_->status == PLUGINXX_OPERATOR_FAILED) {
-                throw std::runtime_error(st_->error.empty() ? "offload failed" : st_->error);
-            }
-        }
-        if constexpr (std::is_void_v<ResultT>) {
+    template<typename Handler>
+    void operator()(Handler&& handler) {
+        using H     = std::decay_t<Handler>;
+        using State = AsyncOffloadState<H, Executor, ResultT, WorkFn>;
+        auto st     = std::make_shared<State>(H(std::forward<Handler>(handler)), ex, std::move(work));
+        if (!sched || !sched->offload) {
+            st->outcome.status     = PLUGINXX_OPERATOR_FAILED;
+            st->outcome.startError = "scheduler offload is unavailable";
+            finishAsyncOffload<State>(st);
             return;
-        } else {
-            if (!st_ || !st_->result) {
-                return ResultT{};
-            }
-            return std::move(*st_->result);
         }
-    }
-
-private:
-    std::shared_ptr<OffloadState<ResultT>> st_;
-};
-
-/// 提交一次阻塞工作 (**立即开始**; 工作体在主程序工作池线程上跑)
-template<typename WorkFn>
-inline auto submitOffload(
-    const PluginxxHost*           host,
-    const PluginxxSchedulerIface* sched,
-    const PluginxxCancelIface*    cancel,
-    PollOneBridge*                bridge,
-    WorkFn&&                      work
-) -> OffloadTicket<std::decay_t<std::invoke_result_t<WorkFn, const PluginxxCancelToken*>>> {
-    using ResultType = std::decay_t<std::invoke_result_t<WorkFn, const PluginxxCancelToken*>>;
-    using State      = OffloadState<ResultType>;
-
-    auto st    = std::make_shared<State>();
-    st->host   = host;
-    st->cancel = cancel;
-    st->bridge = bridge;
-
-    if (!sched || !sched->offload) {
-        st->status     = PLUGINXX_OPERATOR_FAILED;
-        st->startError = "scheduler offload is unavailable";
-        st->state.store(AwaiterState::COMPLETED, std::memory_order_release);
-        return OffloadTicket<ResultType>{std::move(st)};
-    }
-
-    st->work = std::make_unique<OffloadWork<ResultType, std::decay_t<WorkFn>>>(
-        std::forward<WorkFn>(work),
-        st.get()
-    );
-
-    // 主程序给 work 与 done 的是**同一个** user_data, 且 done 总在 work 之后:
-    // 堆上只留一份持有者, 由 done 回调释放 (work 只借用)。
-    auto* holder = new std::shared_ptr<State>(st);
-    PluginxxString err{nullptr, 0};
-    st->opHandle = sched->offload(
-        host,
-        [](void* ud, const PluginxxCancelToken* token, PluginxxString* error_out) -> void* {
-            auto* hp = static_cast<std::shared_ptr<State>*>(ud);
-            auto  s  = *hp;
-            try {
-                if (s->work) {
-                    s->work->run(token);
-                }
-            } catch (...) {
-                s->workError = std::current_exception();
-            }
-            // 工作体已返回才释放它 (工作体自身可能就在它里面)
-            s->work.reset();
-            if (error_out) {
-                *error_out = PluginxxString{nullptr, 0};
-            }
-            return nullptr;
-        },
-        [](void* ud, int32_t status, void*, const PluginxxStringView* errView) {
-            auto* hp = static_cast<std::shared_ptr<State>*>(ud);
-            auto  s  = *hp;
-            delete hp;
-
-            s->status = status;
-            s->error  = PluginStringView::str(errView);
-            // 状态规则与 [TableOpState] 一致: 只有"已经挂起"才恢复协程
-            auto expected = AwaiterState::INIT;
-            if (s->state.compare_exchange_strong(
-                    expected,
-                    AwaiterState::COMPLETED,
-                    std::memory_order_acq_rel
-                )) {
-                return;
-            }
-            auto installing = AwaiterState::CALLING;
-            if (s->state.compare_exchange_strong(
-                    installing,
-                    AwaiterState::COMPLETED,
-                    std::memory_order_acq_rel
-                )) {
-                return;
-            }
-            s->state.store(AwaiterState::COMPLETED, std::memory_order_release);
-            if (s->resumeEntry) {
-                s->resumeEntry(s.get());
-            }
-        },
-        holder,
-        &err
-    );
-    if (!st->opHandle) {
-        delete holder;
-        st->work       = nullptr;
-        st->status     = PLUGINXX_OPERATOR_FAILED;
-        st->startError = takeHostError(host, err);
-        if (st->startError.empty()) {
-            st->startError = "plugin offload was not accepted";
-        }
-        st->state.store(AwaiterState::COMPLETED, std::memory_order_release);
-    }
-    return OffloadTicket<ResultType>{std::move(st)};
-}
-
-struct InvokeCapState {
-    const PluginxxHost*              host = nullptr;
-    const PluginxxCapabilitiesIface* caps = nullptr;
-    /// 异步操作句柄的取消入口 (`cancel.op_cancel`)
-    const PluginxxCancelIface* cancelIface = nullptr;
-    PluginxxScopeRef                 scope{}; ///< 归属引用 (借用视图指向 awaiter 内部)
-    std::string                      scopeId;
-    uint64_t                         scopeSeq = 0;
-
-    /// 归属引用 (空 id 时返回 NULL; 否则指向本结构体内部, 仅供本次调用)
-    const PluginxxScopeRef* scopeRef() {
-        if (scopeId.empty()) {
-            return nullptr;
-        }
-        scope.struct_size = static_cast<uint32_t>(sizeof(PluginxxScopeRef));
-        scope.flags       = 0;
-        scope.id          = PluginStringView::from(scopeId.data(), scopeId.size());
-        scope.seq         = scopeSeq;
-        return &scope;
-    }
-
-    /// 协程驱动桥 (可空): 完成回调经它投递 continuation 并唤醒 driver。
-    PollOneBridge*            bridge = nullptr;
-    std::string               capability;
-    std::string               argsJson;
-    PluginxxOperatorHandle*   opHandle = nullptr;
-    int32_t                   status   = PLUGINXX_OPERATOR_OK;
-    std::string               payload;
-    std::string               startError;
-    std::atomic<AwaiterState> state{AwaiterState::INIT};
-    void*                     coroAddr = nullptr;
-};
-
-struct InvokeCapAwaiter {
-    std::shared_ptr<InvokeCapState> st;
-
-    InvokeCapAwaiter(
-        const PluginxxHost*              in_host,
-        const PluginxxCapabilitiesIface* in_caps,
-        const PluginxxCancelIface*       in_cancel,
-        std::string_view                 in_cap,
-        std::string_view                 in_args,
-        PollOneBridge*                   in_bridge   = nullptr,
-        std::string_view                 in_scope    = {},
-        uint64_t                         in_scopeSeq = 0
-    ) :
-        st(std::make_shared<InvokeCapState>()) {
-        st->host        = in_host;
-        st->caps        = in_caps;
-        st->cancelIface = in_cancel;
-        st->capability  = std::string(in_cap);
-        st->argsJson    = std::string(in_args);
-        st->bridge      = in_bridge;
-        st->scopeId     = std::string(in_scope);
-        st->scopeSeq    = in_scopeSeq;
-    }
-
-    bool await_ready() const noexcept {
-        return !st || !st->caps || !st->caps->invoke_capability;
-    }
-
-    template<typename Promise>
-    bool await_suspend(std::coroutine_handle<Promise> h) {
-        st->coroAddr = h.address();
-        st->state.store(AwaiterState::CALLING, std::memory_order_release);
-
-        auto*          holder = new std::shared_ptr<InvokeCapState>(st);
+        // 主程序给 work 与 done 的是同一个 user_data, 且 done 总在 work 之后:
+        // 堆上只留一份持有者, 由 done 回调释放 (work 只借用)
+        auto* holder = new std::shared_ptr<State>(st);
         PluginxxString err{nullptr, 0};
-        auto           capSv = PluginStringView::from(st->capability.data(), st->capability.size());
-        auto           argsSv = PluginStringView::from(st->argsJson.data(), st->argsJson.size());
-
-        st->opHandle = st->caps->invoke_capability(
-            st->host,
-            st->scopeRef(),
-            &capSv,
-            &argsSv,
-            0, ///< 阶段: 0 = 走完整链 before → impl → after
-            [](void* ud, int32_t cbSt, const PluginxxStringView* pl) {
-                auto* hp = static_cast<std::shared_ptr<InvokeCapState>*>(ud);
+        auto*          op = sched->offload(
+            host,
+            [](void* ud, const PluginxxCancelToken* token, PluginxxString* error_out) -> void* {
+                auto* hp = static_cast<std::shared_ptr<State>*>(ud);
                 auto  s  = *hp;
+                try {
+                    if constexpr (std::is_void_v<ResultT>) {
+                        s->work(token);
+                    } else {
+                        s->outcome.value = s->work(token);
+                    }
+                } catch (...) {
+                    s->outcome.workError = std::current_exception();
+                }
+                if (error_out) {
+                    *error_out = PluginxxString{nullptr, 0};
+                }
+                return nullptr;
+            },
+            [](void* ud, int32_t status, void*, const PluginxxStringView* errView) {
+                auto* hp = static_cast<std::shared_ptr<State>*>(ud);
+                auto  s  = std::move(*hp);
                 delete hp;
-
-                s->status = cbSt;
-                if (pl && pl->data && pl->size > 0) {
-                    s->payload.assign(pl->data, static_cast<size_t>(pl->size));
-                }
-
-                auto expected = AwaiterState::CALLING;
-                if (s->state.compare_exchange_strong(
-                        expected,
-                        AwaiterState::COMPLETED,
-                        std::memory_order_acq_rel
-                    )) {
-                    return;
-                }
-
-                auto handle = std::coroutine_handle<Promise>::from_address(s->coroAddr);
-                handle.promise().clear_outstanding();
-
-                // 桥接路径不在主程序回调栈内恢复插件协程 (见 [resumePluginCoroutine])。
-                resumePluginCoroutine(s->bridge, handle);
+                s->outcome.status = status;
+                s->outcome.error  = PluginStringView::str(errView);
+                finishAsyncOffload<State>(s);
             },
             holder,
             &err
         );
-
-        if (!st->opHandle) {
+        if (!op) {
             delete holder;
-            if (err.data) {
-                st->startError.assign(err.data, static_cast<size_t>(err.size));
-                PluginString::free(st->host, &err);
+            st->outcome.status     = PLUGINXX_OPERATOR_FAILED;
+            st->outcome.startError = takeHostError(host, err);
+            if (st->outcome.startError.empty()) {
+                st->outcome.startError = "plugin offload was not accepted";
             }
-            return false;
+            finishAsyncOffload<State>(st);
         }
+    }
+};
 
-        auto expected = AwaiterState::CALLING;
-        if (st->state.compare_exchange_strong(
-                expected,
-                AwaiterState::SUSPENDED,
-                std::memory_order_acq_rel
-            )) {
-            h.promise().set_outstanding([st = this->st]() {
-                if (st->cancelIface && st->cancelIface->op_cancel && st->opHandle) {
-                    st->cancelIface->op_cancel(st->opHandle);
-                }
-            });
-            return true;
+/// asio 异步操作对象 (协议同 [AsyncTableOp]: 只认完成签名探针与完成处理器两种调用)
+template<typename Executor, typename ResultT, typename WorkFn>
+class AsyncOffload {
+public:
+
+    AsyncOffload(
+        const PluginxxHost*           inHost,
+        const PluginxxSchedulerIface* inSched,
+        Executor                      inEx,
+        WorkFn                        inWork
+    ) :
+        host_(inHost),
+        sched_(inSched),
+        ex_(std::move(inEx)),
+        work_(std::move(inWork)) {}
+
+    template<typename Token>
+        requires(
+            std::is_same_v<std::decay_t<Token>, asio::detail::completion_signature_probe>
+            || std::is_same_v<std::decay_t<Token>, asio::detail::async_operation_probe>
+            || std::is_invocable_v<std::decay_t<Token>&, OffloadOutcome<ResultT>>
+        )
+    auto operator()(Token&& token) {
+        using TokenT = std::decay_t<Token>;
+        if constexpr (std::is_same_v<TokenT, asio::detail::completion_signature_probe>) {
+            return asio::detail::completion_signature_probe_result<void(OffloadOutcome<ResultT>)>{};
+        } else if constexpr (std::is_same_v<TokenT, asio::detail::async_operation_probe>) {
+            return asio::detail::async_operation_probe_result{};
+        } else {
+            auto initiation = AsyncOffloadInitiation<Executor, ResultT, WorkFn>{
+                host_,
+                sched_,
+                ex_,
+                std::move(work_)
+            };
+            initiation(std::forward<Token>(token));
         }
-
-        return false;
     }
 
-    std::string await_resume() {
-        if (!st->startError.empty()) {
-            throw std::runtime_error("invoke_capability start failed: " + st->startError);
-        }
-        if (st->status == PLUGINXX_OPERATOR_CANCELED) {
-            throw CanceledException(
-                st->payload.empty() ? "invoke_capability canceled" : st->payload
-            );
-        }
-        if (st->status != PLUGINXX_OPERATOR_OK) {
-            throw std::runtime_error(
-                st->payload.empty() ? "invoke_capability failed" : st->payload
-            );
-        }
-        return std::move(st->payload);
-    }
+private:
+
+    const PluginxxHost*           host_  = nullptr;
+    const PluginxxSchedulerIface* sched_ = nullptr;
+    Executor                      ex_;
+    WorkFn                        work_;
 };
 
 /// 一次表调用的结果 (接口表成员统一走异步操作契约)
@@ -4268,429 +3230,304 @@ private:
     }
 };
 
-/// 表调用在等待期间共享的状态 (堆上持有: 完成回调与 ticket 各持一份)
+/// asio 异步操作形态的表调用状态 (不经协程驱动桥, 恢复经 `asio::post`)
+/// 完成经 `asio::post` 投回调用方给的那个执行器)
 ///
-/// 调用在构造 ticket 时就提交了, 因此协程可能在**任何时刻**装进来等结果; 这里用
-/// 一个原子状态把三个窗口分开 (与完成回调的 CAS 顺序一一对应):
-/// - `INIT`: 已提交, 还没有协程在等 —— 完成回调直接置 `COMPLETED`, 之后的 await
-///   立即返回, 不需要恢复任何人;
-/// - `CALLING`: 有协程正在安装挂起 —— 完成回调置 `COMPLETED` 但**不恢复**协程,
-///   它随后看到 `COMPLETED` 就不挂起了;
-/// - `SUSPENDED`: 协程已挂起 —— 完成回调置 `COMPLETED` 并恢复协程。
-struct TableOpState {
-    const PluginxxHost*        host         = nullptr;
-    const PluginxxCancelIface* cancelIface = nullptr;
-    PluginxxOperatorHandle*    opHandle    = nullptr;
-    int32_t                    status      = PLUGINXX_OPERATOR_FAILED;
-    std::string                payload;
-    std::string                startError;
-    std::atomic<AwaiterState>  state{AwaiterState::INIT};
-    /// 挂起中的协程帧地址与类型擦除的恢复入口 (都由 `await_suspend` 写入)
-    void* coroAddr                            = nullptr;
-    void (*resumeEntry)(TableOpState* state)  = nullptr;
-    /// 协程驱动桥 (恢复协程时经它投递 + 唤醒, 绝不在主程序回调栈内恢复)
-    PollOneBridge*            bridge = nullptr;
-    /// 结果已经被取走过 (ticket 可以复制, 但正文只能取一次)
-    std::atomic<bool> consumed{false};
+/// 为什么需要它: 插件自有 io 线程 (自建 `io_context`) 上的协程是 `asio::awaitable`,
+/// 那种协程只认 `awaitable` 与 asio 异步操作两类可等待对象, 自定义 awaiter 写不进去。
+/// 所以这里把同一次表调用包成标准 asio 异步操作, 由调用方指定"在哪个执行器上恢复"。
+template<typename Handler, typename Executor>
+struct AsyncTableOpState {
+    Handler           handler;
+    Executor          ex;
+    std::atomic<bool> fired{false};
+    /// 本次表调用在主程序侧的操作句柄 (槽里取消时用它调 `op_cancel`)
+    std::atomic<PluginxxOperatorHandle*> opHandle{nullptr};
 
-    TableOpState(const PluginxxHost* inHost, const PluginxxCancelIface* inCancel) :
-        host(inHost),
-        cancelIface(inCancel) {}
+    AsyncTableOpState(Handler inHandler, Executor inEx) :
+        handler(std::move(inHandler)),
+        ex(std::move(inEx)) {}
 };
 
-/// 一次表调用的凭据 (**调用即提交**)
+/// 把结果投到执行器并调用完成处理器 (恰好一次)
 ///
-/// 三种用法:
-/// - `co_await tableOp(ctx, ...)`: 提交并当场等结果;
-/// - `auto t = tableOp(ctx, ...);` 之后再 `co_await t`: 提交时就已经在跑, 协程可以
-///   先干别的 (顺手再提交几条), 需要结果时再取; 多条并发用 [whenAll] 一次收齐;
-/// - `tableOp(ctx, ...).forget();`: 提交完不管结果 (fire-and-forget)。
-///
-/// 规则:
-/// - **构造即提交**: 即使之后提前 `return` 或抛异常, 这次调用也已经在跑, 撤不回来;
-/// - `~TableOpTicket` 不取消操作 —— 取消是显式动作 [cancel];
-/// - 正在等它的协程被取消时, 会经 `pluginxx.cancel.op_cancel` 请求取消这次调用
-///   (协作式), 之后仍要 await 才拿得到终态;
-/// - 正文只能取一次: 重复 `co_await` 得到 `accepted() == false` 的说明文本;
-/// - 可复制 (语义与 `std::shared_future` 类似): 复制品共享同一份状态, 但只有一个
-///   能取到正文。
-class [[nodiscard]] TableOpTicket {
-public:
-    /// 泛化入口 (`whenAll` 等) 需要的结果类型
-    using result_type = detail::TableOpResult;
-
-    TableOpTicket() = default;
-
-    /// 由 [tableOp] 构造 (业务代码写 `tableOp(ctx, ...)` 即可)
-    explicit TableOpTicket(std::shared_ptr<TableOpState> st) noexcept :
-        st_(std::move(st)) {}
-
-    /// 主程序受理了这次调用 (false = 压根没开始, 原因在结果的 `startError`)
-    bool accepted() const noexcept {
-        return st_ && st_->startError.empty();
+/// 完成回调可能来自任何线程 (主程序 IO / 插件执行线程, 甚至 `start` 内部就地完成),
+/// 因此这里**只 post 不直接调**: 处理器恢复的是调用方那个执行器上的协程。
+template<typename Handler, typename Executor>
+inline void finishAsyncTableOp(
+    const std::shared_ptr<AsyncTableOpState<Handler, Executor>>& st,
+    TableOpResult                                                result
+) {
+    if (st->fired.exchange(true, std::memory_order_acq_rel)) {
+        return;
     }
+    asio::post(
+        st->ex,
+        [st, result = std::move(result)]() mutable {
+            auto handler = std::move(st->handler);
+            handler(std::move(result));
+        }
+    );
+}
 
-    /// 已有结果 (含"未受理"; 为真时 `co_await` 不挂起)
-    bool done() const noexcept {
-        return !st_ || st_->state.load(std::memory_order_acquire) == AwaiterState::COMPLETED;
-    }
+/// asio 异步操作形态的表调用发起器: 调用处即提交, 结果经 `asio::post` 回到执行器
+template<typename Executor, typename StartFn>
+struct AsyncTableOpInitiation {
+    const PluginxxHost*        host        = nullptr;
+    const PluginxxCancelIface* cancelIface = nullptr;
+    Executor                   ex;
+    StartFn                    start;
+    /// 调用方协程的取消槽 (未连接 = 不接取消)
+    asio::cancellation_slot slot;
 
-    /// 请求取消这次调用 (协作式, 不等待; 终态仍通过 `co_await` 取)
-    void cancel() const noexcept {
-        if (!st_) {
+    template<typename Handler>
+    void operator()(Handler&& handler) {
+        using H     = std::decay_t<Handler>;
+        using State = AsyncTableOpState<H, Executor>;
+        auto st     = std::make_shared<State>(H(std::forward<Handler>(handler)), ex);
+        auto* holder = new std::shared_ptr<State>(st);
+        PluginxxString err{nullptr, 0};
+        // 完成回调: 主程序受理后至少调用一次 (未受理则不会调用, 由下面的
+        // `start` 返回值判定), 因此这里直接接管 holder 的所有权
+        auto* op = start(
+            [](void* ud, int32_t status, const PluginxxStringView* payload) {
+                auto* hp = static_cast<std::shared_ptr<State>*>(ud);
+                auto  s  = std::move(*hp);
+                delete hp;
+                // 操作已结束: 之后的取消不能再拿这个句柄去调 op_cancel
+                s->opHandle.store(nullptr, std::memory_order_release);
+                TableOpResult r;
+                r.status = status;
+                if (payload && payload->data && payload->size > 0) {
+                    r.payload.assign(payload->data, static_cast<size_t>(payload->size));
+                }
+                finishAsyncTableOp<H, Executor>(s, std::move(r));
+            },
+            holder,
+            &err
+        );
+        if (op == nullptr) {
+            delete holder;
+            TableOpResult r;
+            r.startError = takeHostError(host, err);
+            if (r.startError.empty()) {
+                r.startError = "plugin table call was not accepted";
+            }
+            finishAsyncTableOp<H, Executor>(st, std::move(r));
             return;
         }
-        if (st_->cancelIface && st_->cancelIface->op_cancel && st_->opHandle) {
-            st_->cancelIface->op_cancel(st_->opHandle);
+        st->opHandle.store(op, std::memory_order_release);
+        // 协程被取消 (主程序关闭 / 业务主动取消) 时把同一次调用在主程序侧撤掉,
+        // 否则插件会一直等到计时器/IO 自己结束。
+        if (slot.is_connected() && cancelIface != nullptr && cancelIface->op_cancel != nullptr) {
+            slot.assign([st, cancelIface = cancelIface](asio::cancellation_type) {
+                if (auto* h = st->opHandle.exchange(nullptr, std::memory_order_acq_rel)) {
+                    try {
+                        cancelIface->op_cancel(h);
+                    } catch (...) {
+                    }
+                }
+            });
         }
     }
+};
 
-    /// 明确的"提交完不管": 丢掉结果 (完成回调照常执行, 只是没人看)
-    void forget() const noexcept {}
+/// asio 异步操作对象 (实现了 asio 的异步操作协议: `op(token)`)
+///
+/// 协议只覆盖两件事, 因此不去碰 `asio::async_initiate` (它的显式模板参数顺序在不同
+/// Boost 版本里不一致, 传签名和传令牌谁在前都试过, 会难读到无法维护):
+/// - `op(completion_signature_probe)` → 交回完成签名 `void(TableOpResult)` (asio 用它
+///   推断 `co_await` 的结果类型);
+/// - `op(handler)` → 直接发起, 完成处理器就是传进来的那个 (asio 的 awaitable 走的
+///   就是这条)。
+///
+/// 其它完成令牌 (例如 `asio::detached`) 不支持: 需要的话把它包进协程即可。
+template<typename Executor, typename StartFn>
+class AsyncTableOp {
+public:
 
-    bool await_ready() const noexcept {
-        return done();
-    }
+    AsyncTableOp(
+        const PluginxxHost*        inHost,
+        const PluginxxCancelIface* inCancel,
+        Executor                   inEx,
+        StartFn                    inStart,
+        asio::cancellation_slot    inSlot = {}
+    ) :
+        host_(inHost),
+        cancelIface_(inCancel),
+        ex_(std::move(inEx)),
+        start_(std::move(inStart)),
+        slot_(inSlot) {}
 
-    template<typename Promise>
-    bool await_suspend(std::coroutine_handle<Promise> h) {
-        auto st = st_;
-        if (!st) {
-            return false;
+    template<typename Token>
+        requires(
+            std::is_same_v<std::decay_t<Token>, asio::detail::completion_signature_probe>
+            || std::is_same_v<std::decay_t<Token>, asio::detail::async_operation_probe>
+            || std::is_invocable_v<std::decay_t<Token>&, TableOpResult>
+        )
+    auto operator()(Token&& token) {
+        using TokenT = std::decay_t<Token>;
+        if constexpr (std::is_same_v<TokenT, asio::detail::completion_signature_probe>) {
+            return asio::detail::completion_signature_probe_result<void(TableOpResult)>{};
+        } else if constexpr (std::is_same_v<TokenT, asio::detail::async_operation_probe>) {
+            return asio::detail::async_operation_probe_result{};
+        } else {
+            auto initiation = AsyncTableOpInitiation<Executor, StartFn>{
+                host_,
+                cancelIface_,
+                ex_,
+                start_,
+                slot_
+            };
+            initiation(std::forward<Token>(token));
         }
-        st->coroAddr    = h.address();
-        st->resumeEntry = +[](TableOpState* state) {
-            auto handle = std::coroutine_handle<Promise>::from_address(state->coroAddr);
-            handle.promise().clear_outstanding();
-            resumePluginCoroutine(state->bridge, handle);
-        };
-
-        auto expected = AwaiterState::INIT;
-        if (!st->state.compare_exchange_strong(
-                expected,
-                AwaiterState::CALLING,
-                std::memory_order_acq_rel
-            )) {
-            // 已经有结果 (或已被别的协程接管): 不挂起, 当场取结果
-            return false;
-        }
-
-        auto suspended = AwaiterState::CALLING;
-        if (!st->state.compare_exchange_strong(
-                suspended,
-                AwaiterState::SUSPENDED,
-                std::memory_order_acq_rel
-            )) {
-            // 完成回调在安装期间到达: 结果已经记下, 这里不挂起
-            return false;
-        }
-
-        h.promise().set_outstanding([st] {
-            if (st->cancelIface && st->cancelIface->op_cancel && st->opHandle) {
-                st->cancelIface->op_cancel(st->opHandle);
-            }
-        });
-        return true;
-    }
-
-    TableOpResult await_resume() {
-        TableOpResult r;
-        if (!st_) {
-            r.startError = "empty table op ticket";
-            return r;
-        }
-        if (st_->consumed.exchange(true, std::memory_order_acq_rel)) {
-            r.startError = "table op result was already taken";
-            return r;
-        }
-        r.status     = st_->status;
-        r.payload    = std::move(st_->payload);
-        r.startError = std::move(st_->startError);
-        return r;
     }
 
 private:
 
-    std::shared_ptr<TableOpState> st_;
+    const PluginxxHost*        host_        = nullptr;
+    const PluginxxCancelIface* cancelIface_ = nullptr;
+    Executor                   ex_;
+    StartFn                    start_;
+    asio::cancellation_slot    slot_;
 };
 
-/// 提交一次表调用并返回凭据 (提交即开始, 见 [TableOpTicket])
+} // namespace detail
+
+namespace detail {
+
+/// 取当前协程的执行器与取消槽后提交一次表调用 (asio 形态的公共入口)
 ///
-/// `start` 把收尾三件套转交给表成员:
-/// `(PluginxxOperatorCallback cb, void* ud, PluginxxString* error_out) -> PluginxxOperatorHandle*`。
-/// 完成回调不直接恢复插件协程, 而是经协程驱动桥恢复 (同 [InvokeCapAwaiter] 的协议)。
-template<typename StartFn>
-inline TableOpTicket submitTableOp(
-    const PluginxxHost*        host,
-    const PluginxxCancelIface* cancel,
-    PollOneBridge*             bridge,
-    StartFn&&                  start
-) {
-    auto st    = std::make_shared<TableOpState>(host, cancel);
-    st->bridge = bridge;
-
-    auto*          holder = new std::shared_ptr<TableOpState>(st);
-    PluginxxString err{nullptr, 0};
-    st->opHandle = start(
-        [](void* ud, int32_t cbStatus, const PluginxxStringView* payload) {
-            auto* hp = static_cast<std::shared_ptr<TableOpState>*>(ud);
-            auto  s  = *hp;
-            delete hp;
-
-            s->status = cbStatus;
-            if (payload && payload->data && payload->size > 0) {
-                s->payload.assign(payload->data, static_cast<size_t>(payload->size));
-            }
-
-            // 状态规则见 [TableOpState]: 只有"已经挂起"才恢复协程;
-            // 其它两种情况下 await_suspend 自己会看到 COMPLETED, 不会挂起。
-            auto expected = AwaiterState::INIT;
-            if (s->state.compare_exchange_strong(
-                    expected,
-                    AwaiterState::COMPLETED,
-                    std::memory_order_acq_rel
-                )) {
-                return;
-            }
-            auto installing = AwaiterState::CALLING;
-            if (s->state.compare_exchange_strong(
-                    installing,
-                    AwaiterState::COMPLETED,
-                    std::memory_order_acq_rel
-                )) {
-                return;
-            }
-            s->state.store(AwaiterState::COMPLETED, std::memory_order_release);
-            if (s->resumeEntry) {
-                s->resumeEntry(s.get());
-            }
-        },
-        holder,
-        &err
-    );
-
-    if (!st->opHandle) {
-        delete holder;
-        st->startError = takeHostError(host, err);
-        if (st->startError.empty()) {
-            st->startError = "plugin table call was not accepted";
-        }
-        // 未受理 = 有结果 (原因在 startError), 之后的 await 不挂起
-        st->state.store(AwaiterState::COMPLETED, std::memory_order_release);
-    }
-    return TableOpTicket{std::move(st)};
+/// 取消槽连上时, 协程被取消会把同一次调用在主程序侧 `op_cancel` 掉
+/// (见 [AsyncTableOpInitiation]); 未连接则与不带槽的重载一致。
+template<typename Ctx, typename StartFn>
+inline asio::awaitable<TableOpResult> tableOpAwaitAsyncSlot(const Ctx& ctx, StartFn start) {
+    auto ex = co_await asio::this_coro::executor;
+    auto cs = co_await asio::this_coro::cancellation_state;
+    co_return co_await asyncTableOp(ctx, ex, cs.slot(), std::move(start));
 }
 
 } // namespace detail
 
-/// 主程序计时器适配 (**提交即开始计时**): 到期时主程序回调适配器, 适配器把
-/// continuation 投递到本地执行器并 [detail::PollOneBridge::wake], 由下一次 driver 推进。
+/// 计时器的 **asio 形态** (插件里唯一的计时入口)
 ///
-/// - 返回值是凭据 (`SleepTicket`), 可直接 `co_await`, 也可以先提交几条再用 [whenAll] 等齐;
-/// - `ms <= 0` 当场完成 (`co_await` 不挂起)。
-template<typename Ctx>
-inline detail::SleepTicket sleep(const Ctx& ctx, int64_t ms) noexcept {
-    return detail::submitSleep(
-        ctx.host,
-        ctx.iface.scheduler,
-        ctx.iface.cancel,
-        &ctx.bridge(),
-        ms
-    );
-}
-
-/// 让出一轮 (等价于"下一位"): 投递 continuation + 唤醒 driver,
-/// 由下一次请求推进, 因此主程序与插件任务按轮次交替。
-template<typename Ctx>
-inline detail::YieldAwaiter yield(const Ctx& ctx) noexcept {
-    return detail::YieldAwaiter{ctx.host, &ctx.bridge()};
-}
-
-/// 阻塞工作委托 (**提交即开始**; 主程序工作线程池): **显式例外**, 工作体本身不在
-/// driver 序列里运行; 完成后的恢复仍回到 driver 序列 (见 [detail::OffloadTicket])。
+/// 完成经 `asio::post` 投回当前协程的执行器。走的是主程序 `scheduler.sleep`
+/// (插件本地没有自己会流动的 reactor, 自建 `steady_timer` 不会自行到期)。
 ///
-/// - 返回值是凭据 (`OffloadTicket<R>`), 可直接 `co_await`, 也可以先提交几条再用
-///   [whenAll] 等齐 (总耗时 = 最慢那条);
-/// - 工作体抛出的异常原样重抛给 `co_await` 处。
-template<typename Ctx, typename WorkFn>
-inline auto offload(const Ctx& ctx, WorkFn&& work) {
-    return detail::submitOffload(
-        ctx.host,
-        ctx.iface.scheduler,
-        ctx.iface.cancel,
-        &ctx.bridge(),
-        std::forward<WorkFn>(work)
+/// - 失败/被拒抛 `std::runtime_error`, 取消抛 [CanceledException];
+/// - `ms <= 0` 直接返回, 不提交计时。
+template<typename Ctx>
+inline asio::awaitable<void> sleepAsync(Ctx& ctx, int64_t ms) {
+    if (ms <= 0) {
+        co_return;
+    }
+    if (!ctx.iface.scheduler || !ctx.iface.scheduler->sleep) {
+        throw std::runtime_error("scheduler sleep is unavailable");
+    }
+    auto r = co_await detail::tableOpAwaitAsyncSlot(
+        ctx,
+        [&ctx, ms](PluginxxOperatorCallback cb, void* ud, PluginxxString* err)
+            -> PluginxxOperatorHandle* {
+            return ctx.iface.scheduler->sleep(ctx.host, ms, cb, ud, err);
+        }
     );
-}
-
-template<typename Ctx>
-inline detail::InvokeCapAwaiter invoke_cap(
-    const Ctx&       ctx,
-    std::string_view capability,
-    std::string_view argsJson = "{}"
-) {
-    return detail::InvokeCapAwaiter{
-        ctx.host,
-        ctx.iface.capabilities,
-        ctx.iface.cancel,
-        capability,
-        argsJson,
-        &ctx.bridge()
-    };
-}
-
-/// 带作用域归属的能力调用 (被调方可以从请求上下文知道"谁在调")
-template<typename Ctx>
-inline detail::InvokeCapAwaiter invoke_cap(
-    const Ctx&       ctx,
-    const ScopeRef&  scope,
-    std::string_view capability,
-    std::string_view argsJson = "{}"
-) {
-    return detail::InvokeCapAwaiter{
-        ctx.host,
-        ctx.iface.capabilities,
-        ctx.iface.cancel,
-        capability,
-        argsJson,
-        &ctx.bridge(),
-        scope.id(),
-        scope.seq()
-    };
+    if (!r.accepted()) {
+        throw std::runtime_error(
+            r.startError.empty() ? "plugin sleep was not accepted" : r.startError
+        );
+    }
+    if (r.status == PLUGINXX_OPERATOR_CANCELED) {
+        throw CanceledException(r.text().empty() ? "sleep canceled" : std::string{r.text()});
+    }
+    if (!r.ok()) {
+        throw std::runtime_error(r.text().empty() ? "sleep failed" : std::string{r.text()});
+    }
+    co_return;
 }
 
 /// 表调用的结果类型 (`pluginxx::detail::TableOpResult` 的对外别名)
 using TableOpResult = detail::TableOpResult;
 
-/// 表调用的凭据类型 (`pluginxx::detail::TableOpTicket` 的对外别名)
-using TableOpTicket = detail::TableOpTicket;
-
-/// 调用接口表成员 (**调用即提交**), 返回凭据, `co_await` 它拿结果
+/// 调用接口表成员, 包成 **asio 异步操作** (可用 `co_await` 于 `asio::awaitable`)
 ///
-/// `start` 把收尾三件套原样转交给表成员, 例如:
+/// 完成经 `asio::post(ex, ...)` 投到调用方给的那个执行器, 与 kit 的驱动桥无关。
+/// 典型场景: 插件自带 `io_context` (网络/协议循环), 业务代码是 asio 协程。
+///
+/// - `ex`: 恢复协程用的执行器 (通常是那个 io_context 的 executor)。完成回调可能
+///   来自任何线程, 因此**必须**给对执行器, 否则协程会跑错线程;
+/// - 提交发生在调用处 (不是等 `co_await` 才提交);
+/// - 完成签名是 `void(pluginxx::TableOpResult)`: 业务失败不抛异常, 看 `ok()` /
+///   `text()` / `accepted()`;
+/// - 同一对象也能给回调形态用 (任何 asio 完成标记: `asio::detached` / lambda);
+/// - 不接协程取消: 需要取消时在 `start` 里自行保存句柄后调 `cancel.op_cancel`。
+///
 /// ```cpp
-/// auto r = co_await tableOp(ctx, [&](auto cb, auto ud, auto err) {
-///     return iface->get_messages(host, scope, &sid, cb, ud, err);
-/// });
-/// if (!r.ok()) { log("读会话失败: {}", r.text()); }
+/// auto r = co_await pluginxx::asyncTableOp(
+///     ctx,
+///     ex,
+///     [&](PluginxxOperatorCallback cb, void* ud, PluginxxString* err) {
+///         return iface->get_messages(host, scope, &sid, cb, ud, err);
+///     }
+/// );
 /// ```
-/// - 返回 [TableOpResult]: 同时带"是否受理"与执行状态, 业务失败**不抛异常**
-///   (取消也是其中一种状态), 由调用方自己决定怎么处理;
-/// - 提交就发生在**本调用内** (不是等到 `co_await`), 因此可以先攒几条再一起等,
-///   也可以 `.forget()` 丢结果 (见 [TableOpTicket] 与 [whenAll]);
-/// - 调用方本来就在主程序 IO 线程时 (插件协程的常规情形), 主程序是**内联执行**的:
-///   本函数返回时操作往往已经有结果, `co_await` 不再挂起, 顺序与同步调用一致;
-/// - 协程被取消时经 `cancel.op_cancel` 取消这次调用 (协作式);
-/// - 注册类调用仍要 `co_await` 完再继续 —— 登记本身已经生效, 但失败原因只有结果里有。
-template<typename Ctx, typename StartFn>
-inline detail::TableOpTicket tableOp(const Ctx& ctx, StartFn&& start) {
-    return detail::submitTableOp(
+template<typename Ctx, typename Executor, typename StartFn>
+inline auto asyncTableOp(const Ctx& ctx, Executor ex, StartFn&& start) {
+    return detail::AsyncTableOp<Executor, std::decay_t<StartFn>>{
         ctx.host,
         ctx.iface.cancel,
-        &ctx.bridge(),
+        std::move(ex),
         std::forward<StartFn>(start)
-    );
-}
-
-namespace detail {
-
-/// 收一条已提交 ticket 的结果; 抛异常只记下第一条, 不打断其余条目
-///
-/// `result_type` 与 `await_resume()` 的差异 (void 结果用 `monostate` 占位) 在这里抹平。
-template<typename TicketT>
-inline Task<typename TicketT::result_type>
-    takeTicket(TicketT ticket, std::exception_ptr& firstError) {
-    using ResultT = typename TicketT::result_type;
-    try {
-        if constexpr (std::is_void_v<decltype(std::declval<TicketT&>().await_resume())>) {
-            co_await std::move(ticket);
-            co_return ResultT{};
-        } else {
-            co_return co_await std::move(ticket);
-        }
-    } catch (...) {
-        if (!firstError) {
-            firstError = std::current_exception();
-        }
-        if constexpr (!std::is_void_v<decltype(std::declval<TicketT&>().await_resume())>) {
-            co_return ResultT{};
-        }
-    }
-}
-
-} // namespace detail
-
-/// 等一批**已提交**的表调用 / `offload` / `sleep` 全部完成 (总耗时 = 最慢的那条)
-///
-/// - 参数是已经提交的 ticket (`tableOp(...)` / `offload(...)` / `sleep(...)` 一调用
-///   就开始了), 这里只按顺序收结果, 不会把它们串起来执行;
-/// - 返回的结果与传入顺序一一对应;
-/// - 某条抛异常 (失败/取消) 不影响其余条目把工作做完, 全部条目结束后重抛第一个异常;
-/// - 用法:
-/// ```cpp
-/// std::vector<TableOpTicket> tickets;
-/// tickets.push_back(tableOp(ctx, ...));
-/// tickets.push_back(tableOp(ctx, ...));
-/// auto results = co_await whenAll(std::move(tickets));
-/// ```
-/// - 返回 `pluginxx::Task<...>` (本包的协程类型, 不是 asio 的 awaitable —— 插件协程帧
-///   没有 asio executor), 只能在插件协程里 `co_await`。
-template<typename TicketT>
-inline Task<std::vector<typename TicketT::result_type>> whenAll(std::vector<TicketT> tickets) {
-    std::vector<typename TicketT::result_type> results;
-    results.reserve(tickets.size());
-    std::exception_ptr firstError;
-    for (auto& ticket : tickets) {
-        results.push_back(co_await detail::takeTicket(std::move(ticket), firstError));
-    }
-    if (firstError) {
-        std::rethrow_exception(firstError);
-    }
-    co_return results;
-}
-
-namespace detail {
-
-/// 按 index 序列逐条取结果 (**从左到右**保证: 花括号初始化列表的求值顺序是确定的)
-template<typename ResultTuple, typename... Tickets, size_t... Is>
-inline Task<ResultTuple> takeAllInto(
-    std::index_sequence<Is...>,
-    std::exception_ptr&        firstError,
-    Tickets&&... tickets
-) {
-    ResultTuple out{};
-    (void)std::initializer_list<int>{
-        (std::get<Is>(out) = co_await takeTicket(std::forward<Tickets>(tickets), firstError), 0)...
     };
-    co_return out;
 }
 
-} // namespace detail
-
-/// 等几条**不同类**的已提交 ticket (变参: 表调用 / `offload` / `sleep` 可混用)
+/// 表调用的 asio 异步操作 (带取消槽)
 ///
-/// - 返回 `Task<std::tuple<...>>`, 与传入顺序一一对应;
-/// - 同样的"先全部提交再一起等"语义: 总耗时 = 最慢那条;
-/// - 某条抛异常时, 其余条目仍会被等到 (它们已在跑), 之后重抛第一个异常。
-template<typename First, typename... Rest>
-    requires(sizeof...(Rest) >= 1)
-inline Task<std::tuple<typename std::decay_t<First>::result_type,
-                       typename std::decay_t<Rest>::result_type...>>
-    whenAll(First&& first, Rest&&... rest) {
-    using ResultTuple = std::tuple<typename std::decay_t<First>::result_type,
-                                   typename std::decay_t<Rest>::result_type...>;
-    std::exception_ptr firstError;
-    auto               results = co_await detail::takeAllInto<ResultTuple>(
-        std::index_sequence_for<First, Rest...>{},
-        firstError,
-        std::forward<First>(first),
-        std::forward<Rest>(rest)...
-    );
-    if (firstError) {
-        std::rethrow_exception(firstError);
-    }
-    co_return results;
+/// 与上一个重载完全相同, 只是多给一个取消槽: 槽被触发时把同一次调用在主程序
+/// 侧的操作 `op_cancel` 掉, 插件协程因此不会干等计时器/IO 自己结束。
+/// 典型的传入值 = `co_await asio::this_coro::cancellation_state` 的 `slot()`。
+template<typename Ctx, typename Executor, typename StartFn>
+inline auto
+    asyncTableOp(const Ctx& ctx, Executor ex, asio::cancellation_slot slot, StartFn&& start) {
+    return detail::AsyncTableOp<Executor, std::decay_t<StartFn>>{
+        ctx.host,
+        ctx.iface.cancel,
+        std::move(ex),
+        std::forward<StartFn>(start),
+        slot
+    };
 }
+
+
+/// 把阻塞工作交给主程序工作池, 包成 **asio 形态** (可用 `co_await` 于 `asio::awaitable`)
+///
+/// 完成经 `asio::post(ex, ...)` 投到调用方给的那个执行器, 因此插件自有 `io_context`
+/// 上的业务协程也能用。
+///
+/// - `work` 形如 `ResultType(const PluginxxCancelToken*)`, 在工作池线程上跑;
+///   取消时主程序会把令牌置为已请求 (协作式, 不会强行打断);
+/// - 提交发生在调用处 (不是等 `co_await` 才提交);
+/// - 结果是一个 [OffloadOutcome] 结构 (**完成处理器里不抛异常**): 未受理、取消、
+///   失败与工作体异常都在其中, 由调用方决定怎么处理 (agent 侧的 `offloadAsync`
+///   已把这些换成异常);
+/// - 不接协程取消: 需要取消时自己保存令牌/句柄再走 `cancel.op_cancel`。
+///
+/// ```cpp
+/// auto outcome = co_await pluginxx::asyncOffload(ctx, ex, [&](const PluginxxCancelToken*) {
+///     return doBlockingWork();   // 目录遍历 / 全文件扫描这类 CPU 工作
+/// });
+/// ```
+template<typename Ctx, typename Executor, typename WorkFn>
+inline auto asyncOffload(const Ctx& ctx, Executor ex, WorkFn&& work) {
+    using ResultT = std::decay_t<std::invoke_result_t<WorkFn&, const PluginxxCancelToken*>>;
+    return detail::AsyncOffload<Executor, ResultT, std::decay_t<WorkFn>>{
+        ctx.host,
+        ctx.iface.scheduler,
+        std::move(ex),
+        std::forward<WorkFn>(work)
+    };
+}
+
+
 
 /// 调用接口表成员并把结果交给回调 (**回调形态**, 任意线程)
 ///
@@ -4699,8 +3536,8 @@ inline Task<std::tuple<typename std::decay_t<First>::result_type,
 template<typename Ctx, typename StartFn, typename DoneFn>
 inline void tableOpCallback(const Ctx& ctx, StartFn&& start, DoneFn&& done) {
     using Done = std::decay_t<DoneFn>;
-    /// 回调上下文: 第一个字段是 "不是同步桥" 的标记
-    /// - 主程序在完成时会对 `user_data` 按指针读 8 字节标记 (见 [isSyncBridgeCallback]),
+    /// 回调上下文: 第一字段只是一块占位 (让整个结构至少 8 字节)
+    /// - 主程序不读 `user_data` 的内容 (只按原样透传), 但会对它按指针读 8 字节,
     ///   所以不能直接把很小的函子当 `user_data` 用 (空函子只占 1 字节 → 越界读)
     struct Holder {
         uint64_t magic = 0;
@@ -4732,182 +3569,11 @@ inline void tableOpCallback(const Ctx& ctx, StartFn&& start, DoneFn&& done) {
     }
 }
 
-/// 调用接口表成员并等结果 (**同步等待**, 只给同步桥用)
-///
-/// 什么时候用: 调用方必须**当场拿到结果**, 而且**不能写成协程** —— 典型是内嵌脚本
-/// 引擎 (QuickJS 这类同步 C API) 在脚本回调里调主程序表。其它地方一律
-/// `co_await tableOp(...)` 或 [tableOpCallback]。
-///
-/// 线程规则:
-/// - **既不是 io 线程、也不是插件执行线程**: 真等到完成回调, `timeoutMs > 0` 时到点先
-///   请求取消 (`cancel.op_cancel`), 然后继续等 —— 取消是协作式的, 主程序**一定会**
-///   交回结果, 所以不会留下悬空的等待对象;
-/// - **io 线程上**: 不等待 (那会把主程序卡死)。主程序在调用方本来就在 io 线程时是
-///   **内联执行**的, 因此正常情况这里已经拿到结果; 万一没有, 返回原因文本、按
-///   "没有结果"处理, 不会死锁;
-/// - **插件执行线程上**: 默认不等待 (agent 侧 `call_tool` / 能力调用可能把工作体派发到
-///   同一条线程, 两边互等); 传 `SyncWaitThreadPolicy::allowOnPluginThread` 时真等 ——
-///   前提是主程序保证工作体不会派回本插件的执行线程 (client 表就是这样)。
-///
-/// 完成回调怎么回来: 本函数把回调包成**同步桥** (`pluginxx/api/sync_bridge.h`)，
-/// 主程序就地调用它而不投回插件执行器 —— 否则阻塞中的线程永远等不到自己。
-template<typename StartFn>
-inline detail::TableOpResult tableOpSyncWait(
-    const PluginxxHost*           host,
-    const PluginxxCancelIface*    cancel,
-    const PluginxxSchedulerIface* scheduler,
-    StartFn&&                     start,
-    int64_t                       timeoutMs            = 0,
-    SyncWaitThreadPolicy          pluginThreadPolicy   = SyncWaitThreadPolicy::refuseOnPluginThread
-) {
-    detail::TableOpResult out;
-
-    struct Wait {
-        std::mutex              mutex;
-        std::condition_variable cv;
-        bool                    done   = false;
-        int32_t                 status = PLUGINXX_OPERATOR_FAILED;
-        std::string             payload;
-    };
-    auto holder = std::make_shared<Wait>();
-    auto waitOn = [](void* ud, int32_t status, const PluginxxStringView* payload) {
-        std::unique_ptr<std::shared_ptr<Wait>> keep(static_cast<std::shared_ptr<Wait>*>(ud));
-        auto&                                  w = **keep;
-        std::lock_guard                        lock(w.mutex);
-        w.status = status;
-        if (payload && payload->data && payload->size > 0) {
-            w.payload.assign(payload->data, static_cast<size_t>(payload->size));
-        }
-        w.done = true;
-        w.cv.notify_all();
-    };
-
-    // 同步桥: 主程序看到标记就就地调用, 不投回插件执行器 (否则就是自己等自己)
-    auto* bridge = new SyncBridgeCallback();
-    bridge->fn   = waitOn;
-    bridge->ud   = new std::shared_ptr<Wait>(holder);
-    PluginxxString err{nullptr, 0};
-    auto           handle = start(&invokeSyncBridge, bridge, &err);
-    if (!handle) {
-        // 未受理: 回调不会被调用, 包装块自己释放
-        delete static_cast<std::shared_ptr<Wait>*>(bridge->ud);
-        delete bridge;
-        out.startError = detail::takeHostError(host, err);
-        if (out.startError.empty()) {
-            out.startError = "plugin table call was not accepted";
-        }
-        return out;
-    }
-
-    if (holder->done) {
-        // 主程序在 IO 线程上内联执行完了 (最常见的情况)
-        std::lock_guard lock(holder->mutex);
-        out.status  = holder->status;
-        out.payload = holder->payload;
-        return out;
-    }
-
-    if (pluginThreadPolicy == SyncWaitThreadPolicy::refuseOnPluginThread && scheduler
-        && scheduler->is_io_thread && scheduler->is_io_thread(host)) {
-        out.startError
-            = "tableOpSyncWait would block on the plugin execution thread; use co_await tableOp";
-        return out;
-    }
-
-    std::unique_lock lock(holder->mutex);
-    if (timeoutMs > 0) {
-        if (!holder->cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] {
-                return holder->done;
-            })) {
-            lock.unlock();
-            if (cancel && cancel->op_cancel) {
-                cancel->op_cancel(handle);
-            }
-            lock.lock();
-            holder->cv.wait(lock, [&] {
-                return holder->done;
-            });
-        }
-    } else {
-        holder->cv.wait(lock, [&] {
-            return holder->done;
-        });
-    }
-    out.status  = holder->status;
-    out.payload = std::move(holder->payload);
-    return out;
-}
-
-/// [tableOpSyncWait] 的上下文形态 (从插件实例上下文取 host / cancel / scheduler)
-template<typename Ctx, typename StartFn>
-inline detail::TableOpResult tableOpSyncWait(
-    const Ctx&           ctx,
-    StartFn&&            start,
-    int64_t              timeoutMs          = 0,
-    SyncWaitThreadPolicy pluginThreadPolicy = SyncWaitThreadPolicy::refuseOnPluginThread
-) {
-    return tableOpSyncWait(
-        ctx.host,
-        ctx.iface.cancel,
-        ctx.iface.scheduler,
-        std::forward<StartFn>(start),
-        timeoutMs,
-        pluginThreadPolicy
-    );
-}
-
 namespace detail {
-
-/// 阻塞读取"主程序自己实现"的表时的线程策略
-///
-/// 这些表 (`config` / `session` / `runtime` ...) 的工作体在主程序 io 上执行,
-/// 完成回调就是同步桥 (`invokeSyncBridge`)、就地在 io 上调用 —— 因此插件执行线程上
-/// 真等不会自己等自己。禁止的是"工作体会派回同一条插件线程"的调用 (能力/工具互调),
-/// 那些必须写 `co_await`。
-inline constexpr SyncWaitThreadPolicy kMainSideWaitPolicy
-    = SyncWaitThreadPolicy::allowOnPluginThread;
-
-/// [tableOpText] 的定义: 只取结果正文 (失败 = 空串)
-template<typename StartFn>
-std::string tableOpText(
-    const PluginxxHost*           host,
-    const PluginxxCancelIface*    cancel,
-    const PluginxxSchedulerIface* scheduler,
-    StartFn&&                     start
-) {
-    auto res = pluginxx::tableOpSyncWait(
-        host,
-        cancel,
-        scheduler,
-        std::forward<StartFn>(start),
-        0,
-        kMainSideWaitPolicy
-    );
-    return res.ok() ? std::string(res.text()) : std::string{};
-}
-
-/// [tableOpOk] 的定义: 只看成败
-template<typename StartFn>
-bool tableOpOk(
-    const PluginxxHost*           host,
-    const PluginxxCancelIface*    cancel,
-    const PluginxxSchedulerIface* scheduler,
-    StartFn&&                     start
-) {
-    return pluginxx::tableOpSyncWait(
-               host,
-               cancel,
-               scheduler,
-               std::forward<StartFn>(start),
-               0,
-               kMainSideWaitPolicy
-    )
-        .ok();
-}
 
 /// 按可调用性选择能力业务签名：fn(ctx, caller, method, args) /
 /// fn(ctx, method, args) / fn(method, args)。
-/// 返回类型原样转发：同步能力返回字符串，异步能力返回 `Task<T>`
+/// 返回类型原样转发：同步能力返回字符串，异步能力返回 `asio::awaitable<T>`
 /// （与 [invokeHook] 相同的严格分发策略）。
 template<typename CapFn, typename Ctx>
 inline decltype(auto) invokeCap(
@@ -4953,182 +3619,199 @@ struct CapabilityOptions {
     const PluginxxScopeRef* scope = nullptr;
 };
 
-/// 登记一行能力实现 (**调用即提交**)
-/// - `fn` 可返回字符串 (同步) 或 `Task<T>` (异步): 返回值就是这次调用的结果文本;
-/// - 未填 [CapabilityOptions] 时按"声明自己的名字 + 单行覆盖 + 只开放 impl 阶段"登记;
-/// - 返回 ticket: 登记提交就已经生效, 拿到结果只为了区分"受理/被拒"与拒绝原因;
-/// - 主程序没有能力表时 ticket 是"未受理"(`accepted() == false`), 不会挂起。
-///
-/// - `return` 表调用凭据 ([tableOp]): `co_await` 它才拿 `<是否受理, 状态, 原因>`
+namespace detail {
+
+/// 能力实现的上下文绑定 (跨边界 user_data)
 template<typename Ctx, typename CapFn>
-inline TableOpTicket capability(
+struct CapabilityShim {
+    Ctx*                ctx = nullptr;
+    std::decay_t<CapFn> fn;
+};
+
+/// 造一行能力登记的跨边界 spec (`run_start` / `cancel` 已绑定)
+///
+/// 业务体两种:
+/// - 同步 (`void` / 字符串类): 调用返回即完成;
+/// - `asio::awaitable<T>`: provider 根经桥的本地执行器推进。
+///
+/// `id` / `owner_tag` 的视图指向调用方给的字符串 (提交在主程序 IO 线程上内联执行,
+/// 返回时 spec 已读完), 因此函数内不再复制。
+template<typename Ctx, typename CapFn>
+inline PluginxxCapabilitySpec buildCapabilitySpec(
+    Ctx&                     ctx,
+    std::string_view         capName,
+    CapFn&&                  fn,
+    const CapabilityOptions& opts
+) {
+    using Shim = CapabilityShim<Ctx, CapFn>;
+
+    auto shim = ctx.storeShim(std::make_unique<Shim>(Shim{&ctx, std::forward<CapFn>(fn)}));
+
+    PluginxxCapabilitySpec spec{};
+    spec.version     = PLUGINXX_API_VERSION;
+    spec.struct_size = sizeof(PluginxxCapabilitySpec);
+    spec.id          = PluginStringView::from(capName.data(), capName.size());
+    if (!opts.ownerTag.empty()) {
+        spec.owner_tag = PluginStringView::from(opts.ownerTag.data(), opts.ownerTag.size());
+    }
+    spec.impls      = opts.impls;
+    spec.merge      = opts.merge;
+    spec.phases     = opts.phases;
+    spec.phase      = opts.phase;
+    spec.priority   = opts.priority;
+    spec.timeout_ms = opts.timeoutMs;
+    spec.user_data  = shim;
+
+    spec.run_start = [](void*                         user_data,
+                        const PluginxxHost*           caller_host,
+                        const PluginxxStringView*     method,
+                        const PluginxxStringView*     args_json,
+                        const PluginxxOperatorNotify* notify,
+                        PluginxxString*               error_out) -> void* {
+        auto* s = static_cast<Shim*>(user_data);
+        (void)error_out;
+        if (!s || !s->ctx) {
+            CompletionGuard guard(notify);
+            guard.failed("capability context released");
+            return nullptr;
+        }
+        // 能力入参纳入拥有型 Request: 业务只读到 Request 拥有的 method/args
+        auto request = RootRequest::forCapability(s->ctx->host, method, args_json);
+
+        using CapRet = decltype(
+            invokeCap(s->fn, *s->ctx, caller_host, std::string_view{}, std::string_view{})
+        );
+        // 同步能力: void 或字符串类返回值; 其余 (asio 协程) 走异步路径。
+        constexpr bool kSyncCap
+            = std::is_void_v<CapRet> || std::is_convertible_v<CapRet, std::string_view>;
+        if constexpr (kSyncCap) {
+            /// 同步能力：调用返回即完成；异常统一映射为终态。
+            CompletionGuard guard(notify);
+            try {
+                if constexpr (std::is_void_v<CapRet>) {
+                    invokeCap(
+                        s->fn,
+                        *s->ctx,
+                        caller_host,
+                        request.capMethod(),
+                        request.args()
+                    );
+                    guard.ok();
+                } else {
+                    guard.ok(invokeCap(
+                        s->fn,
+                        *s->ctx,
+                        caller_host,
+                        request.capMethod(),
+                        request.args()
+                    ));
+                }
+            } catch (...) {
+                guard.fromCurrentException();
+            }
+            return nullptr;
+        } else if constexpr (IsPluginAwaitable<CapRet>::value) {
+            /// asio 协程能力: 起一条 provider 根; 入参由根保活到协程结束。
+            auto hold = std::make_shared<RootRequest>(std::move(request));
+            auto pr   = startProviderRoot(
+                s->ctx->bridge(),
+                notify ? *notify : PluginxxOperatorNotify{nullptr, nullptr},
+                [s, caller_host, hold](std::shared_ptr<ProviderRoot> root) -> CapRet {
+                    root->keepAlive = hold;
+                    return invokeCap(
+                        s->fn,
+                        *s->ctx,
+                        caller_host,
+                        hold->capMethod(),
+                        hold->args()
+                    );
+                },
+                [](auto&& value) {
+                    using ValueT = std::decay_t<decltype(value)>;
+                    if constexpr (std::is_void_v<ValueT>) {
+                        return std::make_pair(int32_t{PLUGINXX_OPERATOR_OK}, std::string{});
+                    } else {
+                        return std::make_pair(
+                            int32_t{PLUGINXX_OPERATOR_OK},
+                            std::string{value}
+                        );
+                    }
+                },
+                [](std::exception_ptr ep) {
+                    std::string why;
+                    try {
+                        std::rethrow_exception(ep);
+                    } catch (const std::exception& e) {
+                        why = e.what();
+                    } catch (...) {
+                        why = "capability threw a non-standard exception";
+                    }
+                    return std::make_pair(int32_t{PLUGINXX_OPERATOR_FAILED}, why);
+                }
+            );
+            return pr.get();
+        } else {
+            /// 返回类型对不上: 同步能力返回 `void` / 字符串, 异步能力返回
+            /// `asio::awaitable<T>`
+            static_assert(
+                IsPluginAwaitable<CapRet>::value,
+                "capability(): 业务体必须返回 void / 字符串 / asio::awaitable<T>"
+            );
+            CompletionGuard guard(notify);
+            guard.failed("capability returned an unsupported type");
+            return nullptr;
+        }
+    };
+
+    spec.cancel = [](void* user_data, void* op) {
+        (void)user_data;
+        if (!op) {
+            return;
+        }
+        static_cast<CancelableProvider*>(op)->requestCancel();
+    };
+    return spec;
+}
+
+} // namespace detail
+
+/// 登记一行能力实现 (**唯一入口**: 提交/等待都用 asio 协程)
+///
+/// 业务体可返回字符串 (同步) 或 `asio::awaitable<T>` (异步): 返回值就是这次调用的
+/// 结果文本。给工具体、功能埋点实现体这类 `asio::awaitable` 事务用。
+template<typename Ctx, typename CapFn>
+inline asio::awaitable<TableOpResult> capabilityAsync(
     Ctx&                     ctx,
     std::string_view         capName,
     CapFn&&                  fn,
     const CapabilityOptions& opts = {}
 ) {
-    struct CapShim {
-        Ctx*                ctx = nullptr;
-        std::decay_t<CapFn> fn;
-    };
-
-    /// 异步能力的 provider 句柄：拥有输入 Request，并由 promise.opCleanup_ 回收。
-    struct CapJob {
-        CapShim*                           shim = nullptr;
-        std::shared_ptr<std::atomic<bool>> cancelFlag;
-        void*                              coroAddr = nullptr;
-        detail::RootRequest                request;
-    };
-
-    auto shim = ctx.storeShim(std::make_unique<CapShim>(CapShim{&ctx, std::forward<CapFn>(fn)}));
-
-    if (ctx.iface.capabilities && ctx.iface.capabilities->register_capability) {
-        auto capSv = PluginStringView::from(capName.data(), capName.size());
-        auto run = [](void*                         user_data,
-               const PluginxxHost*           caller_host,
-               const PluginxxStringView*     method,
-               const PluginxxStringView*     args_json,
-               const PluginxxOperatorNotify* notify,
-               PluginxxString*               error_out) -> void* {
-                auto* shim = static_cast<CapShim*>(user_data);
-                (void)error_out;
-                if (!shim || !shim->ctx) {
-                    detail::CompletionGuard guard(notify);
-                    guard.failed("capability context released");
-                    return nullptr;
-                }
-                // 能力入参纳入拥有型 Request：业务只读到 Request 拥有的
-                // method/args（F13），不再依赖主程序借用缓冲区。
-                auto request
-                    = detail::RootRequest::forCapability(shim->ctx->host, method, args_json);
-
-                using CapRet = decltype(detail::invokeCap(
-                    shim->fn,
-                    *shim->ctx,
-                    caller_host,
-                    std::string_view{},
-                    std::string_view{}
-                ));
-                // 同步能力: void 或字符串类返回值；其余 (Task<T>) 走异步路径。
-                constexpr bool kSyncCap
-                    = std::is_void_v<CapRet> || std::is_convertible_v<CapRet, std::string_view>;
-                if constexpr (kSyncCap) {
-                    /// 同步能力：调用返回即完成；异常统一映射为终态。
-                    detail::CompletionGuard guard(notify);
-                    try {
-                        if constexpr (std::is_void_v<CapRet>) {
-                            detail::invokeCap(
-                                shim->fn,
-                                *shim->ctx,
-                                caller_host,
-                                request.capMethod(),
-                                request.args()
-                            );
-                            guard.ok();
-                        } else {
-                            guard.ok(detail::invokeCap(
-                                shim->fn,
-                                *shim->ctx,
-                                caller_host,
-                                request.capMethod(),
-                                request.args()
-                            ));
-                        }
-                    } catch (...) {
-                        guard.fromCurrentException();
-                    }
-                    return nullptr;
-                } else {
-                    /// Task<T> 能力：由 promise 在协程结束后收束完成通知，
-                    /// 返回 Job 作为主程序可取消的 provider 句柄。
-                    auto* job = new CapJob{
-                        shim,
-                        std::make_shared<std::atomic<bool>>(false),
-                        nullptr,
-                        std::move(request)
-                    };
-                    auto task = detail::invokeCap(
-                        shim->fn,
-                        *shim->ctx,
-                        caller_host,
-                        job->request.capMethod(),
-                        job->request.args()
-                    );
-                    if (!task.handle_) {
-                        delete job;
-                        detail::CompletionGuard guard(notify);
-                        guard.failed("capability returned an empty task");
-                        return nullptr;
-                    }
-                    auto h        = task.handle_;
-                    task.handle_  = nullptr;
-                    auto& p       = h.promise();
-                    p.notify_     = notify ? *notify : PluginxxOperatorNotify{nullptr, nullptr};
-                    p.host_       = job->request.host;
-                    p.cancelFlag_ = job->cancelFlag;
-                    job->coroAddr = h.address();
-
-                    // 根的首步由 host driver 推进 (与工具同一套完成协议)。
-                    detail::startBridgedRoot(shim->ctx->bridge(), p.notify_, h, [job] {
-                        delete job;
-                    });
-                    return job;
-                }
-            };
-        auto cancel = [](void* user_data, void* op) {
-                (void)user_data;
-                if (!op) {
-                    return;
-                }
-                auto* job = static_cast<CapJob*>(op);
-                if (job->cancelFlag) {
-                    job->cancelFlag->store(true, std::memory_order_release);
-                }
-                if (job->coroAddr) {
-                    auto handle = std::coroutine_handle<detail::PromiseBase<void>>::from_address(
-                        job->coroAddr
-                    );
-                    handle.promise().cancel_outstanding();
-                }
-            };
-        PluginxxCapabilitySpec spec{};
-        spec.version     = PLUGINXX_API_VERSION;
-        spec.struct_size = sizeof(PluginxxCapabilitySpec);
-        spec.id          = capSv;
-        if (!opts.ownerTag.empty()) {
-            spec.owner_tag = PluginStringView::from(opts.ownerTag.data(), opts.ownerTag.size());
-        }
-        spec.impls     = opts.impls;
-        spec.merge     = opts.merge;
-        spec.phases    = opts.phases;
-        spec.phase     = opts.phase;
-        spec.priority  = opts.priority;
-        spec.timeout_ms = opts.timeoutMs;
-        spec.run_start = run;
-        spec.cancel    = cancel;
-        spec.user_data = shim;
-        // 表成员是异步契约: 提交即开始, 结果 (登记成败) 经 ticket 交回。
-        // `start` 在主程序 IO 线程上是内联执行的: 返回时行已登记, spec 也已读完
-        return tableOp(
-            ctx,
-            [&ctx, scope = opts.scope, spec](
-                PluginxxOperatorCallback cb,
-                void*                    ud,
-                PluginxxString*          err
-            ) -> PluginxxOperatorHandle* {
-                return ctx.iface.capabilities->register_capability(
-                    ctx.host,
-                    scope,
-                    &spec,
-                    cb,
-                    ud,
-                    err
-                );
-            }
-        );
+    if (!ctx.iface.capabilities || !ctx.iface.capabilities->register_capability) {
+        TableOpResult r;
+        r.startError = "plugin capability iface unavailable";
+        co_return r;
     }
-    return TableOpTicket{};
+    const auto spec = detail::buildCapabilitySpec(ctx, capName, std::forward<CapFn>(fn), opts);
+    co_return co_await asyncTableOp(
+        ctx,
+        co_await asio::this_coro::executor,
+        [&ctx, scope = opts.scope, spec](
+            PluginxxOperatorCallback cb,
+            void*                    ud,
+            PluginxxString*          err
+        ) -> PluginxxOperatorHandle* {
+            return ctx.iface.capabilities->register_capability(
+                ctx.host,
+                scope,
+                &spec,
+                cb,
+                ud,
+                err
+            );
+        }
+    );
 }
+
 
 /* ==================== 一键式插件入口导出宏 ==================== */
 
@@ -5317,7 +4000,7 @@ inline void createInstanceEntry(
     if constexpr (KitInstanceCtx<CtxType>) {
         if (fresh && ctx->iface.tasks && ctx->iface.tasks->register_task) {
             const PluginxxOperatorNotify done = *notify; // 借用指针: 按值持有到任务结束
-            ctx->spawn([host, done, createFn](CtxType& instance, OpCtl&) -> Task<void> {
+            ctx->spawn([host, done, createFn](CtxType& instance, OpCtl&) -> asio::awaitable<void> {
                 try {
                     co_await instance.onHostReady();
                     if (createFn) {
