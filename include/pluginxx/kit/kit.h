@@ -2507,7 +2507,7 @@ inline asio::awaitable<void> invokeSpawnAwaitableOwned(
 /// - 首步同样不在调用方栈里跑: `co_spawn` 会把帧投递到桥的本地执行器, 等主程序下一次
 ///   driver 推进。
 template<typename Ctx, typename Fn>
-inline void spawnAwaitableImpl(Ctx& ctx, Fn&& fn) {
+inline bool spawnAwaitableImpl(Ctx& ctx, Fn&& fn) {
     using SpawnRecord                  = typename std::remove_reference_t<Ctx>::SpawnRecord;
     auto cancelFlag                    = std::make_shared<std::atomic<bool>>(false);
     auto rec                           = std::make_shared<SpawnRecord>();
@@ -2548,11 +2548,11 @@ inline void spawnAwaitableImpl(Ctx& ctx, Fn&& fn) {
             } else {
                 ctx.log.warn("spawn: register_task failed");
             }
-            return;
+            return false;
         }
     } else {
         ctx.log.warn("spawn: host has no pluginxx.tasks iface");
-        return;
+        return false;
     }
 
     auto closure = std::make_shared<std::decay_t<Fn>>(std::forward<Fn>(fn));
@@ -2591,6 +2591,7 @@ inline void spawnAwaitableImpl(Ctx& ctx, Fn&& fn) {
             }
         )
     );
+    return true;
 }
 
 /// “可取消的业务根”公共接口
@@ -2714,9 +2715,15 @@ inline std::shared_ptr<ProviderRoot> startProviderRoot(
 /// asio 管帧 (`co_spawn` 到桥的本地执行器), 完成时上报一次。
 ///
 /// 入参形如 (Ctx&, OpCtl&) (也可以只收 Ctx&), 闭包按值搬进协程帧。
+///
+/// - `return` true = 已排入任务表并将被推进; false = 没排上 (主机没有 tasks 表 /
+///   register_task 拒绝), 任务体一行都不会执行 — 调用方如果要"完成时必须交回结果",
+///   必需检查这个返回值 (否则完成通知永远不会发出)
+/// - 需要 `finishLater` 之类自动完成兜底的场景, 用它的 guard 更简单
+///   (guard 在闭包被丢弃时自动交 FAILED)
 template<typename Ctx, typename Fn>
-inline void spawn(Ctx& ctx, Fn&& fn) {
-    detail::spawnAwaitableImpl(ctx, std::forward<Fn>(fn));
+inline bool spawn(Ctx& ctx, Fn&& fn) {
+    return detail::spawnAwaitableImpl(ctx, std::forward<Fn>(fn));
 }
 
 /* ==================== 插件实例上下文基类 (通用部分) ==================== */
@@ -2975,9 +2982,11 @@ public:
     /// 启动后台协作任务 (完成协议见 [detail::spawnAwaitableImpl])
     /// - 任务体写成 `asio::awaitable<void>`: asio 管帧, `co_spawn` 到桥的本地执行器
     /// - 任务协程以本实例引用接收 OpCtl; 主程序取消/实例析构时由 [stopSpawns] 收束
+    /// - `return` false = 没排上 (主机没有 tasks 表 / register_task 拒绝), 任务体不会
+    ///   执行; "完成时必须交回通知"的调用方必须检查 (否则对方永远等不到完成)
     template<typename Self, typename Fn>
-    void spawn(this Self& self, Fn&& fn) {
-        detail::spawnAwaitableImpl(self, std::forward<Fn>(fn));
+    bool spawn(this Self& self, Fn&& fn) {
+        return detail::spawnAwaitableImpl(self, std::forward<Fn>(fn));
     }
 
     /// 业务初始化 (**协程**: create 事务在 [attachHost] 之后 await 它)
@@ -3346,11 +3355,21 @@ struct AsyncTableOpInitiation {
             finishAsyncTableOp<H, Executor>(st, std::move(r));
             return;
         }
-        st->opHandle.store(op, std::memory_order_release);
+        // 完成回调可能在 start() 内部就地跑过 (主程序内联完成, 例如网络表的
+        // `net.info` / `ws.send` 一类立即完成的 op): 那时回调已经把 opHandle 清空并
+        // 置位 fired, 这里不能再把过期句柄写回去 —— 操作完成很久之后句柄可能已被
+        // 主程序回收, 取消槽再拿它调 `op_cancel` 就是 use-after-free。
+        if (!st->fired.load(std::memory_order_acquire)) {
+            st->opHandle.store(op, std::memory_order_release);
+        }
         // 协程被取消 (主程序关闭 / 业务主动取消) 时把同一次调用在主程序侧撤掉,
         // 否则插件会一直等到计时器/IO 自己结束。
         if (slot.is_connected() && cancelIface != nullptr && cancelIface->op_cancel != nullptr) {
             slot.assign([st, cancelIface = cancelIface](asio::cancellation_type) {
+                // 已完成: 句柄不再有效 (见上面那段)
+                if (st->fired.load(std::memory_order_acquire)) {
+                    return;
+                }
                 if (auto* h = st->opHandle.exchange(nullptr, std::memory_order_acq_rel)) {
                     try {
                         cancelIface->op_cancel(h);
@@ -4038,7 +4057,8 @@ inline void createInstanceEntry(
     if constexpr (KitInstanceCtx<CtxType>) {
         if (fresh && ctx->iface.tasks && ctx->iface.tasks->register_task) {
             const PluginxxOperatorNotify done = *notify; // 借用指针: 按值持有到任务结束
-            ctx->spawn([host, done, createFn](CtxType& instance, OpCtl&) -> asio::awaitable<void> {
+            const bool                   scheduled
+                = ctx->spawn([host, done, createFn](CtxType& instance, OpCtl&) -> asio::awaitable<void> {
                 try {
                     co_await instance.onHostReady();
                     if (createFn) {
@@ -4059,6 +4079,16 @@ inline void createInstanceEntry(
                 }
                 co_return;
             });
+            if (!scheduled) {
+                // 任务没排上 (register_task 拒绝): 协程体一行都不会执行, 完成通知也就
+                // 永远不会发出 —— 这里补一次失败, 不让主程序等到关闭截止时间
+                notifyLifecycleFailure(
+                    host,
+                    notify,
+                    err,
+                    "plugin create: could not schedule the create transaction"
+                );
+            }
             return;
         }
         if (fresh) {
