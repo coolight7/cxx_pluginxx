@@ -42,9 +42,9 @@
 ///   调到隔壁函数) —— 要改就换新 IID;
 /// - 用 `_MIN_VERSION` 表达"我加了新成员"是错的 (那等于把老主程序全部判死)。
 ///
-/// 本表的当前状态: 通用表 9 张。其中 `capabilities` 为 v7 (v4 是声明 + 多实现行,
+/// 本表的当前状态: 通用表 9 张。其中 `capabilities` 为 v9 (v4 是声明 + 多实现行,
 /// v5 追加 `invoke_capability_ex`, v6 追加 `unregister_capability_ex`, v7 删掉
-/// `op_cancel`), `scheduler` 为 v2 (v2 删 `post_to_io` 与 `op_cancel`,
+/// `op_cancel`, v8 改成异步操作契约, v9 删掉 `sync`), `scheduler` 为 v2 (v2 删 `post_to_io` 与 `op_cancel`,
 /// 并把已删除的 `coroutine_runtime` 表并入), `broadcasts` 为 v3 (v3 追加
 /// `end_broadcast` / `subscribe_broadcast_ex`), `config` / `cancel` 为 v3,
 /// 其余 4 张仍为 v1。
@@ -236,8 +236,10 @@ typedef struct PluginxxBroadcastsIface {
 ///     操作契约, 不变): 登记与注销的结论经完成回调交回, `capability_info` /
 ///     `list_capabilities` 的清单 JSON 在 `payload` 里, 细分原因 (如 `not_declared`)
 ///     也在 `payload` 文本里
-#define PLUGINXX_IFACE_CAPABILITIES_VERSION     8
-#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 8
+/// v9: 删掉 `PluginxxCapabilitySpec.sync` —— 处理器只有一种形态 (调用时给完成通知,
+///     可以在返回后再通知); 主程序派发因此不必为同步处理器单开一条路径
+#define PLUGINXX_IFACE_CAPABILITIES_VERSION     9
+#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 9
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
 #define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE sizeof(PluginxxCapabilitiesIface)
 
@@ -259,10 +261,13 @@ typedef struct PluginxxCapabilitySpec {
     uint32_t phases;     ///< PLUGINXX_CAPABILITY_PHASE_MASK_* (同上)
     int32_t  phase;      ///< 这次登记的阶段: PLUGINXX_CAPABILITY_PHASE_*
     int32_t  priority;   ///< 小者先
-    int32_t  sync;       ///< 1 = 只给同步处理器; 0 = 异步 (hook_start)
     int32_t  timeout_ms; ///< 0 = 用声明里的值
 
-    /// 处理器 (二者取一; 同步处理器在返回前完成 `notify`, 异步处理器可稍后完成)
+    /// 处理器 (唯一形态): 受理时给回操作句柄 (可空), 结束时调用一次
+    /// `notify->done`
+    ///
+    /// 处理器可以在返回之前就调 `notify->done` (立即完成的处理器), 也可以稍后再调
+    /// (等网络 / 等脚本结果) —— 主程序一律按"异步完成"处理, 不区分两种写法。
     PluginxxCapabilityStartFunction  run_start;
     PluginxxOperatorCancelFunction   cancel;
     void*                            user_data;

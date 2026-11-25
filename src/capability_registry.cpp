@@ -36,7 +36,6 @@ utilxx_base::Json rowJson(const CapabilityProvider& row) {
     }
     j["phase"]    = std::string{CapabilityRegistry::phaseName(row.phase)};
     j["priority"] = row.priority;
-    j["sync"]     = row.sync;
     return j;
 }
 
@@ -270,7 +269,6 @@ bool CapabilityRegistry::registerCapability(
     row.provider = std::string{provider};
     row.phase    = CapabilityPhase_e::Impl;
     row.priority = 0;
-    row.sync     = false;
     row.start    = start;
     row.cancel   = cancel;
     row.ctx      = ctx;

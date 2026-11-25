@@ -407,7 +407,6 @@ public:
             spec.phase != 0 ? spec.phase : PLUGINXX_CAPABILITY_PHASE_IMPL
         );
         row.priority = spec.priority;
-        row.sync     = spec.sync != 0;
         row.start    = spec.run_start;
         row.cancel   = spec.cancel;
         row.ctx      = spec.user_data;

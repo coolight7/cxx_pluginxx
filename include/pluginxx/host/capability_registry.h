@@ -105,7 +105,6 @@ struct CapabilityProvider {
     std::string                     ownerTag; ///< 同一插件内区分多个处理器 (可空)
     CapabilityPhase_e               phase    = CapabilityPhase_e::Impl;
     int32_t                         priority = 0; ///< 小者先
-    bool                            sync     = false;
     PluginxxCapabilityStartFunction start    = nullptr;
     PluginxxOperatorCancelFunction  cancel   = nullptr;
     void*                           ctx      = nullptr;
