@@ -419,6 +419,94 @@ struct PluginDispatchContext {
     pluginxx::PluginCallbackStats*      stats = nullptr;
 };
 
+/// 记录一次"回调超过预算"并决定要不要告警 (**任意线程**)
+///
+/// 为什么限频: 这里量的是墙钟时间, 一次回调跑满 100 ms 有两种可能 —— 插件自己做了
+/// 100 ms 的活, 或者它所在线程被系统调度挂起了这么久。后者与插件无关, 而只有周期很短的
+/// 回调 (例如 5 秒采一次的监控广播) 才会统计到这种抖动, 于是同一插件会偶现同一条告警。
+/// 判据改为"重复出现": 同一 (插件, 回调) 在窗口内第一次只记 DEBUG, 之后每个窗口最多
+/// 一条 WARN, 带上窗口内的次数与最长耗时。计数 [PluginCallbackStats::overBudget] 仍每次
+/// 自增, 诊断快照的 `over_budget_top` 能看到全貌。
+inline void notePluginCallbackOverBudget(
+    PluginCallbackStats& stats,
+    std::string_view     pluginName,
+    std::string_view     label,
+    uint64_t             micros,
+    uint64_t             budgetMs
+) {
+    constexpr auto   kWindow     = std::chrono::minutes{5};
+    constexpr size_t kMaxRecords = 512;
+
+    std::string key{pluginName};
+    key += '|';
+    key += label;
+
+    uint64_t count     = 0;
+    uint64_t maxMicros = 0;
+    bool     warn      = false;
+    {
+        std::lock_guard lock(stats.overBudgetMutex);
+        auto&           records = stats.overBudgetRecords;
+        if (records.size() >= kMaxRecords && records.find(key) == records.end()) {
+            // 记录表有上限: 满了先清掉上个窗口的项 (计数照旧, 只是不再新增键)
+            const auto now = std::chrono::steady_clock::now();
+            for (auto it = records.begin(); it != records.end();) {
+                if (it->second.windowStart.time_since_epoch().count() != 0
+                    && now - it->second.windowStart >= kWindow) {
+                    it = records.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        auto&      record = records[key];
+        const auto now    = std::chrono::steady_clock::now();
+        if (record.windowStart.time_since_epoch().count() == 0
+            || now - record.windowStart >= kWindow) {
+            record.windowStart = now;
+            record.count       = 0;
+            record.maxMicros   = 0;
+            record.lastWarn    = {};
+        }
+        ++record.count;
+        record.maxMicros = (std::max)(record.maxMicros, micros);
+        count            = record.count;
+        maxMicros        = record.maxMicros;
+        if (count > 1
+            && (record.lastWarn.time_since_epoch().count() == 0
+                || now - record.lastWarn >= kWindow)) {
+            record.lastWarn = now;
+            warn            = true;
+        }
+    }
+
+    if (warn) {
+        XX_LOGW(
+            "Plugin `{}`: callback `{}` exceeded the {} ms budget {} time(s) in {} min "
+            "(max {} ms); it keeps holding the plugin thread",
+            pluginName,
+            label,
+            budgetMs,
+            count,
+            static_cast<int64_t>(
+                std::chrono::duration_cast<std::chrono::minutes>(kWindow).count()
+            ),
+            maxMicros / 1000
+        );
+    } else if (count == 1) {
+        // 单次超预算: 只可能是调度抖动 (插件本体耗时通常是指标里的平均值级别),
+        // 记 DEBUG 供排查, 不打扰正常日志
+        XX_LOGD(
+            "Plugin `{}`: callback `{}` took {} ms once (budget {} ms), treated as a "
+            "scheduling hiccup; repeated occurrences will be reported",
+            pluginName,
+            label,
+            micros / 1000,
+            budgetMs
+        );
+    }
+}
+
 /// 执行一次投递 (测量 + 异常保护 + 统计); 内联路径与插件线程路径共用
 inline void runPluginDispatch(PluginDispatchContext& context) {
     const auto started = std::chrono::steady_clock::now();
@@ -466,14 +554,7 @@ inline void runPluginDispatch(PluginDispatchContext& context) {
     const auto budget = static_cast<uint64_t>(stats->budgetMs.load(std::memory_order_relaxed));
     if (budget > 0 && micros > budget * 1000) {
         stats->overBudget.fetch_add(1, std::memory_order_relaxed);
-        XX_LOGW(
-            "Plugin `{}`: callback `{}` blocked the plugin thread for {} ms "
-            "(budget {} ms)",
-            context.inst->name,
-            context.label,
-            micros / 1000,
-            budget
-        );
+        notePluginCallbackOverBudget(*stats, context.inst->name, context.label, micros, budget);
     }
 }
 

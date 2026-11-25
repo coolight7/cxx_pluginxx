@@ -405,8 +405,47 @@ struct PluginCallbackStats {
     std::atomic<uint64_t> dropped{0};
     /// 插件执行器不可用 (缺失/已停止) 而丢弃的派发数
     std::atomic<uint64_t> unschedulable{0};
-    /// 单次回调耗时预算 (毫秒); 超过记 WARN 并计入 [overBudget]
+    /// 单次回调耗时预算 (毫秒); 超过计入 [overBudget] 并按 [OverBudgetRecord] 的频率告警
     std::atomic<uint32_t> budgetMs{100};
+
+    /// 一次"超预算"的记录: 按 (插件名, 回调名) 汇总一个时间窗口内的次数与最长耗时
+    ///
+    /// 用途是给告警限频 (见 [notePluginCallbackOverBudget]): 单次超预算无法区分
+    /// "插件真的干了这么久"与"这条线程被系统调度挂起了", 重复出现才是真问题。
+    struct OverBudgetRecord {
+        /// 本窗口内的超预算次数
+        uint64_t count = 0;
+        /// 本窗口内最长的耗时 (微秒)
+        uint64_t maxMicros = 0;
+        /// 窗口起点 (`time_since_epoch().count() == 0` 表示还没有记录)
+        std::chrono::steady_clock::time_point windowStart{};
+        /// 上次输出 WARN 的时刻 (空 = 本窗口还没告警过)
+        std::chrono::steady_clock::time_point lastWarn{};
+    };
+
+    /// 超预算记录表的互斥 (派发可能来自多条插件执行线程)
+    mutable std::mutex overBudgetMutex;
+    /// key = `插件名|回调名`
+    std::map<std::string, OverBudgetRecord> overBudgetRecords;
+
+    /// 最近的超预算记录快照 (诊断用): 按窗口内最长耗时降序, 最多 `limit` 条
+    std::vector<std::pair<std::string, OverBudgetRecord>> overBudgetTop(size_t limit) const {
+        std::vector<std::pair<std::string, OverBudgetRecord>> out;
+        {
+            std::lock_guard lock(overBudgetMutex);
+            out.reserve(overBudgetRecords.size());
+            for (const auto& entry : overBudgetRecords) {
+                out.push_back(entry);
+            }
+        }
+        std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+            return a.second.maxMicros > b.second.maxMicros;
+        });
+        if (limit > 0 && out.size() > limit) {
+            out.resize(limit);
+        }
+        return out;
+    }
 };
 
 /// 不捕获 manager 裸指针的公共运行时状态。Operation 表只由 IO 线程操作。
