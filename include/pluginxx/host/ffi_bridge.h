@@ -1,6 +1,6 @@
-/// 宿主语言 ↔ 插件框架的边界件（与具体应用无关）
+/// 主程序 ↔ 插件框架的边界件（与具体应用无关）
 ///
-/// 只放"任何宿主都要写一遍"的三件事，**不含 op 分发**（那是各宿主自己的兜底通道）：
+/// 只放"任何主程序都要写一遍"的三件事，**不含 op 分发**（那是各主程序自己的兜底通道）：
 ///
 /// - [EventQueue]：事件入队与取走。"任何线程 push、单消费者 poll"，队列有界；
 ///   入队后调用唤醒回调（**在锁外**调用，回调里可以再加锁，不会死锁）；
@@ -8,9 +8,9 @@
 ///   取消幂等；停机 / 卸载时把还没收尾的请求整体结算。**库内不放定时器**：
 ///   `nextDeadlineMs()` / `popExpired()` 交给调用方用自己的 io_context 或定时器驱动；
 /// - 跨堆字符串：`strdupTo` / `freeString`，分配与释放都用调用方给的分配器
-///   （宿主与库可能各有一套 CRT，库不替调用方决定用哪个堆）。
+///   （主程序与库可能各有一套 CRT，库不替调用方决定用哪个堆）。
 ///
-/// 线程约定：两个类都可以在任意线程调用，内部加锁；`poll` 属于单消费者（宿主的事件泵）。
+/// 线程约定：两个类都可以在任意线程调用，内部加锁；`poll` 属于单消费者（主程序的事件泵）。
 #ifndef PLUGINXX_HOST_FFI_BRIDGE_H
 #define PLUGINXX_HOST_FFI_BRIDGE_H
 
@@ -35,8 +35,8 @@ namespace ffi {
 
 /// ==================== 事件队列 ====================
 ///
-/// 事件是**已经序列化好的 JSON 文本**（形状由宿主决定，桥不解释），`poll` 把它们拼成一个
-/// JSON 数组交给宿主。`seq` / 时间戳 / 类型字段也由宿主在序列化时写进去，桥只负责排队不乱序。
+/// 事件是**已经序列化好的 JSON 文本**（形状由主程序决定，桥不解释），`poll` 把它们拼成一个
+/// JSON 数组交给主程序。`seq` / 时间戳 / 类型字段也由主程序在序列化时写进去，桥只负责排队不乱序。
 class EventQueue {
 public:
     explicit EventQueue(size_t capacity = 16384) : capacity_(capacity == 0 ? 1 : capacity) {}
@@ -77,7 +77,7 @@ public:
 
     /// 入队一条事件；队列满时丢最旧的一条再入队（返回 false 表示"丢过东西"）
     ///
-    /// 调用方通常会在返回 false 时再补一条"队列溢出"事件，让宿主知道丢了什么。
+    /// 调用方通常会在返回 false 时再补一条"队列溢出"事件，让主程序知道丢了什么。
     /// `droppedCount` 给出累计丢弃条数。
     bool pushDropOldest(std::string jsonEvent, size_t* droppedCount = nullptr) {
         std::function<void()> wake;
@@ -186,15 +186,15 @@ private:
 
 /// ==================== 一次请求的记账 ====================
 ///
-/// 一条记账 = 一次已受理、还没收尾的请求。宿主拿到 id 后无论走哪条路径都要收尾一次：
+/// 一条记账 = 一次已受理、还没收尾的请求。主程序拿到 id 后无论走哪条路径都要收尾一次：
 /// 正常完成、失败、取消、插件卸载、框架停机。`settle` 只有一个赢家（由锁保证），
 /// 所以"恰好一条结果"不依赖调用方自觉。
 ///
-/// `deadlineMs` 只是记账：**库不建定时器**。宿主用自己的事件循环等到
+/// `deadlineMs` 只是记账：**库不建定时器**。主程序用自己的事件循环等到
 /// `nextDeadlineMs()`，再调 `popExpired()` 结算到期的请求（或者干脆不用超时）。
 struct RequestEntry {
     int64_t     id        = 0;
-    std::string op;        ///< 操作名（宿主自己解释）
+    std::string op;        ///< 操作名（主程序自己解释）
     std::string owner;     ///< 所属插件 / 会话 id（空 = 不限）。卸载时按它批量结算
     int64_t     startedMs = 0; ///< 受理时刻（`nowMs` 由调用方给；只用于统计与超时）
     int64_t     deadlineMs = 0; ///< 到期时刻（0 = 不限）
@@ -204,7 +204,7 @@ class RequestRegistry {
 public:
     /// 受理一次请求；返回请求号（从 1 开始单调递增，不复用）
     ///
-    /// - `timeoutMs > 0` 时记一条到期时刻（`nowMs + timeoutMs`），交给宿主自己的定时器驱动；
+    /// - `timeoutMs > 0` 时记一条到期时刻（`nowMs + timeoutMs`），交给主程序自己的定时器驱动；
     /// - `nowMs` 由调用方给（steady clock 的毫秒数），库不读时钟。
     int64_t begin(std::string_view op, std::string_view owner = {}, int32_t timeoutMs = 0,
                   int64_t nowMs = 0) {
@@ -305,7 +305,7 @@ public:
                             exceptId);
     }
 
-    /// 按自定义条件批量结算（宿主用自己的归属规则时用，例如"实例名去掉前缀后比 id"）
+    /// 按自定义条件批量结算（主程序用自己的归属规则时用，例如"实例名去掉前缀后比 id"）
     std::vector<RequestEntry>
     failAllWhere(const std::function<bool(const RequestEntry&)>& predicate, int64_t exceptId = 0) {
         std::lock_guard<std::mutex> lock{mutex_};
@@ -337,8 +337,8 @@ public:
 
     /// 全部请求里的最早到期时刻（`0` = 没有带超时的请求）
     ///
-    /// 宿主用自己的定时器等到这个时刻，再调 [popExpired] 结算。"库内不放定时器"的原因：
-    /// 两边宿主各有自己的事件循环，库替谁决定线程都不对。
+    /// 主程序用自己的定时器等到这个时刻，再调 [popExpired] 结算。"库内不放定时器"的原因：
+    /// 两边主程序各有自己的事件循环，库替谁决定线程都不对。
     int64_t nextDeadlineMs(int64_t nowMs) const {
         std::lock_guard<std::mutex> lock{mutex_};
         int64_t                     next = 0;

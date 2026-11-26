@@ -21,6 +21,7 @@
 #include "asio/steady_timer.hpp"
 #include "pluginxx/host/abi_util.h"
 #include "pluginxx/host/capability_registry.h"
+#include "pluginxx/host/kind_registry.h"
 #include "pluginxx/host/domain_services.h"
 #include "pluginxx/host/broadcast_registry.h"
 #include "pluginxx/host/capability_chain.h"
@@ -231,6 +232,23 @@ public:
     /// 能力注册表 (主程序其它代码可直接查询)
     std::shared_ptr<CapabilityRegistry> capabilities() const {
         return capabilities_;
+    }
+
+    /// 插件形态注册表
+    /// - 预置形态 (`native` 与主程序自带的解释执行形态) 由主程序在构造时交给它
+    ///   (`setKindRegistry`), 不交时只有空表;
+    /// - 插件经通用表 `<应用名>.kind` 登记 / 撤销自己的形态, 跟着插件生命周期撤销
+    PluginxxKindRegistry& kindRegistry() noexcept {
+        return kindRegistry_;
+    }
+
+    const PluginxxKindRegistry& kindRegistry() const noexcept {
+        return kindRegistry_;
+    }
+
+    /// 替换形态表 (构造期间调用一次; 之后插件登记写在表里)
+    void setKindRegistry(PluginxxKindRegistry registry) {
+        kindRegistry_ = std::move(registry);
     }
 
     // =====================================================================
@@ -504,6 +522,8 @@ public:
             return;
         }
         capabilities_->removeProvider(inst->name);
+        // 形态登记跟着实例走: 停用 / 卸载 / 关闭框架后不能留下"没有运行器却显示为可用"的行
+        kindRegistry_.unregisterAllOf(inst->name);
     }
 
     /// 撤销实例声明的全部能力并清空登记记录 (**IO 线程**; 实例即将销毁/停用收尾)
@@ -1809,6 +1829,8 @@ protected:
     std::string                         officialPrefix_{pluginxx::appIdPrefix()};
     std::shared_ptr<CapabilityRegistry> capabilities_ = std::make_shared<CapabilityRegistry>();
     std::shared_ptr<BroadcastRegistry>  broadcasts_   = std::make_shared<BroadcastRegistry>();
+    /// 插件形态表 (预置形态 + 插件登记的形态)
+    PluginxxKindRegistry kindRegistry_;
 };
 
 } // namespace pluginxx

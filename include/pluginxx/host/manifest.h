@@ -7,6 +7,7 @@
 /// - 资源声明: [PluginManifestResources] (skill/memory/mcp; 相对路径已解析为绝对);
 /// - 接口声明: [PluginManifestInterfaces] (require/optional 接口名清单);
 /// - 入口路径解析: [resolvePluginEntryPath] (平台扩展名修正 + 配置子目录回退);
+/// - 插件形态: 清单 `kind` 字段 (缺省 = 空串, 按动态库插件处理);
 /// - 依赖排序: [PluginSortItem] / [topoSortPlugins] (Kahn 拓扑排序)。
 ///
 /// 接口声明的**协商** (前缀归属与主程序支持集比对) 属于主程序业务, 由主程序实现。
@@ -119,6 +120,11 @@ struct PluginManifestInterfaces {
 /// - interfaces 非空时额外输出接口声明段 (require/optional, 见
 ///   PluginManifestInterfaces); 段缺失时保持为空 —— 接口声明不参与
 ///   manifest 合法性判定
+/// - kind 非空时输出清单里的形态名 (`kind: js`); 段缺失时为空串, 表示
+///   "按动态库插件加载"。形态名是否合法、这个形态能不能跑由加载路径查形态表判定
+/// - version / description / apiVersion 非空时输出清单里的展示字段与声明代次
+///   (`api_version`); 动态库插件这些值由插件 `get_info` 给, 解释执行的形态
+///   只能从清单读
 PLUGINXX_API bool parsePluginManifest(
     const std::filesystem::path& dir,
     std::string&                 name,
@@ -126,7 +132,11 @@ PLUGINXX_API bool parsePluginManifest(
     std::vector<std::string>&    depends,
     std::vector<std::string>&    optionalDepends,
     PluginManifestResources*     resources  = nullptr,
-    PluginManifestInterfaces*    interfaces = nullptr
+    PluginManifestInterfaces*    interfaces = nullptr,
+    std::string*                 kind       = nullptr,
+    std::string*                 version    = nullptr,
+    std::string*                 description = nullptr,
+    int32_t*                     apiVersion  = nullptr
 );
 
 /// 从 YAML 字符串解析插件清单 (内置内嵌 `plugin.yaml` 原文路径)
@@ -141,7 +151,11 @@ PLUGINXX_API bool parsePluginManifestFromString(
     std::vector<std::string>&    depends,
     std::vector<std::string>&    optionalDepends,
     PluginManifestResources*     resources  = nullptr,
-    PluginManifestInterfaces*    interfaces = nullptr
+    PluginManifestInterfaces*    interfaces = nullptr,
+    std::string*                 kind       = nullptr,
+    std::string*                 version    = nullptr,
+    std::string*                 description = nullptr,
+    int32_t*                     apiVersion  = nullptr
 );
 
 /// 尝试从内置内嵌清单解析 (优先于文件系统)
@@ -154,7 +168,11 @@ PLUGINXX_API bool parseBuiltinManifest(
     std::vector<std::string>& depends,
     std::vector<std::string>& optionalDepends,
     PluginManifestResources*  resources  = nullptr,
-    PluginManifestInterfaces* interfaces = nullptr
+    PluginManifestInterfaces* interfaces = nullptr,
+    std::string*              kind       = nullptr,
+    std::string*              version    = nullptr,
+    std::string*              description = nullptr,
+    int32_t*                  apiVersion  = nullptr
 );
 
 /// 目录插件 entry 相对路径 → 平台化绝对库路径:

@@ -159,11 +159,45 @@ bool parseManifestNode(
     std::vector<std::string>&    depends,
     std::vector<std::string>&    optionalDepends,
     PluginManifestResources*     resources,
-    PluginManifestInterfaces*    interfaces
+    PluginManifestInterfaces*    interfaces,
+    std::string*                 kind,
+    std::string*                 version,
+    std::string*                 description,
+    int32_t*                     apiVersion
 ) {
     try {
         name  = node["name"] ? node["name"].as<std::string>() : std::string{};
         entry = node["entry"] ? node["entry"].as<std::string>() : std::string{};
+        // 形态名: 缺省 = 空串 (按动态库插件加载)。是否合法、能不能跑由加载路径查形态表
+        if (kind) {
+            *kind = node["kind"] && node["kind"].IsScalar()
+                        ? node["kind"].as<std::string>()
+                        : std::string{};
+        }
+        // 展示字段与声明代次: 动态库插件从 `get_info` 取, 解释执行的形态只能读清单
+        if (version) {
+            *version = node["version"] && node["version"].IsScalar()
+                           ? node["version"].as<std::string>()
+                           : std::string{};
+        }
+        if (description) {
+            *description = node["description"] && node["description"].IsScalar()
+                               ? node["description"].as<std::string>()
+                               : std::string{};
+        }
+        if (apiVersion) {
+            *apiVersion = 0;
+            if (node["api_version"] && node["api_version"].IsScalar()) {
+                try {
+                    *apiVersion = node["api_version"].as<int32_t>();
+                } catch (...) {
+                    XX_LOGW(
+                        "Plugin manifest `{}`: `api_version` is not an integer, ignored",
+                        logHint
+                    );
+                }
+            }
+        }
         if (node["depends"] && node["depends"].IsSequence()) {
             for (const auto& d : node["depends"]) {
                 if (d.IsScalar()) {
@@ -321,7 +355,11 @@ bool parsePluginManifest(
     std::vector<std::string>&    depends,
     std::vector<std::string>&    optionalDepends,
     PluginManifestResources*     resources,
-    PluginManifestInterfaces*    interfaces
+    PluginManifestInterfaces*    interfaces,
+    std::string*                 kind,
+    std::string*                 version,
+    std::string*                 description,
+    int32_t*                     apiVersion
 ) {
     auto            yamlPath = dir / "plugin.yaml";
     std::error_code ec;
@@ -339,7 +377,11 @@ bool parsePluginManifest(
             depends,
             optionalDepends,
             resources,
-            interfaces
+            interfaces,
+            kind,
+            version,
+            description,
+            apiVersion
         );
     } catch (const std::exception& e) {
         XX_LOGE("Parse plugin manifest `{}` failed: {}", yamlPath.string(), e.what());
@@ -355,7 +397,11 @@ bool parsePluginManifestFromString(
     std::vector<std::string>&    depends,
     std::vector<std::string>&    optionalDepends,
     PluginManifestResources*     resources,
-    PluginManifestInterfaces*    interfaces
+    PluginManifestInterfaces*    interfaces,
+    std::string*                 kind,
+    std::string*                 version,
+    std::string*                 description,
+    int32_t*                     apiVersion
 ) {
     if (yamlStr.empty()) {
         return false;
@@ -373,7 +419,11 @@ bool parsePluginManifestFromString(
             depends,
             optionalDepends,
             resources,
-            interfaces
+            interfaces,
+            kind,
+            version,
+            description,
+            apiVersion
         );
     } catch (const std::exception& e) {
         XX_LOGE("Parse builtin manifest failed: {}", e.what());
@@ -388,7 +438,11 @@ bool parseBuiltinManifest(
     std::vector<std::string>& depends,
     std::vector<std::string>& optionalDepends,
     PluginManifestResources*  resources,
-    PluginManifestInterfaces* interfaces
+    PluginManifestInterfaces* interfaces,
+    std::string*              kind,
+    std::string*              version,
+    std::string*              description,
+    int32_t*                  apiVersion
 ) {
     auto* m = findBuiltinManifest(pluginName);
     if (!m || pluginStringView2std(m->yaml).empty()) {
@@ -403,7 +457,11 @@ bool parseBuiltinManifest(
         depends,
         optionalDepends,
         resources,
-        interfaces
+        interfaces,
+        kind,
+        version,
+        description,
+        apiVersion
     );
 }
 

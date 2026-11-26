@@ -24,6 +24,7 @@
 /// 之后只读, 因此可安全被多个插件线程并发查询。
 #pragma once
 
+#include "pluginxx/api/kinds.h"
 #include "pluginxx/api/tables.h"
 #include "pluginxx/host/abi_util.h"
 #include "pluginxx/host/host_core.h"
@@ -1198,6 +1199,134 @@ struct GenericTableEntries {
     // cancel 表
     // =====================================================================
 
+    // =====================================================================
+    // kind 表 (插件形态登记; 预置形态由主程序构造时交给注册表)
+    // =====================================================================
+
+    /// 登记 / 覆盖一种形态
+    ///
+    /// `spec_json` 字段见 `pluginxx/api/kinds.h`; `provider` 一律用登记它的实例名,
+    /// 不接受自报 —— 卸载 / 停用时按实例名整批撤销。
+    static PluginxxOperatorHandle* PLUGINXX_CALL kindRegisterEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* spec_json,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
+        PluginxxString*           error_out
+    ) {
+        if (detail::abiViewEmpty(spec_json)) {
+            setTableOpError(error_out, "register_kind: missing spec_json");
+            return nullptr;
+        }
+        const std::string raw = svToStr(*spec_json);
+        return detail::asyncTableOp<InstanceT, ManagerT>(
+            host,
+            cb,
+            cb_ud,
+            error_out,
+            "kind.register_kind",
+            [raw](InstanceT* inst, ManagerT* mgr) -> std::string {
+                utilxx_base::Json json;
+                try {
+                    json = utilxx_base::Json::parse(raw);
+                } catch (const std::exception& e) {
+                    throw TableOpError(
+                        fmt::format("register_kind: invalid spec_json: {}", e.what())
+                    );
+                }
+                if (!json.is_object()) {
+                    throw TableOpError("register_kind: spec_json must be a JSON object");
+                }
+                PluginxxKindSpec spec;
+                spec.kind                = json.value("kind", std::string{});
+                spec.requiresPluginAbi   = json.value("requiresPluginAbi", false);
+                spec.interfaceVersion    = json.value("interfaceVersion", 0);
+                spec.minInterfaceVersion = json.value("minInterfaceVersion", 0);
+                spec.loadCapability      = json.value("loadCapability", std::string{});
+                spec.unloadCapability    = json.value("unloadCapability", std::string{});
+                spec.validateCapability  = json.value("validateCapability", std::string{});
+                spec.describe            = json.value("describe", std::string{});
+                spec.provider            = inst->name;
+                const bool overrideBuiltin = json.value("overrideBuiltin", false);
+                std::string reason;
+                if (!mgr->kindRegistry().registerKind(spec, overrideBuiltin, reason)) {
+                    throw TableOpError(
+                        reason.empty() ? std::string{"register_kind failed"} : std::move(reason)
+                    );
+                }
+                return std::string{};
+            }
+        );
+    }
+
+    /// 撤销本插件登记的形态
+    static PluginxxOperatorHandle* PLUGINXX_CALL kindUnregisterEntry(
+        const PluginxxHost*       host,
+        const PluginxxStringView* kind,
+        PluginxxOperatorCallback  cb,
+        void*                     cb_ud,
+        PluginxxString*           error_out
+    ) {
+        if (detail::abiViewEmpty(kind)) {
+            setTableOpError(error_out, "unregister_kind: missing kind");
+            return nullptr;
+        }
+        const std::string name = svToStr(*kind);
+        return detail::asyncTableOp<InstanceT, ManagerT>(
+            host,
+            cb,
+            cb_ud,
+            error_out,
+            "kind.unregister_kind",
+            [name](InstanceT* inst, ManagerT* mgr) -> std::string {
+                std::string reason;
+                if (!mgr->kindRegistry().unregisterKind(name, inst->name, reason)) {
+                    throw TableOpError(
+                        reason.empty() ? std::string{"unregister_kind failed"} : std::move(reason)
+                    );
+                }
+                return std::string{};
+            }
+        );
+    }
+
+    /// 列出全部形态 (预置的在前; 被接管的显示接管后的那一项)
+    static PluginxxOperatorHandle* PLUGINXX_CALL kindListEntry(
+        const PluginxxHost*      host,
+        PluginxxOperatorCallback cb,
+        void*                    cb_ud,
+        PluginxxString*          error_out
+    ) {
+        return detail::asyncTableOp<InstanceT, ManagerT>(
+            host,
+            cb,
+            cb_ud,
+            error_out,
+            "kind.list_kinds",
+            [](InstanceT*, ManagerT* mgr) -> std::string {
+                utilxx_base::Json arr = utilxx_base::Json::array();
+                for (const auto& spec : mgr->kindRegistry().all()) {
+                    utilxx_base::Json item = utilxx_base::Json::object();
+                    item["kind"]                = spec.kind;
+                    item["builtin"]             = spec.builtin;
+                    item["requiresPluginAbi"]   = spec.requiresPluginAbi;
+                    item["interfaceVersion"]    = spec.interfaceVersion;
+                    item["minInterfaceVersion"] = spec.minInterfaceVersion;
+                    item["provider"]            = spec.provider;
+                    item["providerId"]          = spec.provider;
+                    item["loadCapability"]      = spec.loadCapability;
+                    item["unloadCapability"]    = spec.unloadCapability;
+                    item["validateCapability"]  = spec.validateCapability;
+                    item["describe"]            = spec.describe;
+                    item["overridden"]          = spec.builtin && !spec.provider.empty();
+                    item["available"]           = !spec.loadCapability.empty();
+                    arr.push_back(std::move(item));
+                }
+                return arr.dump();
+            }
+        );
+    }
+
 
     // =====================================================================
     // 表结构体 (首次查询时构造; 线程安全的静态初始化)
@@ -1307,6 +1436,17 @@ struct GenericTableEntries {
         };
         return iface;
     }
+
+    static const PluginxxKindIface& kindIface() {
+        static const PluginxxKindIface iface{
+            PLUGINXX_IFACE_KIND_VERSION,
+            sizeof(PluginxxKindIface),
+            &kindRegisterEntry,
+            &kindUnregisterEntry,
+            &kindListEntry,
+        };
+        return iface;
+    }
 };
 
 /// 通用表的表名清单 (IID 里 `<应用名>_` 之后那一段, 均以 `plugin_` 开头):
@@ -1314,7 +1454,7 @@ struct GenericTableEntries {
 inline constexpr std::string_view kGenericTableNames[] = {
     "plugin_log",   "plugin_json",        "plugin_config", "plugin_plugins",
     "plugin_broadcasts", "plugin_capabilities", "plugin_scheduler", "plugin_tasks",
-    "plugin_cancel", "plugin_net",
+    "plugin_cancel", "plugin_net", "plugin_kind",
 };
 
 /// `iid` 是否以 `_<已知通用表名>` 结尾
@@ -1368,6 +1508,9 @@ const void* queryGenericPluginIface(std::string_view iid) {
     }
     if (iid == PLUGINXX_IFACE_CANCEL) {
         return &Entries::cancelIface();
+    }
+    if (iid == PLUGINXX_IFACE_KIND) {
+        return &Entries::kindIface();
     }
     if (!iid.starts_with(pluginxx::appTableIdPrefix()) && looksLikeGenericTableIid(iid)) {
         utilxx_base::xxLogPrint(
