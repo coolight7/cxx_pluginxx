@@ -88,6 +88,7 @@ set(_CXX_PLUGINXX_SOURCES
   src/capability_registry.cpp
   src/loader.cpp
   src/manifest.cpp
+  src/manifest_targets.cpp
   src/version.cpp
 )
 
