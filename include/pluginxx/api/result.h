@@ -30,6 +30,7 @@
 #define PLUGINXX_RESULT_ERR_PERMISSION (-6)   ///< 没有权限（不是属主 / 系统频道 / 路径越界）
 #define PLUGINXX_RESULT_ERR_BUSY (-7)         ///< 排队已满（连接 / 请求 / 服务上限）
 #define PLUGINXX_RESULT_ERR_NO_MEMORY (-8)    ///< 内存不足
+#define PLUGINXX_RESULT_ERR_CANCELED (-9)     ///< 调用方主动取消（终局之一：不再有结果）
 
 /* ==================== 广播段 (-200 ~ -299) ==================== */
 
@@ -70,6 +71,7 @@ inline const char* nameOf(int32_t code) {
     case PLUGINXX_RESULT_ERR_PERMISSION: return "permission_denied";
     case PLUGINXX_RESULT_ERR_BUSY: return "busy";
     case PLUGINXX_RESULT_ERR_NO_MEMORY: return "out_of_memory";
+    case PLUGINXX_RESULT_ERR_CANCELED: return "canceled";
 
     case PLUGINXX_RESULT_ERR_NOT_DECLARED: return "not_declared";
     case PLUGINXX_RESULT_ERR_NO_VALUE: return "no_value";
