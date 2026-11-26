@@ -26,7 +26,7 @@
 通用表的 IID 不是字面量, 而是 **`<应用名>.<表名>`**: 表名部分冻结, 应用名由**构建方**给出。
 
 - 代码侧: `PLUGINXX_APP_ID("log")` → `PLUGINXX_APP_NAME "." "log"` (见 `pluginxx/api/app.h`),
-  `PLUGINXX_IFACE_LOG` 等 10 个 IID 宏都用它拼;
+  `PLUGINXX_IFACE_LOG` 等通用表与界面 / 形态表的 IID 宏都用它拼;
 - 构建侧: CMake 缓存变量 `PLUGINXX_APP_NAME` (默认 `pluginxx` = 库自己就是应用),
   以 PUBLIC 编译定义下发给所有使用方 —— 主程序与插件看到同一个值;
   **主程序必须覆盖**, 例如 `-DPLUGINXX_APP_NAME=your_app`;
@@ -48,22 +48,30 @@ include/pluginxx/
                    内置合并描述) —— 与主程序业务无关
           app.h    应用名与应用命名空间下的标识: PLUGINXX_APP_NAME /
                    PLUGINXX_APP_ID(name) / pluginxx::appIdPrefix()
-          tables.h 通用接口表 (log/json/config/plugins/broadcasts/capabilities/
-                   scheduler/coroutine_runtime/tasks/cancel)
+          tables.h 9 张通用接口表 (log/json/config/plugins/broadcasts/capabilities/
+                   scheduler/tasks/cancel); 网络表在 net.h (plugin_net)
+          ui.h     声明式界面表 <应用名>.ui (声明项 / 内容生成 / 槽位)
+          kinds.h  形态表 <应用名>.kind (插件清单里的 kind 由形态运行器登记)
+          result.h / async_reply.h / entry.h / iface_meta.h / broadcast_handle.h
+                   操作结果、异步应答、入口符号、接口元信息、广播句柄
   kit/    kit.h    插件侧 C++ SDK 通用部分 (header-only): PluginStringView/PluginString、
-                   通用表聚合 PluginIfaceCore、Logger、Task<T> 锚定协程与锚定原语
-                   (sleep/yield/offload/invoke_cap)、CancelRegistry/OpCtl/ArgReader、
-                   后台任务 spawn、能力注册 capability、实例上下文基类
-                   PluginBaseT<IfacesT>、入口符号导出宏 PLUGINXX_EXPORT_PLUGIN          guard.h  C ABI 边界异常守卫 (logTo/reportCurrentException/guardCall/guardCallVoid)
+                   通用表聚合 PluginIfaceCore、Logger、锚定原语 (sleep/yield/offload/invoke_cap)、
+                   CancelRegistry/OpCtl/ArgReader、后台任务 spawn、能力注册 capability、
+                   实例上下文基类 PluginBaseT<IfacesT>、入口符号导出宏 PLUGINXX_EXPORT_PLUGIN
+          guard.h  C ABI 边界异常守卫 (logTo/reportCurrentException/guardCall/guardCallVoid)
   runtime/插件运行时 (runtime/driver/instance_base/manager_base/op_driver)
   host/   loader.h (dlopen/LoadLibrary)、manifest.h (plugin.yaml/名称推导/拓扑排序)、
           abi_util.h (C 串转换/异常保护/io 线程同步投递)、
           capability_registry.h (能力注册表: 声明 + 实现行 (阶段/优先级/作用域) + 启动/取消回调)、
           broadcast_registry.h (广播注册表: 频道声明 + 缓存 + 发布权限 + 订阅限频 + 流结束)、
           capability_chain.h (阶段链顺序 + JSON 补丁合并)、
+          kind_registry.h (形态注册表: 清单 kind → 运行器校验/加载/卸载)、
+          ui_slots.h (界面槽位表与形态)、ui_content.h (内容注册表 + 缓存 + 变量绑定)、
+          manifest_targets.h (多目标清单解析: os / arch 标签),
+          ffi_bridge.h (主程序与框架之间的边界件: EventQueue / RequestRegistry / 跨堆字符串),
           domain_services.h (业务数据入口 DomainServices: 通用表需要主程序数据的入口)、
           host_core.h (框架核心 PluginHostCore<InstanceT>: 通用表状态与方法实现)、
-          tables_impl.h (十张通用表的 vtable 入口 + queryGenericPluginIface<I,M>)、
+          tables_impl.h (通用表与形态表的 vtable 入口 + queryGenericPluginIface<I,M>)、
           lifecycle.h (框架生命周期骨架 PluginHostLifecycle<InstanceT>: 加载/启停/
                    禁用启用/卸载/级联依赖; 主程序经少量扩展点注入业务动作)
 src/      对应实现 (version.cpp / loader.cpp / manifest.cpp / capability_registry.cpp /
@@ -98,7 +106,9 @@ protected:
 ```
 
 - **通用表 (定义与实现都在本库)**: log / json / config / plugins / broadcasts / scheduler /
-  coroutine_runtime / tasks / cancel / capabilities —— 主程序经 `DomainServices` 提供业务数据；
+  tasks / cancel / capabilities —— 主程序经 `DomainServices` 提供业务数据；界面 (`<应用名>.ui`)
+  与形态 (`<应用名>.kind`) 两张表也在这里定义，槽位、变量与形态注册由主程序接
+  (它们是项目数据，见 `cxx_pluginxx_ui`);
 - **生命周期骨架 (在本库)**: 动态库加载与入口校验、create/start 事务、启用与禁用级联、
   stop 事务补齐、inflight 归零等待、destroy 与动态库卸载、失败回滚、关闭超时重试；
   主程序只提供少量扩展点 (见上)，因此新接入的主程序不必重写这套纪律；
@@ -107,10 +117,11 @@ protected:
 - `query_interface` 里先调 `pluginxx::queryGenericPluginIface<InstanceT, ManagerT>(iid)`
   取通用表，未命中再分发主程序的业务表。
 
-> 已实现: `api/` 两个纯 C 头、`kit/` (插件 SDK 通用部分 + 边界守卫)、
+> 已实现: `api/` 纯 C 头 (ABI / 应用名 / 通用表 / 界面 / 形态 / 网络)、
+> `kit/` (插件 SDK 通用部分 + 边界守卫)、
 > `runtime/` (实例状态机/执行 lease/协程驱动/Operation 驱动器/管理器基类)、
 > `host/` (加载/清单/ABI 辅助/能力注册表/事件后端/业务数据入口/框架核心/通用表入口/
-> 生命周期骨架)。主程序侧的用法: 用一份自己的 umbrella 头文件包含它们, 再补上各自的
+> 生命周期骨架/形态注册表/界面槽位与内容/多目标清单/FFI 边界件)。主程序侧的用法: 用一份自己的 umbrella 头文件包含它们, 再补上各自的
 > 业务 helper (工具/回调/图节点/权限/client UI 等)。
 > 主程序管理器 (agent 侧与 client 侧各一份) 都接入 `PluginHostLifecycle`; 若某端的
 > "加载"步骤有本端特有语义 (例如 dlopen 卸载到内部线程池、接口协商限制、双端入口探测),
@@ -122,6 +133,20 @@ protected:
 |---|---|
 | 主程序 (agent 侧) | 由该主程序自行定义 (工具/权限/回调/会话/模型/提示词/资源/图等) |
 | 主程序 (client 侧) | 由该主程序自行定义 (UI/事件/会话/线路/自身信息等) |
+
+## 共用层 (两个项目共用这里的实现)
+
+`agentxx` 与 `musicxx` 共用下面这几层，渲染方式、槽位与变量各写各的：
+
+| 层 | 头文件 / 实现 | 主程序要写的部分 |
+|---|---|---|
+| 声明式界面 | `api/ui.h` + `host/ui_slots.h` + `host/ui_content.h` | 槽位表（含插件自建槽位）、变量来源、把内容 JSON 画出来；描述层的解析与降级在 `cxx_pluginxx_ui`（Dart 侧有同名运行时） |
+| 形态注册表 | `api/kinds.h` + `host/kind_registry.h` | 每种形态的运行器（校验 / 加载 / 卸载）；内置只有 `native` |
+| 多目标清单 | `host/manifest_targets.h` | 清单里的目标分支按 `(os, arch)` 选；打包脚本可以用同一份解析 |
+| FFI 边界 | `host/ffi_bridge.h` | 唤醒方式、请求超时与取消策略；op 分发不在库里 |
+
+界面契约里冻结的字段（块树、槽位 id、变量 id）写在 `cxx_pluginxx_ui` 的 schema 与 `README.md`；
+改它们等于改插件作者看到的写法，要两个项目、示例插件与作者文档一起改。
 
 ## 构建与使用
 
