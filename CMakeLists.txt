@@ -89,6 +89,8 @@ set(_CXX_PLUGINXX_SOURCES
   src/loader.cpp
   src/manifest.cpp
   src/manifest_targets.cpp
+src/ui_content.cpp
+src/ui_slots.cpp
   src/version.cpp
 )
 
