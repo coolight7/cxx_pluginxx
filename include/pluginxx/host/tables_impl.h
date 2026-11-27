@@ -904,22 +904,6 @@ struct GenericTableEntries {
         const PluginxxStringView* capability_id,
         const PluginxxStringView* args_json,
         int32_t                   phase,
-        PluginxxOperatorCallback  cb,
-        void*                     ud,
-        PluginxxString*           error_out
-    ) {
-        return capabilityInvokeCommon(
-            host, scope, capability_id, args_json, phase, -1, cb, ud, error_out
-        );
-    }
-
-    /// `invoke_capability_ex` (追加成员): 多一个本次调用的超时
-    static PluginxxOperatorHandle* PLUGINXX_CALL capabilityInvokeExEntry(
-        const PluginxxHost*       host,
-        const PluginxxScopeRef*   scope,
-        const PluginxxStringView* capability_id,
-        const PluginxxStringView* args_json,
-        int32_t                   phase,
         int32_t                   timeout_ms,
         PluginxxOperatorCallback  cb,
         void*                     ud,
@@ -930,7 +914,7 @@ struct GenericTableEntries {
         );
     }
 
-    /// 两条调用入口共用的实现 (`timeout_ms < 0` = 用声明里的超时)
+    /// 调用入口的实现 (`timeout_ms < 0` = 用声明里的超时)
     static PluginxxOperatorHandle* capabilityInvokeCommon(
         const PluginxxHost*       host,
         const PluginxxScopeRef*   scope,
@@ -1399,7 +1383,6 @@ struct GenericTableEntries {
             &capabilityInvokeEntry,
             &capabilityInfoEntry,
             &capabilityListEntry,
-            &capabilityInvokeExEntry,
             &capabilityUnregisterExEntry,
         };
         return iface;

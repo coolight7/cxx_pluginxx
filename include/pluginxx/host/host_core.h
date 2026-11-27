@@ -382,8 +382,9 @@ public:
 
         std::string declError;
         if (!capabilities_->declares(fullId) && appOwned) {
-            // 官方 id 的声明由应用负责。主程序自己有一份权威声明表时（本项目是生成物
-            // `capability_ids.g.h`）先补一条应用声明，免得再开一条"应用下发声明"的通道。
+            // 官方 id 的声明由应用负责：应用把自己那张声明表推过来（`host.capabilities`），
+            // 这里问的就是推来的那一份；应用没推过时插件框架的自带表（生成物
+            // `capability_ids.g.h`）就是它的内置副本。
             CapabilityDecl appDecl;
             if (appCapabilityDecl(fullId, &appDecl)) {
                 appDecl.id = fullId;

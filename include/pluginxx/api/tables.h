@@ -42,9 +42,10 @@
 ///   调到隔壁函数) —— 要改就换新 IID;
 /// - 用 `_MIN_VERSION` 表达"我加了新成员"是错的 (那等于把老主程序全部判死)。
 ///
-/// 本表的当前状态: 通用表 9 张。其中 `capabilities` 为 v9 (v4 是声明 + 多实现行,
+/// 本表的当前状态: 通用表 9 张。其中 `capabilities` 为 v10 (v4 是声明 + 多实现行,
 /// v5 追加 `invoke_capability_ex`, v6 追加 `unregister_capability_ex`, v7 删掉
-/// `op_cancel`, v8 改成异步操作契约, v9 删掉 `sync`), `scheduler` 为 v2 (v2 删 `post_to_io` 与 `op_cancel`,
+/// `op_cancel`, v8 改成异步操作契约, v9 删掉 `sync`, v10 把两个调用入口并成一个),
+/// `scheduler` 为 v2 (v2 删 `post_to_io` 与 `op_cancel`,
 /// 并把已删除的 `coroutine_runtime` 表并入), `broadcasts` 为 v3 (v3 追加
 /// `end_broadcast` / `subscribe_broadcast_ex`), `config` / `cancel` 为 v3,
 /// 其余 4 张仍为 v1。
@@ -238,8 +239,10 @@ typedef struct PluginxxBroadcastsIface {
 ///     也在 `payload` 文本里
 /// v9: 删掉 `PluginxxCapabilitySpec.sync` —— 处理器只有一种形态 (调用时给完成通知,
 ///     可以在返回后再通知); 主程序派发因此不必为同步处理器单开一条路径
-#define PLUGINXX_IFACE_CAPABILITIES_VERSION     9
-#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 9
+/// v10: 把 `invoke_capability_ex` 并回 `invoke_capability` —— 调用只有一种入口,
+///      `timeout_ms` 是它的参数之一。基线随本次布局变化重置
+#define PLUGINXX_IFACE_CAPABILITIES_VERSION     10
+#define PLUGINXX_IFACE_CAPABILITIES_MIN_VERSION 10
 /* 基线: 重置时 = 完整布局; 以后追加成员保持不变 (改为 offsetof(第一个追加成员)) */
 #define PLUGINXX_IFACE_CAPABILITIES_BASELINE_SIZE sizeof(PluginxxCapabilitiesIface)
 
@@ -302,6 +305,9 @@ typedef struct PluginxxCapabilitiesIface {
 
     /// 调用能力 (**异步; 完成回调恰好一次**)
     /// - `args_json` 为空按 `{}` 处理; `phase` 为 0 表示走默认链 (before → impl → after);
+    /// - `timeout_ms` 是**这一次调用**的超时: `> 0` 最多等这么久 (到点按取消终结,
+    ///   完成回调 status = CANCELED), `0` 不设超时 (一直等, 由应用自己收尾),
+    ///   `< 0` 用声明里的值;
     /// - 受理在调用线程完成: 返回非 NULL 时句柄立即可用, 后续工作体在 io 线程执行;
     /// - 只有"受理不了"才返回 NULL 并写 `error_out` (运行时不可用 / 调用方实例已收尾);
     ///   能力不存在 / 没有实现是**结果失败** (`PLUGINXX_OPERATOR_FAILED` + 原因), 不是拒绝
@@ -311,6 +317,7 @@ typedef struct PluginxxCapabilitiesIface {
         const PluginxxStringView* capability_id,
         const PluginxxStringView* args_json,
         int32_t                   phase,
+        int32_t                   timeout_ms,
         PluginxxOperatorCallback  cb,
         void*                     ud,
         PluginxxString*           error_out
@@ -332,27 +339,6 @@ typedef struct PluginxxCapabilitiesIface {
         PluginxxOperatorCallback cb,
         void*                    cb_ud,
         PluginxxString*          error_out
-    );
-
-    /// 调用能力 (带**这次调用**的超时; 追加成员, 老主程序没有它)
-    ///
-    /// 与 [invoke_capability] 只差一个 `timeout_ms`:
-    /// - `> 0`: 这次调用最多等这么久 (到点按取消终结, 完成回调 status = CANCELED);
-    /// - `0`: 不设超时 (一直等, 由应用自己收尾);
-    /// - `< 0`: 用声明里的值 (等价于 [invoke_capability])。
-    ///
-    /// 用 `pluginxx::ifaceHas<&PluginxxCapabilitiesIface::invoke_capability_ex>` 判定;
-    /// 老主程序没有这个成员时退回 [invoke_capability] (只按声明的超时)。
-    PluginxxOperatorHandle*(PLUGINXX_CALL* invoke_capability_ex)(
-        const PluginxxHost*       host,
-        const PluginxxScopeRef*   scope,
-        const PluginxxStringView* capability_id,
-        const PluginxxStringView* args_json,
-        int32_t                   phase,
-        int32_t                   timeout_ms,
-        PluginxxOperatorCallback  cb,
-        void*                     ud,
-        PluginxxString*           error_out
     );
 
     /// 注销**指定作用域**上的一条实现行 (追加成员, v6)
